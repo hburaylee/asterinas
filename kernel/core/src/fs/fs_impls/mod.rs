@@ -14,6 +14,7 @@ pub(crate) mod overlayfs;
 pub(crate) mod procfs;
 pub(crate) mod pseudofs;
 pub(crate) mod ramfs;
+pub(crate) mod squashfs;
 pub(crate) mod sysfs;
 pub(crate) mod tmpfs;
 pub(crate) mod virtiofs;
@@ -32,6 +33,7 @@ pub(super) fn init() {
     ext2::init();
     exfat::init();
     overlayfs::init();
+    squashfs::init();
     virtiofs::init();
 }
 
