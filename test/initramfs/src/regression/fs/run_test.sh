@@ -105,6 +105,10 @@ test_ext2 "/ext2" "test_file.txt"
 ./ext2/xattr
 echo "All ext2 fs test passed."
 
+echo "Start squashfs test......"
+./squashfs/squashfs_test
+echo "All squashfs test passed."
+
 echo "Start fdatasync test......"
 test_fdatasync
 echo "All fdatasync test passed."
