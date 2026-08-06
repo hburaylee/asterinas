@@ -11,6 +11,7 @@ SUBDIRS := \
 	procfs \
 	pseudofs \
 	rename \
+	squashfs \
 	statx \
 	symlink \
 	sync \
