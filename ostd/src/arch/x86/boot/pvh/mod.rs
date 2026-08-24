@@ -12,7 +12,9 @@
 //! <https://xenbits.xen.org/docs/unstable/misc/pvh.html>
 //! <https://github.com/xen-project/xen/blob/staging-4.19/xen/include/public/arch-x86/hvm/start_info.h>
 
-use core::{arch::global_asm, ffi::CStr};
+#[cfg(feature = "pvh_boot")]
+use core::arch::global_asm;
+use core::ffi::CStr;
 
 use int_to_c_enum::TryFromInt;
 
@@ -25,6 +27,7 @@ use crate::{
     mm::{Paddr, kspace::paddr_to_vaddr},
 };
 
+#[cfg(feature = "pvh_boot")]
 global_asm!(include_str!("note.S"));
 
 /// The magic value of [`HvmStartInfo::magic`], which is "xEn3" in ASCII.

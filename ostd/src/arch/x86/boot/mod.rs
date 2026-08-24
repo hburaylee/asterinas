@@ -26,7 +26,11 @@ mod pvh;
 
 pub(crate) mod smp;
 
-use core::arch::global_asm;
+use core::{arch::global_asm, num::NonZeroUsize};
+
+use acpi::rsdp::Rsdp;
+
+use crate::{arch::kernel::acpi::AcpiMemoryHandler, boot::memory_region::MemoryRegionType};
 
 global_asm!(
     include_str!("bsp_boot.S"),
@@ -35,3 +39,39 @@ global_asm!(
     KCODE32 = const super::trap::gdt::KCODE32,
 );
 global_asm!(include_str!("ap_boot.S"));
+
+/// Finds the physical address of the ACPI root table.
+pub(super) fn find_acpi_root_table_address() -> Option<NonZeroUsize> {
+    // Multiboot v1 is BIOS-oriented: its entry state and boot information are
+    // based on the legacy PC BIOS model, and it has no standard EFI System
+    // Table field. So we use the BIOS RSDP scan as the legacy fallback. The
+    // PVH entry path under QEMU also goes through SeaBIOS (the pvh.bin option
+    // ROM may leave `rsdp_paddr` zero), so it relies on the same scan.
+    //
+    // SAFETY: These entry paths are treated as BIOS-compatible.
+    let Ok(rsdp) = (unsafe { Rsdp::search_for_on_bios(AcpiMemoryHandler {}) }) else {
+        return None;
+    };
+
+    if rsdp.revision() == 0 {
+        NonZeroUsize::new(rsdp.rsdt_address() as usize)
+    } else {
+        NonZeroUsize::new(rsdp.xsdt_address() as usize)
+    }
+}
+
+/// Promotes a reserved region containing the ACPI root table to `Reclaimable`.
+pub(super) fn effective_region_type(
+    typ: MemoryRegionType,
+    base: usize,
+    len: usize,
+    acpi_root_table_address: Option<NonZeroUsize>,
+) -> MemoryRegionType {
+    if typ == MemoryRegionType::Reserved
+        && acpi_root_table_address.is_some_and(|addr| (base..(base + len)).contains(&addr.get()))
+    {
+        MemoryRegionType::Reclaimable
+    } else {
+        typ
+    }
+}
