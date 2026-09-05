@@ -21,7 +21,7 @@ use cpio_decoder::{CpioDecoder, CpioEntry, FileMetadata, FileType};
 use device_id::{DeviceId, MajorId, MinorId};
 use lending_iterator::LendingIterator;
 use miniz_oxide::{
-    DataFormat, MZFlush, MZStatus,
+    DataFormat, MZError, MZFlush, MZStatus,
     inflate::stream::{InflateState, inflate},
 };
 use ostd::boot::boot_info;
@@ -53,7 +53,10 @@ pub(crate) fn init_in_first_kthread(path_resolver: &PathResolver) -> Result<()> 
         &[0x1F, 0x8B, _, _] => {
             println!("[kernel] unpacking initramfs.cpio.gz to rootfs ...");
             unpack_to_rootfs(
-                CpioDecoder::new(GzipReader::new(initramfs_buf)),
+                CpioDecoder::new(
+                    GzipReader::new(Cursor::new(initramfs_buf))
+                        .map_err(cpio_decoder::error::Error::from)?,
+                ),
                 path_resolver,
             )?;
         }
@@ -187,37 +190,108 @@ fn try_append_entry_to_rootfs<R: Read>(
     Ok(())
 }
 
-/// A streaming gzip decompressor over an in-memory compressed buffer.
-struct GzipReader<'a> {
-    // The DEFLATE body not yet consumed, shrinking as it is read.
-    deflate_body: &'a [u8],
+/// A streaming gzip decompressor over a [`Read`] source.
+struct GzipReader<R> {
+    inner: R,
+    /// DEFLATE bytes read from `inner` but not yet consumed by `inflate`.
+    input: Vec<u8>,
     state: Box<InflateState>,
     done: bool,
 }
 
-impl<'a> GzipReader<'a> {
-    /// Creates a decompressor, parsing and skipping the gzip header of `buf`.
-    fn new(buf: &'a [u8]) -> Self {
-        Self {
-            deflate_body: strip_gzip_header(buf),
+impl<R: Read> GzipReader<R> {
+    /// Creates a decompressor, parsing and skipping the gzip header.
+    fn new(mut inner: R) -> io::Result<Self> {
+        let mut header = [0u8; 10];
+        inner.read_exact(&mut header)?;
+
+        if header[0] != 0x1F || header[1] != 0x8B || header[2] != 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid gzip header",
+            ));
+        }
+
+        let flg = header[3];
+        if flg & FLG_FEXTRA != 0 {
+            let mut xlen_buf = [0u8; 2];
+            inner.read_exact(&mut xlen_buf)?;
+            let xlen = u16::from_le_bytes(xlen_buf) as usize;
+            skip_exact(&mut inner, xlen)?;
+        }
+        if flg & FLG_FNAME != 0 {
+            read_until_nul(&mut inner)?;
+        }
+        if flg & FLG_FCOMMENT != 0 {
+            read_until_nul(&mut inner)?;
+        }
+        if flg & FLG_FHCRC != 0 {
+            let mut crc_buf = [0u8; 2];
+            inner.read_exact(&mut crc_buf)?;
+        }
+
+        Ok(Self {
+            inner,
+            input: Vec::new(),
             state: InflateState::new_boxed(DataFormat::Raw),
             done: false,
-        }
+        })
     }
 }
 
-impl Read for GzipReader<'_> {
+impl<R: Read> Read for GzipReader<R> {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if out.is_empty() {
             return Ok(0);
         }
 
         while !self.done {
-            let result = inflate(&mut self.state, self.deflate_body, out, MZFlush::None);
-            self.deflate_body = &self.deflate_body[result.bytes_consumed..];
+            if self.input.is_empty() {
+                let mut chunk = [0u8; 4096];
+                let n = self.inner.read(&mut chunk)?;
+                if n == 0 {
+                    break;
+                }
+                self.input.extend_from_slice(&chunk[..n]);
+            }
+
+            let result = inflate(&mut self.state, &self.input, out, MZFlush::None);
+            self.input.drain(..result.bytes_consumed);
+
             match result.status {
-                Ok(MZStatus::StreamEnd) => self.done = true,
-                Ok(_) => {}
+                Ok(MZStatus::StreamEnd) => {
+                    self.done = true;
+                    if result.bytes_written > 0 {
+                        return Ok(result.bytes_written);
+                    }
+                    break;
+                }
+                Ok(_) => {
+                    if result.bytes_written > 0 {
+                        return Ok(result.bytes_written);
+                    }
+                    if result.bytes_consumed == 0 {
+                        if self.input.is_empty() {
+                            continue;
+                        }
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "gzip decompression failed",
+                        ));
+                    }
+                }
+                Err(MZError::Buf) => {
+                    if result.bytes_written > 0 {
+                        return Ok(result.bytes_written);
+                    }
+                    if self.input.is_empty() {
+                        continue;
+                    }
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "gzip decompression failed",
+                    ));
+                }
                 Err(_) => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -225,52 +299,39 @@ impl Read for GzipReader<'_> {
                     ));
                 }
             }
-            if result.bytes_written > 0 {
-                return Ok(result.bytes_written);
-            }
-            // No output and no input consumed means no further progress is
-            // possible (truncated stream); stop to avoid spinning forever.
-            if result.bytes_consumed == 0 {
-                break;
-            }
         }
 
         Ok(0)
     }
 }
 
-/// Parses the gzip header and returns the remaining bytes.
-///
-/// # Panics
-///
-/// Panics if `buf` contains an invalid or incomplete gzip header.
-fn strip_gzip_header(buf: &[u8]) -> &[u8] {
-    // The gzip header flag bits.
-    // Reference: <https://datatracker.ietf.org/doc/html/rfc1952>.
-    const FLG_FHCRC: u8 = 0x02;
-    const FLG_FEXTRA: u8 = 0x04;
-    const FLG_FNAME: u8 = 0x08;
-    const FLG_FCOMMENT: u8 = 0x10;
+// The gzip header flag bits.
+// Reference: <https://datatracker.ietf.org/doc/html/rfc1952>.
+const FLG_FHCRC: u8 = 0x02;
+const FLG_FEXTRA: u8 = 0x04;
+const FLG_FNAME: u8 = 0x08;
+const FLG_FCOMMENT: u8 = 0x10;
 
-    // Fixed 10-byte header: ID1, ID2, CM, FLG, MTIME(4), XFL, OS.
-    let flg = buf[3];
-    let mut pos = 10;
+/// Skips `n` bytes from `reader`.
+fn skip_exact<R: Read>(reader: &mut R, mut n: usize) -> io::Result<()> {
+    let mut buf = [0u8; 128];
+    while n > 0 {
+        let chunk = n.min(buf.len());
+        reader.read_exact(&mut buf[..chunk])?;
+        n -= chunk;
+    }
+    Ok(())
+}
 
-    if flg & FLG_FEXTRA != 0 {
-        let xlen = u16::from_le_bytes([buf[pos], buf[pos + 1]]) as usize;
-        pos += 2 + xlen;
+/// Reads from `reader` until a NUL byte, discarding the data.
+fn read_until_nul<R: Read>(reader: &mut R) -> io::Result<()> {
+    let mut byte = [0u8; 1];
+    loop {
+        reader.read_exact(&mut byte)?;
+        if byte[0] == 0 {
+            return Ok(());
+        }
     }
-    if flg & FLG_FNAME != 0 {
-        pos += buf[pos..].iter().position(|&b| b == 0).unwrap() + 1;
-    }
-    if flg & FLG_FCOMMENT != 0 {
-        pos += buf[pos..].iter().position(|&b| b == 0).unwrap() + 1;
-    }
-    if flg & FLG_FHCRC != 0 {
-        pos += 2;
-    }
-
-    &buf[pos..]
 }
 
 struct InodeWriter<'a> {
