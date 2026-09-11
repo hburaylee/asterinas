@@ -22,7 +22,6 @@ pub enum BootProtocol {
     Multiboot,
     #[default]
     Multiboot2,
-    Pvh,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
