@@ -15,7 +15,9 @@ use crate::{
 // Reference: <https://elixir.bootlin.com/linux/v7.0/source/arch/x86/include/uapi/asm/kvm_para.h>.
 const KVM_FEATURE_CLOCKSOURCE2: u32 = 3;
 const MSR_KVM_SYSTEM_TIME_NEW: u32 = 0x4b56_4d01;
+const MSR_KVM_WALL_CLOCK_NEW: u32 = 0x4b56_4d00;
 const KVM_MSR_ENABLE_BIT: u64 = 1;
+const MAX_RETRIES: usize = 1_000_000;
 
 /// Metadata for the KVM pvclock frame.
 ///
@@ -29,6 +31,7 @@ struct PvclockPageMeta;
 impl_frame_meta_for!(PvclockPageMeta);
 
 static PVCLOCK_PAGE: Once<PvclockPage> = Once::new();
+static WALL_CLOCK_FRAME: Once<Frame<()>> = Once::new();
 
 /// Guest-visible layout of the KVM pvclock page.
 ///
@@ -46,6 +49,25 @@ struct PvclockVcpuTimeInfo {
     tsc_shift: i8,
     _flags: u8,
     _pad: [u8; 2],
+}
+
+/// Guest-visible layout of the KVM wall clock page.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v7.0/source/arch/x86/include/asm/pvclock-abi.h#L37>.
+#[repr(C, align(4))]
+struct PvclockWallClock {
+    version: u32,
+    sec: u32,
+    nsec: u32,
+}
+
+/// KVM-provided wall-clock time at guest boot.
+#[derive(Clone, Copy, Debug)]
+pub struct KvmWallClock {
+    /// Seconds since the Unix epoch.
+    pub sec: u32,
+    /// Nanoseconds within the current second.
+    pub nsec: u32,
 }
 
 /// A handle to the KVM pvclock page shared with the hypervisor.
@@ -86,8 +108,6 @@ impl PvclockPage {
 
     /// Returns a consistent snapshot read from the KVM pvclock page.
     fn read_time_snapshot(&self) -> Option<PvclockTimeSnapshot> {
-        const MAX_RETRIES: usize = 1_000_000;
-
         for _ in 0..MAX_RETRIES {
             // KVM marks an in-progress pvclock update with an odd `version`.
             // Accept fields only when `version` is even and unchanged across the read.
@@ -179,6 +199,57 @@ pub(super) fn determine_tsc_freq() -> Option<u64> {
     time_snapshot.tsc_freq_hz()
 }
 
-fn has_kvm_clocksource2() -> bool {
+/// Returns whether the current environment supports the KVM clocksource v2.
+pub fn has_kvm_clocksource2() -> bool {
     cpuid::is_running_under_kvm() && cpuid::query_kvm_feature(KVM_FEATURE_CLOCKSOURCE2)
+}
+
+/// Reads the KVM wall clock via `MSR_KVM_WALL_CLOCK_NEW`.
+pub fn read_kvm_wall_clock() -> Option<KvmWallClock> {
+    if !has_kvm_clocksource2() {
+        return None;
+    }
+
+    let frame = if let Some(frame) = WALL_CLOCK_FRAME.get() {
+        frame
+    } else {
+        let frame = FrameAllocOptions::new().alloc_frame().ok()?;
+        WALL_CLOCK_FRAME.call_once(|| frame)
+    };
+
+    let paddr = frame.paddr();
+
+    // SAFETY: `paddr` is the physical address of a live, zeroed page retained by
+    // `WALL_CLOCK_FRAME`.
+    unsafe {
+        msr::wrmsr(MSR_KVM_WALL_CLOCK_NEW, paddr as u64);
+    }
+
+    let info = mm::paddr_to_vaddr(paddr) as *const PvclockWallClock;
+
+    for _ in 0..MAX_RETRIES {
+        // SAFETY: `info` points to a live KVM wall clock page.
+        let version_before = unsafe { core::ptr::addr_of!((*info).version).read_volatile() };
+        if version_before & 1 != 0 {
+            core::hint::spin_loop();
+            continue;
+        }
+
+        fence(Ordering::Acquire);
+        // SAFETY: `info` points to a live KVM wall clock page.
+        let sec = unsafe { core::ptr::addr_of!((*info).sec).read_volatile() };
+        let nsec = unsafe { core::ptr::addr_of!((*info).nsec).read_volatile() };
+        fence(Ordering::Acquire);
+        // SAFETY: `info` points to a live KVM wall clock page.
+        let version_after = unsafe { core::ptr::addr_of!((*info).version).read_volatile() };
+
+        // A nonzero, unchanged version indicates KVM has actually written the page.
+        if version_before != 0 && version_before == version_after {
+            return Some(KvmWallClock { sec, nsec });
+        }
+
+        core::hint::spin_loop();
+    }
+
+    None
 }
