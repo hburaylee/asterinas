@@ -11,6 +11,7 @@ bitflags.workspace = true
 component.workspace = true
 ostd.workspace = true
 spin.workspace = true
+time.workspace = true
 
 [target.riscv64imac-unknown-none-elf.dependencies]
 chrono.workspace = true

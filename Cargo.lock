@@ -368,6 +368,7 @@ dependencies = [
  "component",
  "ostd",
  "spin",
+ "time",
 ]
 
 [[package]]
