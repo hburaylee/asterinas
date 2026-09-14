@@ -370,6 +370,7 @@ dependencies = [
  "fdt-util",
  "ostd",
  "spin",
+ "time",
 ]
 
 [[package]]
