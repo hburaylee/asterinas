@@ -136,11 +136,12 @@ impl ToEarlyBootInfo for BootInformation<'_> {
 
         // Add the boot loader name region since Grub does not specify it.
         if let Some(name) = self.boot_loader_name_tag().and_then(|tag| tag.name().ok()) {
-            // SAFETY: The address of `name` is physical and the bootloader name will live for
-            // `'static`.
-            let bootloader_name = unsafe { make_str_vaddr_static(name) };
             regions
-                .push(MemoryRegion::module(bootloader_name.as_bytes()))
+                .push(MemoryRegion::new(
+                    name.as_ptr() as usize,
+                    name.len(),
+                    MemoryRegionType::Reclaimable,
+                ))
                 .unwrap();
         }
 

@@ -18,122 +18,6 @@ core::arch::global_asm!(include_str!("header.S"));
 
 const MULTIBOOT_ENTRY_MAGIC: u32 = 0x2BADB002;
 
-unsafe fn parse_as_cstr<'a>(ptr: u32) -> Option<&'a str> {
-    if ptr == 0 {
-        return None;
-    }
-
-    let name_ptr = paddr_to_vaddr(ptr as usize) as *const core::ffi::c_char;
-    // SAFETY: The safety is upheld by the caller.
-    let name_cstr = unsafe { core::ffi::CStr::from_ptr(name_ptr) };
-
-    name_cstr.to_str().ok()
-}
-
-impl ToEarlyBootInfo for MultibootLegacyInfo {
-    fn bootloader_name(&self) -> &'static str {
-        // SAFETY:
-        // 1. The bootloader name is safe to read because of the contract with the Multiboot
-        //    loader.
-        // 2. We reserve the bootloader-name region in `memory_regions`, so it will live as an
-        //    immutable reference for `'static`.
-        unsafe { parse_as_cstr(self.boot_loader_name) }.unwrap_or("Unknown Multiboot Loader")
-    }
-
-    fn kernel_commandline(&self) -> Option<&'static str> {
-        // SAFETY:
-        // 1. The command line is safe to read because of the contract with the Multiboot loader.
-        // 2. We reserve the command-line region in `finish_memory_regions`, so it will live as an
-        //    immutable reference for `'static`.
-        unsafe { parse_as_cstr(self.cmdline) }
-    }
-
-    fn initramfs(&self) -> Option<&'static [u8]> {
-        // FIXME: We think all modules are initramfs, can this cause problems?
-        if self.mods_count == 0 {
-            return None;
-        }
-
-        let mods_addr = paddr_to_vaddr(self.mods_addr as usize) as *const u32;
-        // SAFETY: We have checked `mods_count` above. By the contract with the Multiboot loader,
-        // the module addresses are available.
-        let (start, end) = unsafe { (*mods_addr, *mods_addr.add(1)) };
-
-        let ptr = paddr_to_vaddr(start as usize) as *const u8;
-        let len = (end - start) as usize;
-
-        // SAFETY:
-        // 1. The initramfs is safe to read because of the contract with the loader.
-        // 2. We reserve the initramfs region in `memory_regions`, so it will live as an immutable
-        //    reference for `'static`.
-        Some(unsafe { core::slice::from_raw_parts(ptr, len) })
-    }
-
-    fn acpi_arg(&self) -> BootloaderAcpiArg {
-        // Multiboot v1 is BIOS-oriented and does not define a standard field for
-        // the RSDP or the EFI System Table.
-        BootloaderAcpiArg::ScanBios
-    }
-
-    fn framebuffer_arg(&self) -> Option<BootloaderFramebufferArg> {
-        if self.framebuffer_table.addr == 0 {
-            return None;
-        }
-
-        Some(BootloaderFramebufferArg {
-            address: self.framebuffer_table.addr as usize,
-            width: self.framebuffer_table.width as usize,
-            height: self.framebuffer_table.height as usize,
-            bpp: self.framebuffer_table.bpp as usize,
-        })
-    }
-
-    fn memory_regions(
-        &self,
-        initramfs: Option<&'static [u8]>,
-        kernel_cmdline: Option<&'static str>,
-        framebuffer_arg: Option<BootloaderFramebufferArg>,
-    ) -> MemoryRegionArray {
-        let mut regions = MemoryRegionArray::new();
-
-        // The Multiboot protocol does not report ACPI regions explicitly. An ACPI
-        // region may live above the highest usable physical memory region when the
-        // total memory size is below 2G. We therefore mark it as reclaimable to
-        // include it in the linear mappings and allow access.
-        //
-        // FIXME: The ACPI specification does not guarantee that all ACPI tables
-        // are contiguous and do not cross region boundaries. See ACPI 6.4, Section
-        // 5.1, "Overview of the System Description Table Architecture".
-        // A full ACPI table graph scan may eventually be unavoidable.
-        let acpi_root_table_address = super::find_acpi_root_table_address();
-
-        // Add the regions in the multiboot protocol.
-        for entry in self.get_memory_map() {
-            let base = entry.base_addr().try_into().unwrap();
-            let len = entry.length().try_into().unwrap();
-            let typ = super::effective_region_type(
-                entry.memory_type(),
-                base,
-                len,
-                acpi_root_table_address,
-            );
-
-            regions.push(MemoryRegion::new(base, len, typ)).unwrap();
-        }
-
-        // Add the boot loader name region since Grub does not specify it.
-        // SAFETY: The bootloader name is a C-style NUL-terminated string because of the contract
-        // with the Multiboot loader.
-        if let Some(bootloader_name) = unsafe { parse_as_cstr(self.boot_loader_name) } {
-            regions
-                .push(MemoryRegion::module(bootloader_name.as_bytes()))
-                .unwrap();
-        }
-
-        super::finish_memory_regions(regions, framebuffer_arg, initramfs, kernel_cmdline)
-    }
-}
-
 /// Representation of Multiboot Information according to specification.
 ///
 /// Ref: <https://www.gnu.org/software/grub/manual/multiboot/multiboot.html#Boot-information-format>.
@@ -372,6 +256,122 @@ impl Iterator for MemoryEntryIter {
         unsafe { self.cur_ptr = self.cur_ptr.add(entry_size) };
 
         Some(entry)
+    }
+}
+
+unsafe fn parse_as_cstr<'a>(ptr: u32) -> Option<&'a str> {
+    if ptr == 0 {
+        return None;
+    }
+
+    let name_ptr = paddr_to_vaddr(ptr as usize) as *const core::ffi::c_char;
+    // SAFETY: The safety is upheld by the caller.
+    let name_cstr = unsafe { core::ffi::CStr::from_ptr(name_ptr) };
+
+    name_cstr.to_str().ok()
+}
+
+impl ToEarlyBootInfo for MultibootLegacyInfo {
+    fn bootloader_name(&self) -> &'static str {
+        // SAFETY:
+        // 1. The bootloader name is safe to read because of the contract with the Multiboot
+        //    loader.
+        // 2. We reserve the bootloader-name region in `memory_regions`, so it will live as an
+        //    immutable reference for `'static`.
+        unsafe { parse_as_cstr(self.boot_loader_name) }.unwrap_or("Unknown Multiboot Loader")
+    }
+
+    fn kernel_commandline(&self) -> Option<&'static str> {
+        // SAFETY:
+        // 1. The command line is safe to read because of the contract with the Multiboot loader.
+        // 2. We reserve the command-line region in `finish_memory_regions`, so it will live as an
+        //    immutable reference for `'static`.
+        unsafe { parse_as_cstr(self.cmdline) }
+    }
+
+    fn initramfs(&self) -> Option<&'static [u8]> {
+        // FIXME: We think all modules are initramfs, can this cause problems?
+        if self.mods_count == 0 {
+            return None;
+        }
+
+        let mods_addr = paddr_to_vaddr(self.mods_addr as usize) as *const u32;
+        // SAFETY: We have checked `mods_count` above. By the contract with the Multiboot loader,
+        // the module addresses are available.
+        let (start, end) = unsafe { (*mods_addr, *mods_addr.add(1)) };
+
+        let ptr = paddr_to_vaddr(start as usize) as *const u8;
+        let len = (end - start) as usize;
+
+        // SAFETY:
+        // 1. The initramfs is safe to read because of the contract with the loader.
+        // 2. We reserve the initramfs region in `memory_regions`, so it will live as an immutable
+        //    reference for `'static`.
+        Some(unsafe { core::slice::from_raw_parts(ptr, len) })
+    }
+
+    fn acpi_arg(&self) -> BootloaderAcpiArg {
+        // Multiboot v1 is BIOS-oriented and does not define a standard field for
+        // the RSDP or the EFI System Table.
+        BootloaderAcpiArg::ScanBios
+    }
+
+    fn framebuffer_arg(&self) -> Option<BootloaderFramebufferArg> {
+        if self.framebuffer_table.addr == 0 {
+            return None;
+        }
+
+        Some(BootloaderFramebufferArg {
+            address: self.framebuffer_table.addr as usize,
+            width: self.framebuffer_table.width as usize,
+            height: self.framebuffer_table.height as usize,
+            bpp: self.framebuffer_table.bpp as usize,
+        })
+    }
+
+    fn memory_regions(
+        &self,
+        initramfs: Option<&'static [u8]>,
+        kernel_cmdline: Option<&'static str>,
+        framebuffer_arg: Option<BootloaderFramebufferArg>,
+    ) -> MemoryRegionArray {
+        let mut regions = MemoryRegionArray::new();
+
+        // The Multiboot protocol does not report ACPI regions explicitly. An ACPI
+        // region may live above the highest usable physical memory region when the
+        // total memory size is below 2G. We therefore mark it as reclaimable to
+        // include it in the linear mappings and allow access.
+        //
+        // FIXME: The ACPI specification does not guarantee that all ACPI tables
+        // are contiguous and do not cross region boundaries. See ACPI 6.4, Section
+        // 5.1, "Overview of the System Description Table Architecture".
+        // A full ACPI table graph scan may eventually be unavoidable.
+        let acpi_root_table_address = super::find_acpi_root_table_address();
+
+        // Add the regions in the multiboot protocol.
+        for entry in self.get_memory_map() {
+            let base = entry.base_addr().try_into().unwrap();
+            let len = entry.length().try_into().unwrap();
+            let typ = super::effective_region_type(
+                entry.memory_type(),
+                base,
+                len,
+                acpi_root_table_address,
+            );
+
+            regions.push(MemoryRegion::new(base, len, typ)).unwrap();
+        }
+
+        // Add the boot loader name region since Grub does not specify it.
+        // SAFETY: The bootloader name is a C-style NUL-terminated string because of the contract
+        // with the Multiboot loader.
+        if let Some(bootloader_name) = unsafe { parse_as_cstr(self.boot_loader_name) } {
+            regions
+                .push(MemoryRegion::module(bootloader_name.as_bytes()))
+                .unwrap();
+        }
+
+        super::finish_memory_regions(regions, framebuffer_arg, initramfs, kernel_cmdline)
     }
 }
 

@@ -97,18 +97,23 @@ fn finish_memory_regions(
     initramfs: Option<&'static [u8]>,
     kernel_cmdline: Option<&'static str>,
 ) -> MemoryRegionArray {
+    // Add the framebuffer region since some loaders do not specify it.
     if let Some(fb) = framebuffer_arg {
         regions.push(MemoryRegion::framebuffer(&fb)).unwrap();
     }
 
+    // Add the kernel region since some loaders do not specify it.
     regions.push(MemoryRegion::kernel()).unwrap();
 
+    // Add the initramfs region.
     if let Some(initramfs) = initramfs {
         regions.push(MemoryRegion::module(initramfs)).unwrap();
     }
 
+    // Add the AP boot code region that will be copied into by the BSP.
     regions.push(smp::reclaimable_memory_region()).unwrap();
 
+    // Add the kernel cmdline region since some loaders does not specify it.
     if let Some(kcmdline) = kernel_cmdline {
         regions
             .push(MemoryRegion::module(kcmdline.as_bytes()))
