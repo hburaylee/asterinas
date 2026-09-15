@@ -31,6 +31,7 @@ INITRAMFS_COMPRESSED := true
 endif
 EXT2_IMAGE := $(BUILD_DIR)/ext2.img
 EXFAT_IMAGE := $(BUILD_DIR)/exfat.img
+SQUASHFS_IMAGE := $(BUILD_DIR)/squashfs.img
 LTP_DEV_IMAGE := $(BUILD_DIR)/ltp_dev.img
 SSD_IMAGE := $(BUILD_DIR)/nvme0n1.img
 XFSTESTS_TEST_IMAGE := $(BUILD_DIR)/xfstests_test.img
@@ -80,7 +81,7 @@ data-disk-images: $(EXT2_IMAGE) $(EXFAT_IMAGE)
 else ifeq ($(XFSTESTS_NEEDS_BLOCK_DEVICES), true)
 data-disk-images: $(EXT2_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(SSD_IMAGE) $(XFSTESTS_TEST_IMAGE) $(XFSTESTS_SCRATCH_IMAGE)
 else
-data-disk-images: $(EXT2_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(SSD_IMAGE)
+data-disk-images: $(EXT2_IMAGE) $(EXFAT_IMAGE) $(LTP_DEV_IMAGE) $(SQUASHFS_IMAGE) $(SSD_IMAGE)
 endif
 
 .PHONY: $(INITRAMFS_IMAGE)
@@ -191,6 +192,10 @@ $(EXFAT_IMAGE):
 	@mkdir -p $(BUILD_DIR)
 	@fallocate -l 512M $(EXFAT_IMAGE)
 	@mkfs.exfat $(EXFAT_IMAGE)
+
+$(SQUASHFS_IMAGE):
+	@mkdir -p $(BUILD_DIR)
+	@$(CUR_DIR)/src/regression/fs/squashfs/mk_squashfs_image.sh $(SQUASHFS_IMAGE)
 
 $(LTP_DEV_IMAGE):
 	@mkdir -p $(BUILD_DIR)
