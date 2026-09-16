@@ -37,17 +37,12 @@ struct RawDirHeader {
 const_assert!(size_of::<RawDirHeader>() == 12);
 
 /// On-disk directory entry (fixed part, 8 bytes).
-///
-/// Reference:
-/// <https://dr-emann.github.io/squashfs/squashfs.html#_directory_table>
-/// <https://elixir.bootlin.com/linux/v7.0/source/fs/squashfs/squashfs_fs.h#L410>
 #[repr(C)]
 #[derive(Clone, Copy, Pod)]
 struct RawDirEntry {
     offset: u16,
-    inode_offset: u16,
+    inode_offset: i16,
     type_: u16,
-    /// One less than the name length; names are not null-terminated.
     size: u16,
 }
 const_assert!(size_of::<RawDirEntry>() == 8);
@@ -136,9 +131,7 @@ impl<'a, 'r> DirIter<'a, 'r> {
         self.reader.read_bytes(&mut self.name_buf[..name_len])?;
         self.remaining -= name_len;
 
-        // The spec defines inode_offset as s16 (signed), but Pod requires u16 on
-        // disk. Cast to i16 first to preserve the sign before widening to i32.
-        let inode_num = (self.header_inode as i32 + (entry.inode_offset as i16) as i32) as u32;
+        let inode_num = (self.header_inode as i32 + entry.inode_offset as i32) as u32;
         let inode_ref = ((self.header_start_block as u64) << 16) | entry.offset as u64;
         let inode_type = SquashFsInodeType::try_from(entry.type_)?;
 

@@ -26,42 +26,30 @@ use crate::{
 };
 
 /// Indicates that an optional table (xattr, fragment, or export) is not
-/// present in the filesystem image. When a superblock field equals this
-/// value, the corresponding table is omitted and must not be read.
-///
-/// Reference:
-/// <https://dr-emann.github.io/squashfs/squashfs.html#_the_superblock>
-/// <https://elixir.bootlin.com/linux/v7.0/source/fs/squashfs/squashfs_fs.h#L40>
+/// present in the filesystem image..
 const INVALID_BLK: u64 = 0xffffffffffffffff;
 
 /// The location of a compressed metadata block: the absolute byte offset of
 /// the block from the start of the image.
 pub(super) type MetaBlockLocation = u64;
 
-/// On-disk inode number (squashfs format is 32-bit; the VFS widens to u64),
-/// also the identity key under which live inodes are cached and reused.
+/// On-disk inode number.
 pub(super) type SquashFsIno = u32;
 
-/// In-memory representation of a mounted Squashfs filesystem.
+/// Parsed representation of a mounted Squashfs filesystem.
 pub(crate) struct SquashFs {
     device: Arc<dyn BlockDevice>,
     pub(super) super_block: SuperBlock,
-    /// Block-pointer array of the UID/GID table.
     id_locations: Vec<MetaBlockLocation>,
-    /// Block-pointer array of the fragment table; empty if the image has no fragments.
     frag_locations: Vec<MetaBlockLocation>,
     decompress: DecompressContext,
     anon_device_id: AnonDeviceId,
-    /// Live inodes, held weakly so unreferenced ones can be dropped and
-    /// re-read from disk.
     inode_cache: RwMutex<BTreeMap<SquashFsIno, Weak<dyn Inode>>>,
     pub(super) fs_event_subscriber_stats: FsEventSubscriberStats,
-    /// Weak self reference so inodes can outlive-check the filesystem.
     self_ref: Weak<SquashFs>,
 }
 
 impl SquashFs {
-    /// Opens a Squashfs image from a block device.
     pub(super) fn open(device: Arc<dyn BlockDevice>) -> Result<Arc<Self>> {
         let super_block = SuperBlock::read(&device, 0)?;
         let decompress = DecompressContext::new(super_block.compressor);
@@ -97,9 +85,6 @@ impl SquashFs {
     }
 
     /// Reads the UID/GID table's top-level metadata-block pointer array.
-    ///
-    /// The ID table is always present, so unlike the fragment table there is
-    /// no [`INVALID_BLK`] case.
     fn read_id_table(
         device: &Arc<dyn BlockDevice>,
         sb: &SuperBlock,
@@ -109,9 +94,6 @@ impl SquashFs {
 
     /// Reads the fragment table's top-level metadata-block pointer array, or an
     /// empty vector when the image has no fragment table.
-    ///
-    /// The fragment table is optional: an image with no fragments reports a
-    /// zero count or an [`INVALID_BLK`] table position.
     fn read_frag_table(
         device: &Arc<dyn BlockDevice>,
         sb: &SuperBlock,
@@ -372,7 +354,7 @@ impl SquashFs {
     }
 
     /// Returns the decompressed fragment block at `frag_index`, reading and
-    /// decompressing it from the device on demand.
+    /// decompressing it.
     pub(super) fn fragment_block(&self, frag_index: u32) -> Result<DataBlock> {
         let frag = self.frag_lookup(frag_index)?;
         let reader = BlockReader::new(&self.device, &self.decompress);
