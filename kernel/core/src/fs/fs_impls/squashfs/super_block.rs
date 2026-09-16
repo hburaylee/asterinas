@@ -18,7 +18,7 @@ use crate::prelude::*;
 /// <https://dr-emann.github.io/squashfs/squashfs.html#_the_superblock>
 pub(super) const SQUASHFS_MAGIC: u32 = 0x73717368;
 
-/// Parsed representation of the Squashfs on-disk superblock.
+/// Parsed representation of the Squashfs superblock.
 #[derive(Clone)]
 pub(super) struct SuperBlock {
     pub(super) inode_count: u32,
@@ -27,9 +27,6 @@ pub(super) struct SuperBlock {
     pub(super) compressor: Compressor,
     pub(super) flags: u16,
     pub(super) id_count: u16,
-    /// 64-bit inode reference to the root directory: the upper 48 bits are
-    /// the byte offset of its metadata block relative to the inode table,
-    /// and the low 16 bits are the byte offset within that block.
     pub(super) root_inode: u64,
     pub(super) bytes_used: u64,
     pub(super) id_table: u64,
@@ -49,11 +46,7 @@ impl Debug for SuperBlock {
     }
 }
 
-/// The superblock layout.
-///
-/// Reference:
-/// <https://dr-emann.github.io/squashfs/squashfs.html#_the_superblock>
-/// <https://elixir.bootlin.com/linux/v7.0/source/fs/squashfs/squashfs_fs.h#L241>
+/// The on-disk superblock layout.
 #[repr(C)]
 #[derive(Clone, Copy, Pod)]
 struct RawSuperBlock {
@@ -81,7 +74,6 @@ struct RawSuperBlock {
 const_assert!(size_of::<RawSuperBlock>() == 96);
 
 impl SuperBlock {
-    /// Reads and validates the superblock from the block device at the given offset.
     pub(super) fn read(
         device: &Arc<dyn BlockDevice>,
         offset: u64,
