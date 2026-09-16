@@ -27,6 +27,10 @@ use ostd::mm::{FrameAllocOptions, Segment, VmIo, io::util::HasVmReaderWriter};
 use super::{SquashFsError, compressor::DecompressContext};
 use crate::prelude::*;
 
+/// Metadata block header: a 16-bit little-endian value where bit 15 is the
+/// compression flag and the low 15 bits are the data length.
+pub(super) type MetaBlockHeader = u16;
+
 /// Bit 15 of a metadata block header: 1 = uncompressed, 0 = compressed.
 ///
 /// Reference:
@@ -86,7 +90,7 @@ impl MetaBlock {
             .read_bytes(disk_pos as usize, &mut header_buf)
             .map_err(|_| SquashFsError::IoError)?;
 
-        let header = u16::from_le_bytes(header_buf);
+        let header = MetaBlockHeader::from_le_bytes(header_buf);
         let compressed = header & METADATA_COMPRESSED_BIT == 0;
         let data_len = (header & !METADATA_COMPRESSED_BIT) as usize;
 
