@@ -8,10 +8,8 @@
 //! Regular file reads go through the page cache. [`SquashFsPageCacheBackend`]
 //! fills each 4 KB page on demand by decompressing the containing squashfs
 //! block (typically 128 KB) and writing the requested bytes straight into the
-//! page frame. Decompressed *data* blocks are not cached; each page fault
-//! decompresses its containing block afresh. Decompressed *fragment* blocks,
-//! which may be shared by many files, are served from the filesystem's
-//! round-robin fragment cache.
+//! page frame. Decompressed data and fragment blocks are not cached; each page
+//! fault decompresses its containing block afresh.
 
 use core::{ops::Deref, time::Duration};
 
