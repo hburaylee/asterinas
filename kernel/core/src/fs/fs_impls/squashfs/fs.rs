@@ -11,10 +11,10 @@ use super::{
     block::{BlockReader, DataBlock},
     compressor::DecompressContext,
     dir::{DirEntry, DirIter},
-    fragment::{FragmentCache, FragmentEntry, RawFragmentEntry},
+    fragment::{FragmentEntry, RawFragmentEntry},
     impl_for_vfs::inode::SquashFsInode,
     inode::{self, BlockSizeInfo, InodeMeta, ParsedInode},
-    meta::{META_MAX, MetaCache, MetaCursor, MetaReader},
+    meta::{META_MAX, MetaCursor, MetaReader},
     super_block::SuperBlock,
 };
 use crate::{
@@ -51,8 +51,6 @@ pub(crate) struct SquashFs {
     /// Block-pointer array of the fragment table; empty if the image has no fragments.
     frag_locations: Vec<MetaBlockLocation>,
     decompress: DecompressContext,
-    meta_cache: Mutex<MetaCache>,
-    frag_cache: Mutex<FragmentCache>,
     anon_device_id: AnonDeviceId,
     /// Live inodes, held weakly so unreferenced ones can be dropped and
     /// re-read from disk.
@@ -85,8 +83,6 @@ impl SquashFs {
             id_locations,
             frag_locations,
             decompress,
-            meta_cache: Mutex::new(MetaCache::new()),
-            frag_cache: Mutex::new(FragmentCache::new()),
             anon_device_id,
             inode_cache: RwMutex::new(BTreeMap::new()),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
@@ -170,14 +166,12 @@ impl SquashFs {
     }
 
     /// Reads and parses the inode addressed by the 64-bit `inode_ref` on demand,
-    /// decompressing metadata blocks through the shared cache.
+    /// decompressing metadata blocks from the device.
     pub(super) fn read_inode(&self, inode_ref: u64) -> Result<ParsedInode> {
         let raw = {
-            let mut cache = self.meta_cache.lock();
             let mut reader = MetaReader::new(
                 &self.device,
                 &self.decompress,
-                &mut cache,
                 self.super_block.inode_table,
                 MetaCursor::from_ref(inode_ref),
             );
@@ -215,11 +209,9 @@ impl SquashFs {
             .get(meta_index)
             .ok_or_else(|| Error::with_message(Errno::EIO, "id index out of bounds"))?;
 
-        let mut cache = self.meta_cache.lock();
         let mut reader = MetaReader::new(
             &self.device,
             &self.decompress,
-            &mut cache,
             0,
             MetaCursor {
                 block: block_ptr,
@@ -240,11 +232,9 @@ impl SquashFs {
             .get(meta_index)
             .ok_or_else(|| Error::with_message(Errno::EIO, "fragment index out of bounds"))?;
 
-        let mut cache = self.meta_cache.lock();
         let mut reader = MetaReader::new(
             &self.device,
             &self.decompress,
-            &mut cache,
             0,
             MetaCursor {
                 block: block_ptr,
@@ -297,11 +287,9 @@ impl SquashFs {
         file_size: u32,
         name: &[u8],
     ) -> Result<Option<(SquashFsIno, u64)>> {
-        let mut cache = self.meta_cache.lock();
         let mut reader = MetaReader::new(
             &self.device,
             &self.decompress,
-            &mut cache,
             self.super_block.dir_table,
             MetaCursor {
                 block: block_start as u64,
@@ -328,11 +316,9 @@ impl SquashFs {
         skip: usize,
         mut f: impl FnMut(usize, &DirEntry) -> Result<bool>,
     ) -> Result<()> {
-        let mut cache = self.meta_cache.lock();
         let mut reader = MetaReader::new(
             &self.device,
             &self.decompress,
-            &mut cache,
             self.super_block.dir_table,
             MetaCursor {
                 block: block_start as u64,
@@ -386,18 +372,16 @@ impl SquashFs {
     }
 
     /// Returns the decompressed fragment block at `frag_index`, reading and
-    /// decompressing it on a cache miss.
-    ///
-    /// Fragment blocks may be shared by many files, so they are served from
-    /// the fragment cache to avoid repeated re-decompression.
+    /// decompressing it from the device on demand.
     pub(super) fn fragment_block(&self, frag_index: u32) -> Result<DataBlock> {
         let frag = self.frag_lookup(frag_index)?;
         let reader = BlockReader::new(&self.device, &self.decompress);
-        let block = self
-            .frag_cache
-            .lock()
-            .get(&reader, &frag, self.super_block.block_size)?;
-        Ok(block)
+        Ok(reader.read_fragment(
+            frag.start,
+            frag.size as usize,
+            frag.compressed,
+            self.super_block.block_size as usize,
+        )?)
     }
 }
 
