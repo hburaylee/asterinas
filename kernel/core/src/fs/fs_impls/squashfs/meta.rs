@@ -13,8 +13,6 @@
 //!
 //! - [`MetaBlock`] decodes and decompresses a single metadata block into page
 //!   frames.
-//! - [`MetaCache`] keeps a small round-robin cache of decompressed blocks so a
-//!   sequence of nearby reads does not repeatedly decompress the same block.
 //! - [`MetaReader`] walks a logical byte stream across block boundaries from a
 //!   [`MetaCursor`], mirroring how the kernel reads variably-sized records
 //!   (inodes, directory headers) that may straddle blocks.
@@ -42,11 +40,6 @@ pub(super) const METADATA_COMPRESSED_BIT: u16 = 1 << 15;
 /// <https://dr-emann.github.io/squashfs/squashfs.html#_packing_metadata>
 /// <https://elixir.bootlin.com/linux/v7.0/source/fs/squashfs/squashfs_fs.h#L19>
 pub(super) const META_MAX: usize = 0x2000;
-
-/// Number of decompressed metadata blocks kept in [`MetaCache`].
-///
-/// Matches the Linux default (`SQUASHFS_CACHED_BLKS`).
-const META_CACHE_SLOTS: usize = 8;
 
 /// A position within the metadata stream: a metadata block plus a byte offset
 /// inside its decompressed data.
@@ -142,62 +135,15 @@ impl MetaBlock {
     }
 }
 
-/// A single decompressed metadata block, keyed by its disk position.
-struct CachedMetaBlock {
-    /// Absolute disk position of the block's 2-byte header (its identity).
-    disk_pos: u64,
-    block: MetaBlock,
-}
-
-/// A small round-robin cache of decompressed metadata blocks, keyed by their
-/// absolute disk position.
-pub(super) struct MetaCache {
-    slots: [Option<CachedMetaBlock>; META_CACHE_SLOTS],
-    /// Next slot to evict.
-    next: usize,
-}
-
-impl MetaCache {
-    pub(super) fn new() -> Self {
-        Self {
-            slots: [const { None }; META_CACHE_SLOTS],
-            next: 0,
-        }
-    }
-
-    /// Returns the block at `disk_pos`, decompressing and inserting it on a miss.
-    fn get(
-        &mut self,
-        device: &Arc<dyn BlockDevice>,
-        decompress: &DecompressContext,
-        disk_pos: u64,
-    ) -> Result<&MetaBlock, SquashFsError> {
-        if let Some(idx) = self
-            .slots
-            .iter()
-            .position(|slot| matches!(slot, Some(cached) if cached.disk_pos == disk_pos))
-        {
-            return Ok(&self.slots[idx].as_ref().unwrap().block);
-        }
-
-        let block = MetaBlock::read(device, decompress, disk_pos)?;
-        let idx = self.next;
-        self.next = (self.next + 1) % META_CACHE_SLOTS;
-        self.slots[idx] = Some(CachedMetaBlock { disk_pos, block });
-        Ok(&self.slots[idx].as_ref().unwrap().block)
-    }
-}
-
 /// A sequential reader over the metadata stream starting from `base`.
 ///
 /// `base` is the absolute disk position that block offset `0` refers to (the
-/// inode or directory table start). Reads decompress blocks through the shared
-/// [`MetaCache`] and transparently cross block boundaries, so records larger
-/// than one block — or straddling two — are read as a single call.
+/// inode or directory table start). Reads decompress each metadata block on
+/// demand and transparently cross block boundaries, so records larger than one
+/// block — or straddling two — are read as a single call.
 pub(super) struct MetaReader<'a> {
     device: &'a Arc<dyn BlockDevice>,
     decompress: &'a DecompressContext,
-    cache: &'a mut MetaCache,
     base: u64,
     cursor: MetaCursor,
 }
@@ -206,14 +152,12 @@ impl<'a> MetaReader<'a> {
     pub(super) fn new(
         device: &'a Arc<dyn BlockDevice>,
         decompress: &'a DecompressContext,
-        cache: &'a mut MetaCache,
         base: u64,
         cursor: MetaCursor,
     ) -> Self {
         Self {
             device,
             decompress,
-            cache,
             base,
             cursor,
         }
@@ -245,7 +189,7 @@ impl<'a> MetaReader<'a> {
             let start = self.cursor.offset as usize;
 
             let (copied, blk_len, next_pos) = {
-                let block = self.cache.get(self.device, self.decompress, disk_pos)?;
+                let block = MetaBlock::read(self.device, self.decompress, disk_pos)?;
                 let blk_len = block.len as usize;
                 let next_pos = block.next_pos;
                 if start >= blk_len {
@@ -283,7 +227,7 @@ impl<'a> MetaReader<'a> {
             let start = self.cursor.offset as usize;
 
             let (blk_len, next_pos) = {
-                let block = self.cache.get(self.device, self.decompress, disk_pos)?;
+                let block = MetaBlock::read(self.device, self.decompress, disk_pos)?;
                 (block.len as usize, block.next_pos)
             };
 
