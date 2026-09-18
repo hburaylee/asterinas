@@ -69,6 +69,8 @@ pub(crate) fn create_new_user_task(
         }
 
         while !current_thread.is_exited() {
+            crate::syscall::rseq_update_cpu_id(&ctx);
+
             // Execute the user code
             let return_reason = user_mode.execute(&ctx);
 

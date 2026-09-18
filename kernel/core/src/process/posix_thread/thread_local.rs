@@ -28,6 +28,8 @@ pub(crate) struct Rseq {
     pub len: u32,
     /// Registration signature.
     pub sig: u32,
+    /// CPU ID most recently written to the user-space area.
+    pub last_cpu_id: u32,
 }
 
 /// Local data for a POSIX thread.

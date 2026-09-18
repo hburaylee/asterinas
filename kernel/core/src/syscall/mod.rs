@@ -357,6 +357,8 @@ use dispatch_fn_inner;
 use impl_syscall_nums_and_dispatch_fn;
 use syscall_handler;
 
+pub(crate) use rseq::rseq_update_cpu_id;
+
 struct SyscallArgument {
     syscall_number: u64,
     args: [u64; 6],
