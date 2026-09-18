@@ -128,6 +128,7 @@ mod recvmsg;
 mod removexattr;
 mod rename;
 mod rmdir;
+mod rseq;
 mod rt_sigaction;
 mod rt_sigpending;
 mod rt_sigprocmask;
@@ -354,6 +355,9 @@ macro_rules! impl_syscall_nums_and_dispatch_fn {
 // Export macros to sub-modules
 use dispatch_fn_inner;
 use impl_syscall_nums_and_dispatch_fn;
+pub(crate) use rseq::{
+    rseq_ip_fixup, rseq_ip_fixup_if_preempted, rseq_mark_preempted, rseq_update_cpu_id,
+};
 use syscall_handler;
 
 struct SyscallArgument {

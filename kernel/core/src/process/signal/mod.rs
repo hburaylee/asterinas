@@ -123,6 +123,7 @@ pub(crate) fn handle_pending_signal(user_ctx: &mut UserContext, ctx: &Context) {
     };
 
     let sig_num = signal.num();
+    crate::syscall::rseq_ip_fixup(ctx, user_ctx);
     match sig_action {
         SigAction::Ign => {
             debug!("Ignore signal {:?}", sig_num);

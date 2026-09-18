@@ -19,6 +19,21 @@ use crate::{
     vm::vmar::VmarHandle,
 };
 
+/// A registered restartable sequences (rseq) area of a thread.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Rseq {
+    /// User-space address of the `struct rseq` area.
+    pub user_ptr: Vaddr,
+    /// Length of the registered area in bytes.
+    pub len: u32,
+    /// Registration signature.
+    pub sig: u32,
+    /// CPU ID most recently written to the user-space area.
+    pub last_cpu_id: u32,
+    /// Whether the thread was scheduled away since it last ran in user mode.
+    pub needs_ip_fixup: bool,
+}
+
 /// Local data for a POSIX thread.
 pub(crate) struct ThreadLocal {
     // TID pointers.
@@ -33,6 +48,9 @@ pub(crate) struct ThreadLocal {
     // Robust futexes.
     // https://man7.org/linux/man-pages/man2/get_robust_list.2.html
     robust_list: RefCell<Option<RobustListHead>>,
+
+    // Restartable sequences.
+    rseq: Cell<Option<Rseq>>,
 
     // Files.
     /// File table.
@@ -69,6 +87,7 @@ impl ThreadLocal {
         supp_user_context: SuppUserContext,
         user_ns: Arc<UserNamespace>,
         ns_proxy: Arc<NsProxy>,
+        rseq: Option<Rseq>,
     ) -> Self {
         Self {
             set_child_tid: Cell::new(set_child_tid),
@@ -76,6 +95,7 @@ impl ThreadLocal {
             vmar: RefCell::new(Some(vmar)),
             page_fault_disabled: Cell::new(false),
             robust_list: RefCell::new(None),
+            rseq: Cell::new(rseq),
             file_table: RefCell::new(Some(file_table)),
             fs: RefCell::new(fs),
             supp_user_context,
@@ -140,6 +160,10 @@ impl ThreadLocal {
 
     pub(crate) fn robust_list(&self) -> &RefCell<Option<RobustListHead>> {
         &self.robust_list
+    }
+
+    pub(crate) fn rseq(&self) -> &Cell<Option<Rseq>> {
+        &self.rseq
     }
 
     pub(crate) fn borrow_file_table(&self) -> FileTableRef<'_> {
