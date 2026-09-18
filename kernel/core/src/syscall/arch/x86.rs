@@ -110,6 +110,7 @@ use super::{
     removexattr::{sys_fremovexattr, sys_lremovexattr, sys_removexattr},
     rename::{sys_rename, sys_renameat, sys_renameat2},
     rmdir::sys_rmdir,
+    rseq::sys_rseq,
     rt_sigaction::sys_rt_sigaction,
     rt_sigpending::sys_rt_sigpending,
     rt_sigprocmask::sys_rt_sigprocmask,
@@ -418,6 +419,7 @@ impl_syscall_nums_and_dispatch_fn! {
     SYS_PREADV2 = 327          => sys_preadv2(args[..6]);
     SYS_PWRITEV2 = 328         => sys_pwritev2(args[..6]);
     SYS_STATX = 332            => sys_statx(args[..5]);
+    SYS_RSEQ = 334             => sys_rseq(args[..4]);
     SYS_PIDFD_SEND_SIGNAL = 424 => sys_pidfd_send_signal(args[..4]);
     SYS_MOVE_MOUNT = 429        => sys_move_mount(args[..5]);
     SYS_FSOPEN = 430           => sys_fsopen(args[..2]);

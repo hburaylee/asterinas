@@ -487,6 +487,14 @@ fn init_aux_vec(
         aux_vec.set(AuxKey::AT_BASE, ldso_base as u64);
     }
 
+    #[cfg(target_arch = "x86_64")]
+    {
+        // The rseq implementation covers the ABI up to `node_id` and uses the
+        // original 32-byte allocation alignment.
+        aux_vec.set(AuxKey::AT_RSEQ_FEATURE_SIZE, 24);
+        aux_vec.set(AuxKey::AT_RSEQ_ALIGN, 32);
+    }
+
     Ok(aux_vec)
 }
 
