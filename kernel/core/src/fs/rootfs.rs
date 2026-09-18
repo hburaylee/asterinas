@@ -39,7 +39,7 @@ use aster_cmdline::parse::ParamStorage;
 use spin::once::Once;
 
 use super::{
-    ext2,
+    ext2, squashfs,
     vfs::{
         file_system::FsFlags,
         path::{FsPath, Mount, MountNamespace, Path, PathResolver, PerMountFlags},
@@ -49,7 +49,8 @@ use super::{
 use crate::prelude::*;
 
 /// Filesystem types supported for the root filesystem.
-pub(crate) static SUPPORTED_ROOTFS_TYPES: &[&dyn DynFsType] = &[&ext2::EXT2_TYPE];
+pub(crate) static SUPPORTED_ROOTFS_TYPES: &[&dyn DynFsType] =
+    &[&ext2::EXT2_TYPE, &squashfs::SQUASHFS_TYPE];
 
 /// Mounts and switches to the root filesystem configured by the kernel command line.
 ///

@@ -83,11 +83,11 @@ impl From<SquashFsError> for Error {
     }
 }
 
-struct SquashFsType {
+pub(in crate::fs) struct SquashFsType {
     cache: FsCache<DeviceId>,
 }
 
-static SQUASHFS_TYPE: SquashFsType = SquashFsType {
+pub(in crate::fs) static SQUASHFS_TYPE: SquashFsType = SquashFsType {
     cache: FsCache::new(),
 };
 
