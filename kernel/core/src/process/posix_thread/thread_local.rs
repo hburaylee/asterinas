@@ -85,6 +85,7 @@ impl ThreadLocal {
         supp_user_context: SuppUserContext,
         user_ns: Arc<UserNamespace>,
         ns_proxy: Arc<NsProxy>,
+        rseq: Option<Rseq>,
     ) -> Self {
         Self {
             set_child_tid: Cell::new(set_child_tid),
@@ -92,7 +93,7 @@ impl ThreadLocal {
             vmar: RefCell::new(Some(vmar)),
             page_fault_disabled: Cell::new(false),
             robust_list: RefCell::new(None),
-            rseq: Cell::new(None),
+            rseq: Cell::new(rseq),
             file_table: RefCell::new(Some(file_table)),
             fs: RefCell::new(fs),
             supp_user_context,
