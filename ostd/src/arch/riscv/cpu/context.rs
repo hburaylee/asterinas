@@ -182,7 +182,7 @@ impl UserContextApiInternal for UserContext {
             crate::task::scheduler::might_preempt();
 
             let guard = crate::irq::disable_local();
-            hooks.pre_user_run(&guard);
+            hooks.pre_user_run(self, &guard);
             self.user_context.run(guard);
 
             let scause = riscv::register::scause::read();
