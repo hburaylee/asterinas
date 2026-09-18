@@ -39,6 +39,18 @@ proc:proc-multiple-procfs
 proc:proc-fsconfig-hidepid
 proc:proc-pidns
 
+# --- rseq ---
+rseq:basic_percpu_ops_mm_cid_test
+rseq:syscall_errors_test
+rseq:param_test
+rseq:param_test_benchmark
+rseq:param_test_compare_twice
+rseq:param_test_mm_cid
+rseq:param_test_mm_cid_benchmark
+rseq:param_test_mm_cid_compare_twice
+rseq:run_param_test.sh
+rseq:slice_test
+
 # --- signal ---
 signal:mangle_uc_sigmask
 
