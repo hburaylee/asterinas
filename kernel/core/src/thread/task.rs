@@ -142,7 +142,8 @@ impl UserModeHooks for Context<'_> {
         self.has_pending()
     }
 
-    fn pre_user_run(&self, guard: &DisabledLocalIrqGuard) {
+    fn pre_user_run(&self, user_ctx: &mut UserContext, guard: &DisabledLocalIrqGuard) {
+        crate::syscall::rseq_ip_fixup_if_preempted(self, user_ctx);
         self.thread_local
             .supp_user_context()
             .before_user_exec(guard);

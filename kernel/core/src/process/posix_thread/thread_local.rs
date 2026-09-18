@@ -30,6 +30,8 @@ pub(crate) struct Rseq {
     pub sig: u32,
     /// CPU ID most recently written to the user-space area.
     pub last_cpu_id: u32,
+    /// Whether the thread was scheduled away since it last ran in user mode.
+    pub needs_ip_fixup: bool,
 }
 
 /// Local data for a POSIX thread.
