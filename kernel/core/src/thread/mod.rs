@@ -37,6 +37,7 @@ fn pre_schedule_handler(irq_guard: &DisabledLocalIrqGuard) {
         return;
     };
 
+    crate::syscall::rseq_mark_preempted(thread_local);
     thread_local.supp_user_context().before_schedule(irq_guard);
 }
 
