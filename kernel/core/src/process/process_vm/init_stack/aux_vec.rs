@@ -46,6 +46,9 @@ pub(crate) enum AuxKey {
     AT_EXECFN = 31, /* filename of program */
     AT_SYSINFO = 32,
     AT_SYSINFO_EHDR = 33, /* the start address of the page containing the VDSO */
+
+    AT_RSEQ_FEATURE_SIZE = 27, /* rseq supported feature size */
+    AT_RSEQ_ALIGN = 28,        /* rseq allocation alignment */
 }
 
 impl AuxKey {

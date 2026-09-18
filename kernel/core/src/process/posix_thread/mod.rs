@@ -45,7 +45,7 @@ pub(crate) use exit::{do_exit, do_exit_group};
 pub(crate) use personality::Personality;
 pub use posix_thread_ext::AsPosixThread;
 pub(crate) use robust_list::RobustListHead;
-pub(crate) use thread_local::{AsThreadLocal, FileTableRefMut, ThreadLocal};
+pub(crate) use thread_local::{AsThreadLocal, FileTableRefMut, Rseq, ThreadLocal};
 
 pub struct PosixThread {
     // Immutable part
