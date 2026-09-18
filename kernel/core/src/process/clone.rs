@@ -556,6 +556,14 @@ fn clone_child_process(
     // Inherit the parent's signal mask
     let child_sig_mask = posix_thread.sig_mask().into();
 
+    // A forked child without `CLONE_VM` keeps the parent's rseq registration;
+    // a thread created with `CLONE_VM` starts unregistered.
+    let child_rseq = if clone_flags.contains(CloneFlags::CLONE_VM) {
+        None
+    } else {
+        thread_local.rseq().get()
+    };
+
     // Inherit the parent's resource limits
     let child_resource_limits = process.resource_limits().clone();
 
@@ -593,6 +601,7 @@ fn clone_child_process(
             .user_ns(child_user_ns.clone())
             .ns_proxy(child_ns_proxy)
             .default_timer_slack_ns(default_timer_slack_ns)
+            .rseq(child_rseq)
         };
         #[cfg(target_arch = "x86_64")]
         {

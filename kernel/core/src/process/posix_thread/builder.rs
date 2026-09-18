@@ -12,7 +12,7 @@ use ostd::{
 };
 use spin::Once;
 
-use super::{PosixThread, ThreadLocal};
+use super::{PosixThread, Rseq, ThreadLocal};
 use crate::{
     fs::{file::file_table::FileTable, thread_info::ThreadFsInfo},
     prelude::*,
@@ -49,6 +49,7 @@ pub(crate) struct PosixThreadBuilder {
     user_ns: Option<Arc<UserNamespace>>,
     ns_proxy: Option<Arc<NsProxy>>,
     default_timer_slack_ns: u64,
+    rseq: Option<Rseq>,
 }
 
 impl PosixThreadBuilder {
@@ -77,6 +78,7 @@ impl PosixThreadBuilder {
             user_ns: None,
             ns_proxy: None,
             default_timer_slack_ns: 50_000, // 50 usec default slack
+            rseq: None,
         }
     }
 
@@ -148,6 +150,11 @@ impl PosixThreadBuilder {
         self
     }
 
+    pub(crate) fn rseq(mut self, rseq: Option<Rseq>) -> Self {
+        self.rseq = rseq;
+        self
+    }
+
     pub(crate) fn build(self) -> Arc<Task> {
         let Self {
             tid,
@@ -167,6 +174,7 @@ impl PosixThreadBuilder {
             user_ns,
             ns_proxy,
             default_timer_slack_ns,
+            rseq,
         } = self;
 
         let file_table = file_table.unwrap_or_else(FileTable::new);
@@ -226,6 +234,7 @@ impl PosixThreadBuilder {
                 supp_user_context,
                 user_ns,
                 ns_proxy,
+                rseq,
             );
 
             task::create_new_user_task(user_ctx, thread, thread_local)
