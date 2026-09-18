@@ -34,6 +34,7 @@ use crate::{
                 Extension, FallocMode, FileOps, Inode, Metadata, MknodType, RenameMode,
                 SymbolicLink,
             },
+            path::Dentry,
         },
     },
     prelude::*,
@@ -201,7 +202,7 @@ impl Inode for SquashFsInode {
         self.body.file_size() as usize
     }
 
-    fn resize(&self, _new_size: usize) -> Result<()> {
+    fn resize(&self, _self_dentry: &Dentry, _new_size: usize) -> Result<()> {
         return_errno_with_message!(Errno::EROFS, "SquashFS is read-only")
     }
 
@@ -251,7 +252,7 @@ impl Inode for SquashFsInode {
         Ok(InodeMode::from_bits_truncate(self.meta.mode))
     }
 
-    fn set_mode(&self, _mode: InodeMode) -> Result<()> {
+    fn set_mode(&self, _self_dentry: &Dentry, _mode: InodeMode) -> Result<()> {
         return_errno_with_message!(Errno::EROFS, "SquashFS is read-only")
     }
 
@@ -259,7 +260,7 @@ impl Inode for SquashFsInode {
         Ok(Uid::new(self.meta.uid))
     }
 
-    fn set_owner(&self, _uid: Uid) -> Result<()> {
+    fn set_owner(&self, _self_dentry: &Dentry, _uid: Uid) -> Result<()> {
         return_errno_with_message!(Errno::EROFS, "SquashFS is read-only")
     }
 
@@ -267,7 +268,7 @@ impl Inode for SquashFsInode {
         Ok(Gid::new(self.meta.gid))
     }
 
-    fn set_group(&self, _gid: Gid) -> Result<()> {
+    fn set_group(&self, _self_dentry: &Dentry, _gid: Gid) -> Result<()> {
         return_errno_with_message!(Errno::EROFS, "SquashFS is read-only")
     }
 
@@ -275,19 +276,19 @@ impl Inode for SquashFsInode {
         Duration::from_secs(self.meta.mtime as u64)
     }
 
-    fn set_atime(&self, _time: Duration) {}
+    fn set_atime(&self, _self_dentry: &Dentry, _time: Duration) {}
 
     fn mtime(&self) -> Duration {
         Duration::from_secs(self.meta.mtime as u64)
     }
 
-    fn set_mtime(&self, _time: Duration) {}
+    fn set_mtime(&self, _self_dentry: &Dentry, _time: Duration) {}
 
     fn ctime(&self) -> Duration {
         Duration::from_secs(self.meta.mtime as u64)
     }
 
-    fn set_ctime(&self, _time: Duration) {}
+    fn set_ctime(&self, _self_dentry: &Dentry, _time: Duration) {}
 
     fn page_cache(&self) -> Option<Arc<Vmo>> {
         let InodeBody::File {
@@ -328,6 +329,7 @@ impl Inode for SquashFsInode {
 
     fn open(
         &self,
+        _self_dentry: &Dentry,
         _access_mode: AccessMode,
         _status_flags: StatusFlags,
     ) -> Option<Result<Box<dyn PerOpenFileOps>>> {
@@ -349,11 +351,23 @@ impl Inode for SquashFsInode {
         }
     }
 
-    fn create(&self, _name: &str, _type_: InodeType, _mode: InodeMode) -> Result<Arc<dyn Inode>> {
+    fn create(
+        &self,
+        _self_dentry: &Dentry,
+        _name: &str,
+        _type_: InodeType,
+        _mode: InodeMode,
+    ) -> Result<Arc<dyn Inode>> {
         return_errno_with_message!(Errno::EROFS, "SquashFS is read-only")
     }
 
-    fn mknod(&self, _name: &str, _mode: InodeMode, _type_: MknodType) -> Result<Arc<dyn Inode>> {
+    fn mknod(
+        &self,
+        _self_dentry: &Dentry,
+        _name: &str,
+        _mode: InodeMode,
+        _type_: MknodType,
+    ) -> Result<Arc<dyn Inode>> {
         return_errno_with_message!(Errno::EROFS, "SquashFS is read-only")
     }
 
@@ -376,23 +390,22 @@ impl Inode for SquashFsInode {
         fs.get_or_create_inode(inode_num, inode_ref)
     }
 
-    fn link(&self, _old: &Arc<dyn Inode>, _name: &str) -> Result<()> {
+    fn link(&self, _self_dentry: &Dentry, _old_dentry: &Dentry, _name: &str) -> Result<()> {
         return_errno_with_message!(Errno::EROFS, "SquashFS is read-only")
     }
 
-    fn unlink(&self, _name: &str, _child: &Arc<dyn Inode>) -> Result<()> {
+    fn unlink(&self, _child_dentry: &Dentry) -> Result<()> {
         return_errno_with_message!(Errno::EROFS, "SquashFS is read-only")
     }
 
-    fn rmdir(&self, _name: &str, _child: &Arc<dyn Inode>) -> Result<()> {
+    fn rmdir(&self, _child_dentry: &Dentry) -> Result<()> {
         return_errno_with_message!(Errno::EROFS, "SquashFS is read-only")
     }
 
     fn rename(
         &self,
-        _old_name: &str,
-        _old_inode: &Arc<dyn Inode>,
-        _new_dir_inode: &Arc<dyn Inode>,
+        _old_child_dentry: &Dentry,
+        _new_dir_dentry: &Dentry,
         _new_name: &str,
         _replaced_inode: Option<&Arc<dyn Inode>>,
         _mode: RenameMode,
