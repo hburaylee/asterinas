@@ -107,8 +107,37 @@ pub(super) fn sys_rseq(
         user_ptr: rseq_ptr,
         len: rseq_len,
         sig,
+        last_cpu_id: cpu_id,
     }));
     Ok(SyscallReturn::Return(0))
+}
+
+/// Updates the CPU IDs in the thread's rseq area when the thread has been
+/// rescheduled onto a different CPU.
+pub(crate) fn rseq_update_cpu_id(ctx: &Context) {
+    let Some(rseq) = ctx.thread_local.rseq().get() else {
+        return;
+    };
+
+    let cpu_id: u32 = CpuId::current_racy().into();
+    if rseq.last_cpu_id == cpu_id {
+        return;
+    }
+
+    let result = (|| -> Result<()> {
+        let user_space = ctx.user_space();
+        user_space.write_val(rseq.user_ptr + offset_of!(RseqArea, cpu_id_start), &cpu_id)?;
+        user_space.write_val(rseq.user_ptr + offset_of!(RseqArea, cpu_id), &cpu_id)?;
+        Ok(())
+    })();
+    if result.is_err() {
+        return;
+    }
+
+    ctx.thread_local.rseq().set(Some(Rseq {
+        last_cpu_id: cpu_id,
+        ..rseq
+    }));
 }
 
 fn write_rseq_ids(
