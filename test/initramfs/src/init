@@ -40,6 +40,7 @@ ln -s pts/ptmx /dev/ptmx
 
 mount -t ext2 /dev/vda /ext2
 mount -t exfat /dev/vdb /exfat
+mount -t squashfs /dev/vdd /squashfs
 
 # When the init process starts,
 # it does not have a process group, session, or controlling terminal.

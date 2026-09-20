@@ -73,8 +73,8 @@ CONFORMANCE_TEST_GVISOR_FILTER ?= ""
 XFSTESTS_FS_TYPE ?= ext2
 XFSTESTS_RUNLIST ?= short.list
 XFSTESTS_DISK_SIZE ?= 12G
-XFSTESTS_TEST_DEV ?= /dev/vdd
-XFSTESTS_SCRATCH_DEV ?= /dev/vde
+XFSTESTS_TEST_DEV ?= /dev/vde
+XFSTESTS_SCRATCH_DEV ?= /dev/vdf
 # Specify whether to build regression tests under `test/initramfs/src/regression`.
 ENABLE_REGRESSION_TEST ?= false
 # End of auto test features.
