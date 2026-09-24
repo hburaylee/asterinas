@@ -69,6 +69,8 @@ pub(crate) fn create_new_user_task(
         }
 
         while !current_thread.is_exited() {
+            crate::syscall::rseq_update_cpu_id(&ctx);
+
             // Execute the user code
             let return_reason = user_mode.execute(&ctx);
 
@@ -140,7 +142,8 @@ impl UserModeHooks for Context<'_> {
         self.has_pending()
     }
 
-    fn pre_user_run(&self, guard: &DisabledLocalIrqGuard) {
+    fn pre_user_run(&self, user_ctx: &mut UserContext, guard: &DisabledLocalIrqGuard) {
+        crate::syscall::rseq_ip_fixup_if_preempted(self, user_ctx);
         self.thread_local
             .supp_user_context()
             .before_user_exec(guard);
