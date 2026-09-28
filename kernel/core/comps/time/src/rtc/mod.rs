@@ -39,11 +39,14 @@ macro_rules! declare_rtc_drivers {
 mod cmos;
 #[cfg(target_arch = "riscv64")]
 mod goldfish;
+#[cfg(target_arch = "x86_64")]
+mod kvmclock;
 #[cfg(target_arch = "loongarch64")]
 mod loongson;
 
 declare_rtc_drivers! {
     #[cfg(target_arch = "x86_64")] cmos::RtcCmos,
+    #[cfg(target_arch = "x86_64")] kvmclock::RtcKvmClock,
     #[cfg(target_arch = "riscv64")] goldfish::RtcGoldfish,
     #[cfg(target_arch = "loongarch64")] loongson::RtcLoongson,
 }
