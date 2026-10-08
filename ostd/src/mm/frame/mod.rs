@@ -72,8 +72,20 @@ pub(in crate::mm) fn min_paddr() -> Paddr {
     MIN_PADDR.load(Ordering::Relaxed)
 }
 
+#[cfg(feature = "kernelet")]
+pub(crate) fn init_kernelet_max_paddr(ceiling: Paddr) {
+    assert!(ceiling != 0 && ceiling.is_multiple_of(PAGE_SIZE));
+    assert_eq!(MAX_PADDR.swap(ceiling, Ordering::Release), 0);
+}
+
+/// Extends the image's metadata ceiling after Host grant publication.
+#[cfg(feature = "kernelet")]
+pub(crate) fn extend_kernelet_max_paddr(ceiling: Paddr) {
+    MAX_PADDR.fetch_max(ceiling, Ordering::Release);
+}
+
 /// Returns the maximum physical address that is tracked by frame metadata.
-pub(in crate::mm) fn max_paddr() -> Paddr {
+pub(crate) fn max_paddr() -> Paddr {
     let max_paddr = MAX_PADDR.load(Ordering::Relaxed) as Paddr;
     debug_assert_ne!(max_paddr, 0);
     max_paddr

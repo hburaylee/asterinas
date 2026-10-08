@@ -11,11 +11,19 @@ ENABLE_KVM ?= 1
 INTEL_TDX ?= 0
 MEM ?= 8G
 OVMF ?= on
-RELEASE ?= 0
+# The interactive kernelet demo uses optimized Host and kernelet kernels.
+# Pass RELEASE=0 to use the development profile for debugging.
+RELEASE ?= $(if $(filter run_kernelet,$(MAKECMDGOALS)),1,0)
 RELEASE_LTO ?= 0
 LOG_LEVEL ?= error
 SCHEME ?= ""
-SMP ?= 1
+# `run_kernelet` boots with four CPUs by default:
+# the runtime's default sandbox uses two vCPUs,
+# and Host worker threads and sandbox vCPUs
+# share the physical CPUs through the Host scheduler
+# (no CPU is reserved for a sandbox).
+# Benchmark comparisons must pass the same SMP explicitly to both targets.
+SMP ?= $(if $(filter run_kernelet,$(MAKECMDGOALS)),4,1)
 OSTD_TASK_STACK_SIZE_IN_PAGES ?= 64
 FEATURES ?=
 NO_DEFAULT_FEATURES ?= 0
@@ -361,6 +369,29 @@ else ifeq ($(AUTO_TEST), vsock)
 	@tail --lines 100 qemu.log | grep -q "^Vsock test passed." \
 		|| (echo "Vsock test failed" && exit 1)
 endif
+
+# Build the kernelet userspace and boot a Host with an embedded kernelet image.
+.PHONY: run_kernelet
+# Retain the development stack size for the embedded-image boot path.
+run_kernelet: OSTD_TASK_STACK_SIZE_IN_PAGES = 64
+run_kernelet: KERNELET_USERSPACE_DIR := $(abspath kernelet/target/x86_64-unknown-linux-musl/release)
+run_kernelet:
+	@if [ "$(TARGET_ARCH)" != "x86_64" ]; then \
+		echo "run_kernelet requires TARGET_ARCH=x86_64" >&2; \
+		exit 1; \
+	fi
+	@if [ "$(INITRAMFS)" != "on" ]; then \
+		echo "run_kernelet requires INITRAMFS=on" >&2; \
+		exit 1; \
+	fi
+	@$(MAKE) --no-print-directory $(CARGO_OSDK)
+	@rustup target add x86_64-unknown-linux-musl
+	@cargo build --manifest-path kernelet/Cargo.toml --release --target x86_64-unknown-linux-musl
+	@$(MAKE) --no-print-directory initramfs \
+		KERNELET_RUNTIME="$(KERNELET_USERSPACE_DIR)/kernelet-runtime" \
+		KERNELET_AGENT="$(KERNELET_USERSPACE_DIR)/kernelet-agent" \
+		KERNELET_SHIM="$(KERNELET_USERSPACE_DIR)/containerd-shim-kernelet-v2"
+	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) --kernelet
 
 # Build the Asterinas NixOS ISO installer image
 iso: BOOT_PROTOCOL = linux-efi-handover64

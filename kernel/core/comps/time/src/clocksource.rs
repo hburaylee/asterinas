@@ -31,9 +31,8 @@ const NANOS_PER_SECOND: u32 = 1_000_000_000;
 ///
 /// Additionally, the `ClockSource` also holds a last record for an `Instant` and the
 /// corresponding cycles, which acts as a reference point for subsequent time retrieval.
-/// To prevent numerical overflow during  the calculation of `Instant`, this last recorded instant
-/// **must be periodically refreshed**. The maximum interval for these updates must be determined
-/// at the time of the `ClockSource` initialization.
+/// The expected interval between updates determines the coefficient used for cycle conversion.
+/// Longer intervals use a full-width product to avoid overflowing the coefficient calculation.
 ///
 /// # Examples
 /// Suppose we have a counter called `counter` which have the frequency `counter.freq`, and the method
@@ -49,8 +48,7 @@ const NANOS_PER_SECOND: u32 = 1_000_000_000;
 /// let instant = counter_clock.read_instant();
 /// ```
 ///
-/// If using this `ClockSource`, you must ensure its internal instant will be updated
-/// at least once within a time interval of not more than `max_delay_secs.
+/// Updating this `ClockSource` within `max_delay_secs` keeps cycle conversion on the fast path.
 pub struct ClockSource {
     read_cycles: Arc<dyn Fn() -> u64 + Sync + Send>,
     base: ClockSourceBase,
@@ -63,7 +61,7 @@ impl ClockSource {
     /// Creates a new `ClockSource` instance.
     ///
     /// This method requires basic information of the time counter, including the function for
-    /// reading cycles, the frequency, and the maximum delay seconds to update this `ClockSource`.
+    /// reading cycles, the frequency, and the expected interval between updates in seconds.
     /// The `ClockSource` also calculates a reliable `Coeff` based on the counter's frequency and
     /// the maximum delay seconds. This `Coeff` is used to convert the number of cycles into
     /// the duration of time that has passed for those cycles.
@@ -119,13 +117,11 @@ impl ClockSource {
         if cycles <= max_cycles {
             self.coeff * cycles
         } else {
-            ostd::warn!(
-                "The clock source becomes not reliable since an \
-                interval of {} cycles exceeds the maximum delay {}(s)",
-                cycles,
-                max_cycles
-            );
-            self.coeff * max_cycles
+            // A paused CPU can exceed the coefficient's u64 multiplication
+            // bound. Use the same coefficient in a wider product so the
+            // conversion stays continuous when crossing that bound.
+            let nanos = (u128::from(cycles) * u128::from(self.coeff.mult())) >> self.coeff.shift();
+            nanos.min(u128::from(u64::MAX)) as u64
         }
     }
 
@@ -246,6 +242,69 @@ impl ClockSourceBase {
         ClockSourceBase {
             freq,
             max_delay_secs,
+        }
+    }
+}
+
+#[cfg(ktest)]
+mod test {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use ostd::prelude::ktest;
+
+    use super::*;
+
+    #[ktest]
+    fn elapsed_time_survives_delayed_clocksource_updates() {
+        let counter = Arc::new(AtomicU64::new(123_000_000_000));
+        let read_counter = counter.clone();
+        let clock = ClockSource::new(
+            1_000_000_000,
+            100,
+            Arc::new(move || read_counter.load(Ordering::Relaxed)),
+        );
+        clock.calibrate(clock.read_cycles());
+
+        counter.fetch_add(105_123_000_000, Ordering::Relaxed);
+        let instant = clock.read_instant();
+        assert_eq!(
+            Duration::new(instant.secs(), instant.nanos()),
+            Duration::from_millis(105_123)
+        );
+
+        clock.update();
+        counter.fetch_add(2_000_000_000, Ordering::Relaxed);
+        let instant = clock.read_instant();
+        assert_eq!(
+            Duration::new(instant.secs(), instant.nanos()),
+            Duration::from_millis(107_123)
+        );
+    }
+
+    #[ktest]
+    fn clocksource_conversion_is_monotonic_across_its_fast_path_bound() {
+        for frequency in [1_000_000_000, 1_500_000_000, 2_400_000_000, 4_000_000_000] {
+            let counter = Arc::new(AtomicU64::new(0));
+            let reader = counter.clone();
+            let clock = ClockSource::new(
+                frequency,
+                100,
+                Arc::new(move || reader.load(Ordering::Relaxed)),
+            );
+            clock.calibrate(0);
+            let boundary = frequency * clock.max_delay_secs();
+            let mut previous = Duration::ZERO;
+            for cycles in [boundary - 1, boundary, boundary + 1, boundary + frequency] {
+                counter.store(cycles, Ordering::Relaxed);
+                let instant = clock.read_instant();
+                let now = Duration::new(instant.secs(), instant.nanos());
+                assert!(now >= previous, "clock moved backwards at {frequency} Hz");
+                previous = now;
+            }
+            clock.update();
+            counter.fetch_add(frequency, Ordering::Relaxed);
+            let instant = clock.read_instant();
+            assert!(Duration::new(instant.secs(), instant.nanos()) >= previous);
         }
     }
 }

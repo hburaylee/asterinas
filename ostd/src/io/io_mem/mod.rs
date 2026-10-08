@@ -3,20 +3,20 @@
 //! I/O memory and its allocator that allocates memory I/O (MMIO) to device drivers.
 
 mod allocator;
+#[cfg(any(not(target_arch = "x86_64"), feature = "cvm_guest"))]
 pub(crate) mod util;
 
-use core::{
-    marker::PhantomData,
-    ops::{Deref, Range},
-};
+use core::{marker::PhantomData, ops::Range};
 
 use align_ext::AlignExt;
 use inherit_methods_macro::inherit_methods;
 
 pub(crate) use self::allocator::IoMemAllocatorBuilder;
 pub(super) use self::allocator::init;
+#[cfg(target_arch = "x86_64")]
+use crate::arch::if_tdx_enabled;
 #[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))]
-use crate::arch::{if_tdx_enabled, tdx_guest::unprotect_gpa_tdvm_call};
+use crate::arch::tdx_guest::unprotect_gpa_tdvm_call;
 use crate::{
     Error,
     arch::io::io_mem::{read_once, write_once},
@@ -45,10 +45,20 @@ pub(crate) enum Sensitive {}
 #[derive(Clone, Debug)]
 pub enum Insensitive {}
 
+#[derive(Clone, Debug)]
+enum IoMemBackend {
+    Native(Arc<KVirtArea>),
+    #[cfg(feature = "kernelet")]
+    Virtual {
+        device: u16,
+        device_base: Paddr,
+    },
+}
+
 /// I/O memory.
 #[derive(Clone, Debug)]
 pub struct IoMem<SecuritySensitivity = Insensitive> {
-    kvirt_area: Arc<KVirtArea>,
+    backend: IoMemBackend,
     // The actually used range for MMIO is `kvirt_area.start + offset..kvirt_area.start + offset + limit`
     offset: usize,
     limit: usize,
@@ -69,7 +79,7 @@ impl<SecuritySensitivity> IoMem<SecuritySensitivity> {
 
         // We've checked the range is in bounds, so we can construct the new `IoMem` safely.
         Self {
-            kvirt_area: self.kvirt_area.clone(),
+            backend: self.backend.clone(),
             offset: self.offset + range.start,
             limit: range.len(),
             pa: self.pa + range.start,
@@ -141,7 +151,7 @@ impl<SecuritySensitivity> IoMem<SecuritySensitivity> {
         };
 
         Self {
-            kvirt_area: Arc::new(kva),
+            backend: IoMemBackend::Native(Arc::new(kva)),
             offset: range.start - first_page_start,
             limit: range.len(),
             pa: range.start,
@@ -157,7 +167,11 @@ impl<SecuritySensitivity> IoMem<SecuritySensitivity> {
 
     /// Returns the base virtual address of the MMIO range.
     fn base(&self) -> usize {
-        self.kvirt_area.deref().start() + self.offset
+        match &self.backend {
+            IoMemBackend::Native(area) => area.start() + self.offset,
+            #[cfg(feature = "kernelet")]
+            IoMemBackend::Virtual { .. } => unreachable!("virtual MMIO has no mapped address"),
+        }
     }
 
     /// Validates that the offset range lies within the MMIO window.
@@ -166,6 +180,30 @@ impl<SecuritySensitivity> IoMem<SecuritySensitivity> {
             return Err(Error::InvalidArgs);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "kernelet")]
+    fn virtual_register(&self, offset: usize, width: usize) -> Result<Option<(u16, u32)>> {
+        let IoMemBackend::Virtual {
+            device,
+            device_base,
+        } = &self.backend
+        else {
+            return Ok(None);
+        };
+        self.check_range(offset, width)?;
+        let register = self
+            .pa
+            .checked_sub(*device_base)
+            .and_then(|base| base.checked_add(offset))
+            .ok_or(Error::InvalidArgs)?;
+        if !register.is_multiple_of(width) {
+            return Err(Error::InvalidArgs);
+        }
+        Ok(Some((
+            *device,
+            register.try_into().map_err(|_| Error::InvalidArgs)?,
+        )))
     }
 }
 
@@ -185,7 +223,7 @@ impl IoMem<Sensitive> {
     /// effects (e.g., corrupting the kernel memory).
     pub(crate) unsafe fn read_once<T: PodOnce>(&self, offset: usize) -> T {
         debug_assert!(offset + size_of::<T>() <= self.limit);
-        let ptr = (self.kvirt_area.deref().start() + self.offset + offset) as *const T;
+        let ptr = (self.base() + offset) as *const T;
         // SAFETY: The safety of the read operation's semantics is upheld by the caller.
         unsafe { read_once(ptr) }
     }
@@ -204,13 +242,18 @@ impl IoMem<Sensitive> {
     /// effects (e.g., corrupting the kernel memory).
     pub(crate) unsafe fn write_once<T: PodOnce>(&self, offset: usize, value: &T) {
         debug_assert!(offset + size_of::<T>() <= self.limit);
-        let ptr = (self.kvirt_area.deref().start() + self.offset + offset) as *mut T;
+        let ptr = (self.base() + offset) as *mut T;
         // SAFETY: The safety of the write operation's semantics is upheld by the caller.
         unsafe { write_once(ptr, *value) };
     }
 }
 
 impl IoMem<Insensitive> {
+    #[cfg(feature = "kernelet")]
+    fn is_virtual(&self) -> bool {
+        matches!(self.backend, IoMemBackend::Virtual { .. })
+    }
+
     /// Acquires an `IoMem` instance for the given range.
     ///
     /// The I/O memory cache policy is set to uncacheable by default.
@@ -223,11 +266,38 @@ impl IoMem<Insensitive> {
         range: Range<Paddr>,
         cache_policy: CachePolicy,
     ) -> Result<IoMem<Insensitive>> {
-        allocator::IO_MEM_ALLOCATOR
-            .get()
-            .unwrap()
-            .acquire(range, cache_policy)
-            .ok_or(Error::AccessDenied)
+        #[cfg(feature = "kernelet")]
+        {
+            if range.is_empty() {
+                return Err(Error::InvalidArgs);
+            }
+            let device = crate::kernelet::entry::devices().iter().find(|device| {
+                let base = device.mmio_base as usize;
+                let end = base.checked_add(device.reg_bytes as usize);
+                range.start >= base && end.is_some_and(|end| range.end <= end)
+            });
+            let device = device.ok_or(Error::AccessDenied)?;
+            return Ok(Self {
+                backend: IoMemBackend::Virtual {
+                    device: device.id,
+                    device_base: device.mmio_base as usize,
+                },
+                offset: 0,
+                limit: range.len(),
+                pa: range.start,
+                cache_policy,
+                phantom: PhantomData,
+            });
+        }
+
+        #[cfg(not(feature = "kernelet"))]
+        {
+            allocator::IO_MEM_ALLOCATOR
+                .get()
+                .unwrap()
+                .acquire(range, cache_policy)
+                .ok_or(Error::AccessDenied)
+        }
     }
 
     /// Reads from MMIO into fallible memory and returns the copied length.
@@ -241,6 +311,17 @@ impl IoMem<Insensitive> {
     ) -> Result<usize, (Error, usize)> {
         let len = writer.avail();
         self.check_range(offset, len).map_err(|err| (err, 0))?;
+
+        #[cfg(feature = "kernelet")]
+        if self.is_virtual() {
+            for index in 0..len {
+                let byte = self
+                    .read_once::<u8>(offset + index)
+                    .map_err(|err| (err, index))?;
+                writer.write_val(&byte).map_err(|err| (err, index))?;
+            }
+            return Ok(len);
+        }
 
         let src = (self.base() + offset) as *const u8;
         // SAFETY: `src` points to a validated MMIO range and `writer.cursor()` points to
@@ -267,6 +348,20 @@ impl IoMem<Insensitive> {
         let len = reader.remain();
         self.check_range(offset, len).map_err(|err| (err, 0))?;
 
+        #[cfg(feature = "kernelet")]
+        if self.is_virtual() {
+            for index in 0..len {
+                let byte = reader
+                    .clone()
+                    .read_val::<u8>()
+                    .map_err(|err| (err, index))?;
+                self.write_once(offset + index, &byte)
+                    .map_err(|err| (err, index))?;
+                reader.skip(1);
+            }
+            return Ok(len);
+        }
+
         let dst = (self.base() + offset) as *mut u8;
         // SAFETY: `dst` points to a validated MMIO range and `reader.cursor()` points to
         // fallible source memory tracked by `reader`.
@@ -283,6 +378,18 @@ impl IoMem<Insensitive> {
 
 impl VmIoOnce for IoMem<Insensitive> {
     fn read_once<T: PodOnce>(&self, offset: usize) -> Result<T> {
+        #[cfg(feature = "kernelet")]
+        if let Some((device, register)) = self.virtual_register(offset, size_of::<T>())? {
+            let result = (crate::kernelet::entry::services().mmio_read)(
+                device as u32,
+                register,
+                size_of::<T>() as u32,
+            );
+            if result.status < 0 {
+                return Err(Error::AccessDenied);
+            }
+            return Ok(T::from_bytes(&result.value.to_le_bytes()[..size_of::<T>()]));
+        }
         self.check_range(offset, size_of::<T>())?;
         let ptr = (self.base() + offset) as *const T;
         if !ptr.is_aligned() {
@@ -295,6 +402,22 @@ impl VmIoOnce for IoMem<Insensitive> {
     }
 
     fn write_once<T: PodOnce>(&self, offset: usize, value: &T) -> Result<()> {
+        #[cfg(feature = "kernelet")]
+        if let Some((device, register)) = self.virtual_register(offset, size_of::<T>())? {
+            let mut bytes = [0u8; 8];
+            bytes[..size_of::<T>()].copy_from_slice(value.as_bytes());
+            let status = (crate::kernelet::entry::services().mmio_write)(
+                device as u32,
+                register,
+                size_of::<T>() as u32,
+                u64::from_le_bytes(bytes),
+            );
+            return if status < 0 {
+                Err(Error::AccessDenied)
+            } else {
+                Ok(())
+            };
+        }
         self.check_range(offset, size_of::<T>())?;
         let ptr = (self.base() + offset) as *mut T;
         if !ptr.is_aligned() {
@@ -312,6 +435,17 @@ impl VmIo for IoMem<Insensitive> {
         let len = writer.avail();
         self.check_range(offset, len)?;
 
+        #[cfg(feature = "kernelet")]
+        if self.is_virtual() {
+            let mut tentative = writer.clone_exclusive();
+            for index in 0..len {
+                let byte = self.read_once::<u8>(offset + index)?;
+                tentative.write_val(&byte)?;
+            }
+            writer.skip(len);
+            return Ok(());
+        }
+
         let src = (self.base() + offset) as *const u8;
         // SAFETY: `src` points to a validated MMIO range and `writer.cursor()` points to
         // fallible destination memory tracked by `writer`.
@@ -327,6 +461,13 @@ impl VmIo for IoMem<Insensitive> {
     fn read_bytes(&self, offset: usize, buf: &mut [u8]) -> Result<()> {
         let len = buf.len();
         self.check_range(offset, len)?;
+        #[cfg(feature = "kernelet")]
+        if self.is_virtual() {
+            for (index, byte) in buf.iter_mut().enumerate() {
+                *byte = self.read_once(offset + index)?;
+            }
+            return Ok(());
+        }
         let src = (self.base() + offset) as *const u8;
         let dst = buf.as_mut_ptr();
 
@@ -338,6 +479,17 @@ impl VmIo for IoMem<Insensitive> {
     fn write(&self, offset: usize, reader: &mut VmReader) -> Result<()> {
         let len = reader.remain();
         self.check_range(offset, len)?;
+
+        #[cfg(feature = "kernelet")]
+        if self.is_virtual() {
+            let mut tentative = reader.clone();
+            for index in 0..len {
+                let byte = tentative.read_val::<u8>()?;
+                self.write_once(offset + index, &byte)?;
+            }
+            reader.skip(len);
+            return Ok(());
+        }
 
         let dst = (self.base() + offset) as *mut u8;
         // SAFETY: `dst` points to a validated MMIO range and `reader.cursor()` points to
@@ -354,6 +506,13 @@ impl VmIo for IoMem<Insensitive> {
     fn write_bytes(&self, offset: usize, buf: &[u8]) -> Result<()> {
         let len = buf.len();
         self.check_range(offset, len)?;
+        #[cfg(feature = "kernelet")]
+        if self.is_virtual() {
+            for (index, byte) in buf.iter().enumerate() {
+                self.write_once(offset + index, byte)?;
+            }
+            return Ok(());
+        }
         let src = buf.as_ptr();
         let dst = (self.base() + offset) as *mut u8;
 
@@ -377,6 +536,19 @@ impl VmIoFill for IoMem<Insensitive> {
         let write_len = core::cmp::min(len, available);
         if write_len == 0 {
             return Err((Error::InvalidArgs, 0));
+        }
+
+        #[cfg(feature = "kernelet")]
+        if self.is_virtual() {
+            for index in 0..write_len {
+                self.write_once(offset + index, &0u8)
+                    .map_err(|err| (err, index))?;
+            }
+            return if write_len == len {
+                Ok(())
+            } else {
+                Err((Error::InvalidArgs, write_len))
+            };
         }
 
         let dst = (self.base() + offset) as *mut u8;

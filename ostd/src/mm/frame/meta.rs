@@ -15,6 +15,7 @@
 //! address in the kernel space. So finding the metadata of a frame often
 //! comes with no costs since the translation is a simple arithmetic operation.
 
+#[cfg(not(feature = "kernelet"))]
 pub(crate) mod mapping {
     //! The metadata of each physical page is linear mapped to fixed virtual addresses
     //! in [`FRAME_METADATA_RANGE`].
@@ -34,6 +35,31 @@ pub(crate) mod mapping {
         let base = FRAME_METADATA_RANGE.start;
         let offset = (vaddr - base) / size_of::<MetaSlot>();
         offset * PAGE_SIZE
+    }
+
+    pub(crate) const fn has_meta(paddr: Paddr) -> bool {
+        let _ = paddr;
+        true
+    }
+}
+
+#[cfg(feature = "kernelet")]
+pub(crate) mod mapping {
+    use crate::{
+        kernelet::image_grant,
+        mm::{Paddr, PagingConstsTrait, Vaddr},
+    };
+
+    pub(crate) fn frame_to_meta<C: PagingConstsTrait>(paddr: Paddr) -> Vaddr {
+        image_grant::frame_to_meta(paddr)
+    }
+
+    pub(crate) fn meta_to_frame<C: PagingConstsTrait>(vaddr: Vaddr) -> Paddr {
+        image_grant::meta_to_frame(vaddr)
+    }
+
+    pub(crate) fn has_meta(paddr: Paddr) -> bool {
+        image_grant::has_meta(paddr)
     }
 }
 
@@ -73,6 +99,10 @@ pub const FRAME_METADATA_MAX_SIZE: usize = META_SLOT_SIZE
 pub const FRAME_METADATA_MAX_ALIGN: usize = META_SLOT_SIZE;
 
 const META_SLOT_SIZE: usize = 64;
+
+/// Byte offset of the reference count in the Host-created metadata pages.
+#[cfg(not(feature = "kernelet"))]
+pub(crate) const META_REF_COUNT_OFFSET: usize = core::mem::offset_of!(MetaSlot, ref_count);
 
 #[repr(C)]
 pub(in crate::mm) struct MetaSlot {
@@ -210,7 +240,7 @@ pub(super) fn get_slot(paddr: Paddr) -> Result<&'static MetaSlot, GetFrameError>
     if !paddr.is_multiple_of(PAGE_SIZE) {
         return Err(GetFrameError::NotAligned);
     }
-    if paddr < super::min_paddr() || paddr >= super::max_paddr() {
+    if paddr < super::min_paddr() || paddr >= super::max_paddr() || !mapping::has_meta(paddr) {
         return Err(GetFrameError::OutOfBound);
     }
 

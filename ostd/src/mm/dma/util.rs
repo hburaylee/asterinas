@@ -252,7 +252,7 @@ unsafe fn dealloc_protect_physical_range(pa_range: &Range<Paddr>) {
     });
 }
 
-#[cfg(all(target_arch = "x86_64", any(debug_assertions, feature = "cvm_guest")))]
+#[cfg(all(target_arch = "x86_64", feature = "cvm_guest"))]
 fn panic_page_convert_error(
     action: &str,
     gpa: Paddr,

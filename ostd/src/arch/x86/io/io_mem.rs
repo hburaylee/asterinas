@@ -4,6 +4,7 @@
 
 use core::arch::asm;
 
+#[cfg(feature = "cvm_guest")]
 use super::cvm;
 use crate::{
     arch::{if_tdx_enabled, mm::__memcpy_fallible},

@@ -170,6 +170,7 @@ dependencies = [
  "inventory",
  "io-util",
  "jhash",
+ "kernelet-abi",
  "keyable-arc",
  "lending-iterator",
  "logo-ascii-art",
@@ -186,6 +187,7 @@ dependencies = [
  "riscv",
  "short-vis-path",
  "smallvec",
+ "smoltcp",
  "sparse-id-alloc",
  "spin",
  "takeable",
@@ -416,6 +418,7 @@ dependencies = [
  "fdt-util",
  "ostd",
  "spin",
+ "time",
 ]
 
 [[package]]
@@ -1110,6 +1113,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "078e285eafdfb6c4b434e0d31e8cfcb5115b651496faca5749b88fafd4f23bfd"
 
 [[package]]
+name = "kernelet-abi"
+version = "0.1.0"
+dependencies = [
+ "ostd-pod",
+ "zerocopy",
+]
+
+[[package]]
 name = "keyable-arc"
 version = "0.1.0"
 
@@ -1413,6 +1424,7 @@ dependencies = [
  "id-alloc",
  "inherit-methods-macro",
  "int-to-c-enum",
+ "intrusive-collections",
  "linux-boot-params",
  "log",
  "loongArch64",

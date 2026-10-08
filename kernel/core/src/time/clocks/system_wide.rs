@@ -4,7 +4,13 @@ use alloc::sync::Arc;
 use core::time::Duration;
 
 use aster_time::read_monotonic_time;
-use ostd::{cpu::PinCurrentCpu, cpu_local, sync::SpinLock, task::disable_preempt, timer::Jiffies};
+use ostd::{
+    cpu::{CpuId, PinCurrentCpu},
+    cpu_local,
+    sync::SpinLock,
+    task::disable_preempt,
+    timer::{Jiffies, TIMER_FREQ},
+};
 use paste::paste;
 use spin::Once;
 
@@ -280,6 +286,31 @@ fn init_jiffies_clock_manager() {
             .process_expired_timers();
     };
     time::softirq::register_callback(callback);
+}
+
+/// Returns the next timer expiry in the shared elapsed-jiffy clock domain.
+pub(crate) fn next_timer_expiry(cpu: CpuId) -> Option<u64> {
+    let now_jiffies = Jiffies::elapsed().as_u64();
+    let tick_ns = 1_000_000_000 / TIMER_FREQ;
+    let mut earliest = None;
+
+    for manager in [
+        CLOCK_REALTIME_MANAGER.get_on_cpu(cpu).get().unwrap(),
+        CLOCK_MONOTONIC_MANAGER.get_on_cpu(cpu).get().unwrap(),
+        CLOCK_BOOTTIME_MANAGER.get_on_cpu(cpu).get().unwrap(),
+        JIFFIES_TIMER_MANAGER.get().unwrap(),
+    ] {
+        let Some(expiry) = manager.next_expiry() else {
+            continue;
+        };
+        let remaining_ns = expiry
+            .saturating_sub(manager.clock().read_time())
+            .as_nanos();
+        let remaining_jiffies = remaining_ns.div_ceil(tick_ns as u128).min(u64::MAX as u128) as u64;
+        let candidate = now_jiffies.saturating_add(remaining_jiffies);
+        earliest = Some(earliest.map_or(candidate, |current: u64| current.min(candidate)));
+    }
+    earliest
 }
 
 fn update_coarse_clock() {

@@ -90,10 +90,22 @@ pub(super) fn enter<F: FnOnce()>(f: F, cpu_priv_at_irq: PrivilegeLevel) {
         bit_1 | bit_0
     };
     INTERRUPT_LEVEL.add_assign(increment);
+    #[cfg(feature = "kernelet")]
+    publish_virtual_level();
 
     f();
 
     INTERRUPT_LEVEL.sub_assign(increment);
+    #[cfg(feature = "kernelet")]
+    publish_virtual_level();
+}
+
+#[cfg(feature = "kernelet")]
+fn publish_virtual_level() {
+    crate::kernelet::entry::vcpu_record().irq_level.store(
+        InterruptLevel::current().as_u8() as u32,
+        core::sync::atomic::Ordering::Release,
+    );
 }
 
 cpu_local_cell! {
@@ -116,5 +128,5 @@ cpu_local_cell! {
     ///
     /// This compact encoding allows us to update this value
     /// in a single arithmetic operation (see `enter`).
-    static INTERRUPT_LEVEL: u8 = 0;
+    pub(crate) static INTERRUPT_LEVEL: u8 = 0;
 }

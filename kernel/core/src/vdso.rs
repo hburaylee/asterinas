@@ -383,6 +383,14 @@ fn init_vdso() {
 }
 
 pub(super) fn init_in_first_kthread() {
+    // This prebuilt vDSO extrapolates raw TSC, while a kernelet uses the
+    // Host clock page. Clock mode None does not disable __vdso_time or
+    // coarse reads, whose cached timestamps can stop during vCPU idle.
+    // Leave the vDSO absent so libc uses the ordinary clock syscalls.
+    if cfg!(feature = "kernelet") {
+        return;
+    }
+
     init_start_secs_count();
     init_vdso();
 

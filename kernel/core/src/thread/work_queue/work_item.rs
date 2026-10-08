@@ -4,8 +4,10 @@
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
-use intrusive_collections::{LinkedListAtomicLink, intrusive_adapter};
-use ostd::cpu::{CpuId, CpuSet};
+use ostd::{
+    cpu::{CpuId, CpuSet},
+    sync::{ArcQueueItem, ArcQueueLink},
+};
 
 use crate::prelude::*;
 
@@ -13,11 +15,17 @@ use crate::prelude::*;
 pub(crate) struct WorkItem {
     work_func: Box<dyn Fn() + Send + Sync>,
     cpu_affinity: CpuSet,
+    // This stays set after dequeue until a worker starts the callback. The
+    // queue link tracks only membership, so it cannot replace this flag.
     was_pending: AtomicBool,
-    link: LinkedListAtomicLink,
+    link: Arc<ArcQueueLink<Self>>,
 }
 
-intrusive_adapter!(pub(super) WorkItemAdapter = Arc<WorkItem>: WorkItem { link: LinkedListAtomicLink });
+impl ArcQueueItem for WorkItem {
+    fn queue_link(&self) -> &Arc<ArcQueueLink<Self>> {
+        &self.link
+    }
+}
 
 impl WorkItem {
     pub(crate) fn new(work_func: Box<dyn Fn() + Send + Sync>) -> Arc<WorkItem> {
@@ -26,7 +34,7 @@ impl WorkItem {
             work_func,
             cpu_affinity,
             was_pending: AtomicBool::new(false),
-            link: LinkedListAtomicLink::new(),
+            link: ArcQueueLink::new(),
         })
     }
 

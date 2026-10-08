@@ -77,9 +77,15 @@ macro_rules! cpu_local_cell {
 ///
 /// For the difference between [`super::CpuLocal`] and [`CpuLocalCell`], see
 /// [`super`].
+#[repr(transparent)]
 pub struct CpuLocalCell<T: 'static>(UnsafeCell<T>);
 
 impl<T: 'static> CpuLocalCell<T> {
+    /// Returns this static cell's offset from the architecture CPU-local base.
+    pub(crate) fn static_offset(&'static self) -> usize {
+        self as *const _ as usize - __cpu_local_start as *const () as usize
+    }
+
     /// Initializes a CPU-local object.
     ///
     /// Please do not call this function directly. Instead, use the

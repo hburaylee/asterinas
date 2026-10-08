@@ -3,6 +3,9 @@
 pub(super) mod cpu_local;
 mod guard;
 
+#[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+pub(crate) use cpu_local::carrier;
+
 pub use self::guard::{DisabledPreemptGuard, disable_preempt};
 
 /// Halts the CPU until interrupts if no preemption is required.
@@ -30,7 +33,7 @@ pub fn halt_cpu() {
     } else {
         core::mem::forget(irq_guard);
         // IRQs were previously enabled (checked by `might_sleep`). So we can re-enable them now.
-        crate::arch::irq::enable_local_and_halt();
+        crate::timer::enable_local_and_halt();
     }
 
     super::scheduler::might_preempt();

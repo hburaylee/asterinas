@@ -7,7 +7,9 @@
 
 pub(super) mod acpi;
 pub(super) mod apic;
+#[cfg(not(feature = "kernelet"))]
 pub(super) mod kvm_clock;
+#[cfg(not(feature = "kernelet"))]
 pub(super) mod tsc;
 
 pub use acpi::{ACPI_INFO, AcpiInfo};

@@ -50,6 +50,9 @@ impl IrqLine {
 
     /// Allocates a specific IRQ line.
     pub fn alloc_specific(irq_num: u8) -> Result<Self> {
+        if !(IRQ_NUM_MIN..=IRQ_NUM_MAX).contains(&irq_num) {
+            return Err(Error::InvalidArgs);
+        }
         get_or_init_allocator()
             .lock()
             .alloc_specific((irq_num - IRQ_NUM_MIN) as usize)

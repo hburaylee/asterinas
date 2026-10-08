@@ -3,11 +3,13 @@
 //! CPU execution context control.
 
 use alloc::boxed::Box;
+#[cfg(not(feature = "kernelet"))]
 use core::arch::x86_64::{_fxrstor64, _fxsave64, _xrstor64, _xsave64};
 
 use bitflags::bitflags;
 use ostd_pod::{FromZeros, IntoBytes};
 use spin::Once;
+#[cfg(not(feature = "kernelet"))]
 use x86::bits64::segmentation::{rdfsbase, rdgsbase, swapgs, wrfsbase, wrgsbase};
 use x86_64::registers::{
     control::{Cr0, Cr0Flags},
@@ -15,13 +17,14 @@ use x86_64::registers::{
     xcontrol::XCr0,
 };
 
+#[cfg(not(feature = "kernelet"))]
+use crate::debug;
 use crate::{
     arch::{
         irq::HwIrqLine,
         trap::{RawUserContext, TrapFrame},
     },
     cpu::PrivilegeLevel,
-    debug,
     irq::{DisabledLocalIrqGuard, call_irq_callback_functions},
     mm::Vaddr,
     user::{ReturnReason, UserContextApi, UserContextApiInternal, UserModeHooks},
@@ -33,6 +36,7 @@ cfg_select! {
 
         use tdx::VirtualizationExceptionHandler;
     }
+    _ => {}
 }
 
 /// RFLAGS bits that non-privileged code may modify.
@@ -54,6 +58,10 @@ pub const USER_MODIFIABLE_RFLAGS: usize = (RFlags::CARRY_FLAG.bits()
     | RFlags::RESUME_FLAG.bits()
     | RFlags::ALIGNMENT_CHECK.bits()
     | RFlags::NESTED_TASK.bits()) as usize;
+
+mod kernelet;
+#[cfg(not(feature = "kernelet"))]
+pub(crate) use kernelet::run_host_user;
 
 /// Userspace CPU context, including general-purpose registers and exception information.
 #[repr(C)]
@@ -111,6 +119,13 @@ pub struct GeneralRegs {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FsBase(usize);
 
+#[cfg(feature = "kernelet")]
+crate::cpu_local_cell! {
+    static KERNELET_USER_FS_BASE: usize = 0;
+    static KERNELET_USER_GS_BASE: usize = 0;
+    static KERNELET_USER_FAULT_ADDR: usize = 0;
+}
+
 impl FsBase {
     /// Creates a new `FsBase` with the given address.
     pub fn new(addr: usize) -> Self {
@@ -124,14 +139,30 @@ impl FsBase {
 
     /// Saves the current CPU FS base into this struct.
     pub fn save(&mut self) {
+        #[cfg(feature = "kernelet")]
+        {
+            self.0 = KERNELET_USER_FS_BASE.load();
+            return;
+        }
         // SAFETY: Reading the user FS base does not affect kernel code.
-        self.0 = unsafe { rdfsbase() as usize };
+        #[cfg(not(feature = "kernelet"))]
+        {
+            self.0 = unsafe { rdfsbase() as usize };
+        }
     }
 
     /// Loads this struct's FS base onto the CPU.
     pub fn load(&self) {
+        #[cfg(feature = "kernelet")]
+        {
+            KERNELET_USER_FS_BASE.store(self.0);
+            return;
+        }
         // SAFETY: Writing the user FS base does not affect kernel code.
-        unsafe { wrfsbase(self.0 as u64) }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            unsafe { wrfsbase(self.0 as u64) }
+        }
     }
 }
 
@@ -152,9 +183,15 @@ impl GsBase {
 
     /// Saves the current CPU GS base into this struct.
     pub fn save(&mut self, _guard: &DisabledLocalIrqGuard) {
+        #[cfg(feature = "kernelet")]
+        {
+            self.0 = KERNELET_USER_GS_BASE.load();
+            return;
+        }
         // SAFETY:
         // 1. In these steps, we have disabled the IRQ and are not using the kernel GS base.
         // 2. Reading the user GS base does not affect kernel code.
+        #[cfg(not(feature = "kernelet"))]
         unsafe {
             swapgs();
             self.0 = rdgsbase() as usize;
@@ -164,9 +201,15 @@ impl GsBase {
 
     /// Loads this struct's GS base onto the CPU.
     pub fn load(&self, _guard: &DisabledLocalIrqGuard) {
+        #[cfg(feature = "kernelet")]
+        {
+            KERNELET_USER_GS_BASE.store(self.0);
+            return;
+        }
         // SAFETY:
         // 1. In these steps, we have disabled the IRQ and are not using the kernel GS base.
         // 2. Writing the user GS base does not affect kernel code.
+        #[cfg(not(feature = "kernelet"))]
         unsafe {
             swapgs();
             wrgsbase(self.0 as u64);
@@ -277,6 +320,9 @@ impl CpuException {
                 Self::GeneralProtectionFault(error_code)
             }
             14 => {
+                #[cfg(feature = "kernelet")]
+                let page_fault_addr = KERNELET_USER_FAULT_ADDR.load();
+                #[cfg(not(feature = "kernelet"))]
                 let page_fault_addr = x86_64::registers::control::Cr2::read_raw() as usize;
                 Self::PageFault(RawPageFaultInfo {
                     error_code: PageFaultErrorCode::from_bits(error_code).unwrap(),
@@ -369,7 +415,16 @@ impl UserContextApiInternal for UserContext {
 
             let guard = crate::irq::disable_local();
             hooks.pre_user_run(&guard);
+            #[cfg(feature = "kernelet")]
+            let pending = kernelet::run_image_user(&mut self.user_context, guard);
+            #[cfg(not(feature = "kernelet"))]
             self.user_context.run(guard);
+
+            #[cfg(feature = "kernelet")]
+            if pending {
+                crate::arch::irq::enable_local();
+                return ReturnReason::KernelEvent;
+            }
 
             let exception =
                 CpuException::new(self.user_context.trap_num, self.user_context.error_code);
@@ -600,30 +655,54 @@ impl FpuContext {
 
     /// Saves CPU's current FPU context to this instance.
     pub fn save(&mut self) {
-        let mem_addr = self.as_bytes_mut().as_mut_ptr();
-
-        if XSTATE_MAX_FEATURES.is_completed() {
-            unsafe { _xsave64(mem_addr, XFEATURE_MASK_USER_RESTORE) };
-        } else {
-            unsafe { _fxsave64(mem_addr) };
+        #[cfg(feature = "kernelet")]
+        {
+            let bytes = self.as_bytes_mut();
+            let result = (crate::kernelet::entry::services().fpu_save)(
+                bytes.as_mut_ptr(),
+                bytes.len() as u32,
+            );
+            assert_eq!(result, 0, "kernelet fpu_save failed: {result}");
+            return;
         }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            let mem_addr = self.as_bytes_mut().as_mut_ptr();
 
-        debug!("Save FPU context");
+            if XSTATE_MAX_FEATURES.is_completed() {
+                unsafe { _xsave64(mem_addr, XFEATURE_MASK_USER_RESTORE) };
+            } else {
+                unsafe { _fxsave64(mem_addr) };
+            }
+
+            debug!("Save FPU context");
+        }
     }
 
     /// Loads CPU's FPU context from this instance.
     pub fn load(&self) {
-        let mem_addr = self.as_bytes().as_ptr();
-
-        if let Some(xstate_max_features) = XSTATE_MAX_FEATURES.get() {
-            let rs_mask = XFEATURE_MASK_USER_RESTORE & *xstate_max_features;
-
-            unsafe { _xrstor64(mem_addr, rs_mask) };
-        } else {
-            unsafe { _fxrstor64(mem_addr) };
+        #[cfg(feature = "kernelet")]
+        {
+            let bytes = self.as_bytes();
+            let result =
+                (crate::kernelet::entry::services().fpu_load)(bytes.as_ptr(), bytes.len() as u32);
+            assert_eq!(result, 0, "kernelet fpu_load failed: {result}");
+            return;
         }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            let mem_addr = self.as_bytes().as_ptr();
 
-        debug!("Load FPU context");
+            if let Some(xstate_max_features) = XSTATE_MAX_FEATURES.get() {
+                let rs_mask = XFEATURE_MASK_USER_RESTORE & *xstate_max_features;
+
+                unsafe { _xrstor64(mem_addr, rs_mask) };
+            } else {
+                unsafe { _fxrstor64(mem_addr) };
+            }
+
+            debug!("Load FPU context");
+        }
     }
 
     /// Returns the FPU context as a byte slice.
@@ -728,6 +807,7 @@ static XSTATE_MAX_FEATURES: Once<u64> = Once::new();
 /// Mask features which are restored when returning to user space.
 ///
 /// X87 | SSE | AVX | OPMASK | ZMM_HI256 | HI16_ZMM
+#[cfg(not(feature = "kernelet"))]
 const XFEATURE_MASK_USER_RESTORE: u64 = 0b1110_0111;
 
 /// The real size in bytes of the XSAVE area containing all states enabled by XCRO | IA32_XSS.
@@ -736,7 +816,7 @@ static XSAVE_AREA_SIZE: Once<usize> = Once::new();
 /// The max size in bytes of the XSAVE area.
 const MAX_XSAVE_AREA_SIZE: usize = 4096;
 
-pub(in crate::arch) fn enable_essential_features() {
+pub(in crate::arch) fn record_fpu_features() {
     use super::extension::{IsaExtensions, has_extensions};
 
     if has_extensions(IsaExtensions::XSAVE) {
@@ -747,6 +827,18 @@ pub(in crate::arch) fn enable_essential_features() {
             xsave_area_size
         });
     }
+}
+
+pub(crate) fn fpu_area_bytes() -> usize {
+    XSAVE_AREA_SIZE
+        .get()
+        .copied()
+        .unwrap_or(size_of::<FxSaveArea>())
+        .max(size_of::<FxSaveArea>())
+}
+
+pub(in crate::arch) fn enable_essential_features() {
+    record_fpu_features();
 
     // We now assume that all x86-64 CPUs should have the FPU. Otherwise, we should check
     // `has_extensions(IsaExtensions::FPU)` here.

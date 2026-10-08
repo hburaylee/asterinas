@@ -154,6 +154,13 @@ pub(crate) fn current_page_table_paddr() -> Paddr {
 #[derive(Clone, Copy, Debug, Pod)]
 pub(crate) struct PageTableEntry(usize);
 
+#[cfg(feature = "kernelet")]
+impl PageTableEntry {
+    pub(crate) fn from_raw_bits(bits: usize) -> Self {
+        Self(bits)
+    }
+}
+
 /// Parses a bit-flag bits `val` in the representation of `from` to `to` in bits.
 macro_rules! parse_flags {
     ($val:expr, $from:expr, $to:expr) => {

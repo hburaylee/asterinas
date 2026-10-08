@@ -64,10 +64,12 @@
 //!
 //! ```
 
-use intrusive_collections::linked_list::LinkedList;
-use ostd::cpu::{CpuId, CpuSet};
+use ostd::{
+    cpu::{CpuId, CpuSet},
+    sync::ArcQueue,
+};
 use spin::Once;
-use work_item::{WorkItem, WorkItemAdapter};
+use work_item::WorkItem;
 use worker_pool::WorkerPool;
 
 use crate::prelude::*;
@@ -113,7 +115,7 @@ pub(crate) struct WorkQueue {
 }
 
 struct WorkQueueInner {
-    pending_work_items: LinkedList<WorkItemAdapter>,
+    pending_work_items: ArcQueue<WorkItem>,
 }
 
 impl WorkQueue {
@@ -123,7 +125,7 @@ impl WorkQueue {
         let queue = Arc::new(WorkQueue {
             worker_pool: worker_pool.clone(),
             inner: SpinLock::new(WorkQueueInner {
-                pending_work_items: LinkedList::new(WorkItemAdapter::NEW),
+                pending_work_items: ArcQueue::new(),
             }),
         });
         worker_pool
@@ -138,29 +140,24 @@ impl WorkQueue {
         if !work_item.try_pending() {
             return false;
         }
-        self.inner
+        let enqueued = self
+            .inner
             .disable_irq()
             .lock()
             .pending_work_items
             .push_back(work_item);
-
-        true
+        debug_assert!(enqueued, "pending work item has no available queue link");
+        enqueued
     }
 
     /// Request a pending work item. The `request_cpu` indicates the CPU where
     /// the calling worker is located.
     fn dequeue(&self, request_cpu: CpuId) -> Option<Arc<WorkItem>> {
-        let mut inner = self.inner.disable_irq().lock();
-        let mut cursor = inner.pending_work_items.front_mut();
-        while let Some(item) = cursor.get() {
-            if item.is_valid_cpu(request_cpu) {
-                return cursor.remove();
-            }
-
-            cursor.move_next();
-        }
-
-        None
+        self.inner
+            .disable_irq()
+            .lock()
+            .pending_work_items
+            .remove_first_matching(|item| item.is_valid_cpu(request_cpu))
     }
 
     fn has_pending_work_items(&self, request_cpu: CpuId) -> bool {
@@ -168,7 +165,6 @@ impl WorkQueue {
             .disable_irq()
             .lock()
             .pending_work_items
-            .iter()
             .any(|item| item.is_valid_cpu(request_cpu))
     }
 }

@@ -43,6 +43,8 @@ use crate::{
 mod cmdline;
 mod cpuinfo;
 mod filesystems;
+#[cfg(kernelet_rq1)]
+mod kernelet_rq1;
 mod loadavg;
 mod meminfo;
 mod mounts;
@@ -157,6 +159,12 @@ impl RootDirOps {
             "filesystems",
             InodeType::File,
             FileSystemsFileOps::new_inode,
+        ),
+        #[cfg(kernelet_rq1)]
+        (
+            "kernelet_rq1",
+            InodeType::File,
+            kernelet_rq1::KerneletRq1FileOps::new_inode,
         ),
         ("loadavg", InodeType::File, LoadAvgFileOps::new_inode),
         ("meminfo", InodeType::File, MemInfoFileOps::new_inode),

@@ -326,6 +326,69 @@ impl<Fallibility> Clone for VmReader<'_, Fallibility> {
     }
 }
 
+/// Retries the unfinished suffix after the kernel proper resolves a user fault.
+///
+/// While a fault is pending, the Host defers virtual IRQ delivery until this
+/// function has consumed the fault slot. Native Host preemption remains live.
+#[cfg(feature = "kernelet")]
+fn retry_image_access(len: usize, mut access: impl FnMut(usize, usize) -> usize) -> usize {
+    const MAX_STALLED_FAULTS: usize = 8;
+
+    let mut copied = 0;
+    let mut stalled_faults = 0;
+    while copied < len {
+        let remaining = len - copied;
+        crate::mm::fault::clear_image_copy_fault();
+        let advanced = access(copied, remaining);
+        debug_assert!(advanced <= remaining);
+        let fault = if advanced < remaining {
+            crate::mm::fault::take_image_copy_fault()
+        } else {
+            None
+        };
+        copied += advanced;
+        if advanced == remaining {
+            break;
+        }
+        let Some(fault) = fault else {
+            break;
+        };
+        stalled_faults = if advanced == 0 { stalled_faults + 1 } else { 0 };
+        if stalled_faults >= MAX_STALLED_FAULTS
+            || !crate::mm::fault::resolve_image_copy_fault(&fault)
+        {
+            break;
+        }
+    }
+    copied
+}
+
+/// Retries a fallible atomic access only while its fault is recoverable.
+#[cfg(feature = "kernelet")]
+fn retry_image_atomic(mut access: impl FnMut() -> u64) -> Result<u64> {
+    const MAX_STALLED_FAULTS: usize = 8;
+
+    for _ in 0..MAX_STALLED_FAULTS {
+        crate::mm::fault::clear_image_copy_fault();
+        let result = access();
+        let fault = if result == !0 {
+            crate::mm::fault::take_image_copy_fault()
+        } else {
+            None
+        };
+        if result != !0 {
+            return Ok(result);
+        }
+        let Some(fault) = fault else {
+            break;
+        };
+        if !crate::mm::fault::resolve_image_copy_fault(&fault) {
+            break;
+        }
+    }
+    Err(Error::PageFault)
+}
+
 macro_rules! impl_read_fallible {
     ($reader_fallibility:ty, $writer_fallibility:ty) => {
         impl<'a> FallibleVmRead<$writer_fallibility> for VmReader<'a, $reader_fallibility> {
@@ -341,6 +404,7 @@ macro_rules! impl_read_fallible {
                 // SAFETY: The source and destination are subsets of memory ranges specified by
                 // the reader and writer, so they are either valid for reading and writing or in
                 // user space.
+                #[cfg(not(feature = "kernelet"))]
                 let copied_len = unsafe {
                     memcpy::<$writer_fallibility, $reader_fallibility>(
                         writer.cursor,
@@ -348,6 +412,18 @@ macro_rules! impl_read_fallible {
                         copy_len,
                     )
                 };
+                #[cfg(feature = "kernelet")]
+                let copied_len = retry_image_access(copy_len, |offset, remaining| {
+                    // SAFETY: Both suffixes remain inside the caller's fallible
+                    // memory ranges throughout this access.
+                    unsafe {
+                        memcpy::<$writer_fallibility, $reader_fallibility>(
+                            writer.cursor.wrapping_add(offset),
+                            self.cursor.wrapping_add(offset),
+                            remaining,
+                        )
+                    }
+                });
                 self.cursor = self.cursor.wrapping_add(copied_len);
                 writer.cursor = writer.cursor.wrapping_add(copied_len);
 
@@ -883,7 +959,13 @@ impl VmWriter<'_, Fallible> {
 
         // SAFETY: The destination is a subset of the memory range specified by
         // the current writer, so it is either valid for writing or in user space.
+        #[cfg(not(feature = "kernelet"))]
         let set_len = unsafe { memset::<Fallible>(self.cursor, 0u8, len_to_set) };
+        #[cfg(feature = "kernelet")]
+        let set_len = retry_image_access(len_to_set, |offset, remaining| {
+            // SAFETY: The suffix remains inside the caller's fallible range.
+            unsafe { memset::<Fallible>(self.cursor.wrapping_add(offset), 0u8, remaining) }
+        });
         self.cursor = self.cursor.wrapping_add(set_len);
 
         if set_len < len_to_set {
@@ -1046,21 +1128,28 @@ pub trait PodAtomic: Pod {
 impl PodAtomic for u32 {
     unsafe fn atomic_load_fallible(ptr: *const Self) -> Result<Self> {
         // SAFETY: The safety is upheld by the caller.
+        #[cfg(not(feature = "kernelet"))]
         let result = unsafe { __atomic_load_fallible(ptr) };
+        #[cfg(feature = "kernelet")]
+        let result = retry_image_atomic(|| unsafe { __atomic_load_fallible(ptr) })?;
+        #[cfg(not(feature = "kernelet"))]
         if result == !0 {
-            Err(Error::PageFault)
-        } else {
-            Ok(result as Self)
+            return Err(Error::PageFault);
         }
+        Ok(result as Self)
     }
 
     unsafe fn atomic_cmpxchg_fallible(ptr: *mut Self, old_val: Self, new_val: Self) -> Result<u32> {
         // SAFETY: The safety is upheld by the caller.
+        #[cfg(not(feature = "kernelet"))]
         let result = unsafe { __atomic_cmpxchg_fallible(ptr, old_val, new_val) };
+        #[cfg(feature = "kernelet")]
+        let result =
+            retry_image_atomic(|| unsafe { __atomic_cmpxchg_fallible(ptr, old_val, new_val) })?;
+        #[cfg(not(feature = "kernelet"))]
         if result == !0 {
-            Err(Error::PageFault)
-        } else {
-            Ok(result as Self)
+            return Err(Error::PageFault);
         }
+        Ok(result as Self)
     }
 }

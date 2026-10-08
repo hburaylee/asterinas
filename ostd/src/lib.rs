@@ -41,6 +41,8 @@ pub mod cpu;
 mod error;
 pub mod io;
 pub mod irq;
+#[cfg(target_arch = "x86_64")]
+pub mod kernelet;
 pub mod log;
 pub mod mm;
 pub mod panic;
@@ -59,7 +61,9 @@ pub mod vm;
 #[cfg(feature = "coverage")]
 mod coverage;
 
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::AtomicBool;
+#[cfg(not(feature = "kernelet"))]
+use core::sync::atomic::Ordering;
 
 pub use ostd_macros::{
     early_cmdline_parser, global_frame_allocator, global_heap_allocator,
@@ -80,6 +84,7 @@ pub use self::{error::Error, prelude::Result};
 // TODO: We need to refactor this function to make it more modular and
 // make inter-initialization-dependencies more clear and reduce usages of
 // boot stage only global variables.
+#[cfg(not(feature = "kernelet"))]
 unsafe fn init() {
     arch::enable_cpu_features();
 
@@ -152,7 +157,7 @@ pub(crate) static IN_BOOTSTRAP_CONTEXT: AtomicBool = AtomicBool::new(true);
 /// Invoke the initialization functions defined in the FFI.
 /// The component system uses this function to call the initialization functions of
 /// the components.
-fn invoke_ffi_init_funcs() {
+pub(crate) fn invoke_ffi_init_funcs() {
     unsafe extern "C" {
         fn __sinit_array();
         fn __einit_array();
@@ -167,6 +172,12 @@ fn invoke_ffi_init_funcs() {
 }
 
 mod feature_validation {
+    #[cfg(all(feature = "kernelet", feature = "cvm_guest"))]
+    compile_error!("features `kernelet` and `cvm_guest` cannot be enabled together");
+
+    #[cfg(all(feature = "kernelet", not(target_arch = "x86_64")))]
+    compile_error!("feature `kernelet` currently supports only x86-64");
+
     #[cfg(all(not(target_arch = "riscv64"), feature = "riscv_sv39_mode"))]
     compile_error!(
         "feature \"riscv_sv39_mode\" cannot be specified for architectures other than RISC-V"

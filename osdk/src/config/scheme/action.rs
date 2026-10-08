@@ -28,6 +28,10 @@ pub struct BuildScheme {
     pub encoding: Option<PayloadEncoding>,
     #[serde(default)]
     pub rustflags: String,
+    /// Whether to build the position-independent kernelet image from the same
+    /// sources, audit it, and embed it into the host image.
+    #[serde(default)]
+    pub kernelet: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -46,6 +50,10 @@ pub struct Build {
     pub encoding: PayloadEncoding,
     #[serde(default)]
     pub rustflags: String,
+    /// Whether to build the position-independent kernelet image from the same
+    /// sources, audit it, and embed it into the host image.
+    #[serde(default)]
+    pub kernelet: bool,
 }
 
 impl Default for Build {
@@ -59,6 +67,7 @@ impl Default for Build {
             strip_elf: false,
             encoding: PayloadEncoding::default(),
             rustflags: String::new(),
+            kernelet: false,
         }
     }
 }
@@ -80,6 +89,9 @@ impl Build {
         }
         if common_args.strip_elf {
             self.strip_elf = true;
+        }
+        if common_args.kernelet {
+            self.kernelet = true;
         }
         if let Some(encoding) = common_args.encoding.clone() {
             self.encoding.clone_from(&encoding);
@@ -114,6 +126,9 @@ impl BuildScheme {
         if parent.strip_elf {
             self.strip_elf = true;
         }
+        if parent.kernelet {
+            self.kernelet = true;
+        }
         if self.encoding.is_none() {
             self.encoding.clone_from(&parent.encoding);
         }
@@ -130,6 +145,7 @@ impl BuildScheme {
             strip_elf: self.strip_elf,
             encoding: self.encoding.unwrap_or_default(),
             rustflags: self.rustflags,
+            kernelet: self.kernelet,
         }
     }
 }

@@ -47,11 +47,26 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
 
     let irq_guard = crate::irq::disable_local();
 
+    // A task can be woken and picked again between the scheduler's decision and
+    // this point. Its context is already running on this CPU, so there is no
+    // context switch to perform. Check under disabled IRQs to exclude local
+    // preemption before acquiring the next task's execution ownership.
+    if core::ptr::eq(CURRENT_TASK_PTR.load(), Arc::as_ptr(&next_task)) {
+        return;
+    }
+
     before_switching_to(&next_task, &irq_guard);
+    if let Some(current) = Task::current() {
+        let _ = current.accounting.sample(false);
+    }
 
     // `before_switching_to` guarantees that from now on, and while the next task is running on the
     // CPU, its context can be used exclusively.
     let next_task_ctx_ptr = next_task.ctx().get().cast_const();
+    #[cfg(feature = "kernelet")]
+    let next_stack_limit = next_task.kstack.lower_bound();
+    #[cfg(feature = "kernelet")]
+    let vcpu_record = crate::kernelet::entry::vcpu_record() as *const _;
 
     let current_task_ptr = CURRENT_TASK_PTR.load();
     CURRENT_TASK_PTR.store(Arc::into_raw(next_task));
@@ -73,7 +88,14 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
         // 1. We have exclusive access to the next context (see above).
         // 2. The next context is valid (because it is either correctly initialized or written by a
         //    previous `context_switch`).
-        unsafe { first_context_switch(next_task_ctx_ptr) };
+        #[cfg(not(feature = "kernelet"))]
+        unsafe {
+            first_context_switch(next_task_ctx_ptr)
+        };
+        #[cfg(feature = "kernelet")]
+        unsafe {
+            first_context_switch(next_task_ctx_ptr, next_stack_limit, vcpu_record)
+        };
         // We've switched to the first task on the current CPU.
         unreachable!("`first_context_switch` should never return");
     };
@@ -85,7 +107,15 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
     unsafe {
         // This function may not return, for example, when the current task exits. So make sure
         // that all variables on the stack can be forgotten without causing resource leakage.
+        #[cfg(not(feature = "kernelet"))]
         context_switch(next_task_ctx_ptr, current_task_ctx_ptr);
+        #[cfg(feature = "kernelet")]
+        context_switch(
+            next_task_ctx_ptr,
+            current_task_ctx_ptr,
+            next_stack_limit,
+            vcpu_record,
+        );
     }
 
     // SAFETY: The task is just switched back, `after_switching_to` hasn't been called yet.
@@ -117,6 +147,9 @@ fn before_switching_to(next_task: &Task, irq_guard: &DisabledLocalIrqGuard) {
 ///
 /// This function must be called only once after switching to a task.
 pub(super) unsafe fn after_switching_to() {
+    if let Some(current) = Task::current() {
+        current.accounting.resume();
+    }
     // Release the previous task.
     let prev = PREVIOUS_TASK_PTR.load();
     let prev = if !prev.is_null() {

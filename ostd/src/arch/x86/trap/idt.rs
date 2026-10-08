@@ -13,7 +13,7 @@ use x86_64::{
 
 use crate::mm::Vaddr;
 
-global_asm!(include_str!("trap.S"));
+global_asm!(include_str!("trap.S"), interrupt_level = sym crate::irq::INTERRUPT_LEVEL);
 
 const NUM_INTERRUPTS: usize = 256;
 
@@ -23,50 +23,60 @@ unsafe extern "C" {
 }
 
 static GLOBAL_IDT: Once<[Entry<()>; NUM_INTERRUPTS]> = Once::new();
+static IMAGE_IDT: Once<[Entry<()>; NUM_INTERRUPTS]> = Once::new();
 
 /// Returns the IDT base address.
 pub(in crate::arch) fn idt_base() -> Vaddr {
     GLOBAL_IDT.get().unwrap().as_ptr() as Vaddr
 }
 
-/// Initializes and loads the IDT.
-///
-/// The caller should only call this method once in the boot context for each available processor.
-/// This is not a safety requirement, however, because calling this method again will do nothing
-/// more than load the same IDT.
-pub(super) fn init_on_cpu() {
-    let idt = GLOBAL_IDT.call_once(|| {
-        let mut idt = [const { Entry::missing() }; NUM_INTERRUPTS];
-
-        // SAFETY: The vector array is properly initialized, lives for `'static`, and will never be
-        // mutated. So it's always fine to create an immutable borrow to it.
-        let vectors = unsafe { &VECTORS };
-
-        // Initialize the IDT entries.
-        for (intr_no, &handler) in vectors.iter().enumerate() {
-            let handler = VirtAddr::new(handler as u64);
-
-            let entry = &mut idt[intr_no];
-            // SAFETY: The handler defined in `trap.S` has a correct signature to handle the
-            // corresponding exception or interrupt.
-            let opt = unsafe { entry.set_handler_addr(handler) };
-
-            // Enable `int3` and `into` in the userspace.
-            if intr_no == 3 || intr_no == 4 {
-                opt.set_privilege_level(PrivilegeLevel::Ring3);
-            }
+fn build_idt(image: bool) -> [Entry<()>; NUM_INTERRUPTS] {
+    let mut idt = [const { Entry::missing() }; NUM_INTERRUPTS];
+    // SAFETY: The assembly vector array is immutable and has one entry per vector.
+    let vectors = unsafe { &VECTORS };
+    for (intr_no, &handler) in vectors.iter().enumerate() {
+        // SAFETY: Every target implements the corresponding architectural trap frame.
+        let options = unsafe { idt[intr_no].set_handler_addr(VirtAddr::new(handler as u64)) };
+        if intr_no == 3 || intr_no == 4 {
+            options.set_privilege_level(PrivilegeLevel::Ring3);
         }
+        if image {
+            let stack = match intr_no {
+                2 => 1,
+                8 => 2,
+                18 => 3,
+                1 => 4,
+                _ => 0,
+            };
+            // SAFETY: The image IDT is installed only after this carrier's five
+            // private TSS landing stacks are populated. NMI, double fault,
+            // machine check and debug have distinct stacks. The entry adapter
+            // restores the native IDT before handlers can enable interrupts.
+            unsafe { options.set_stack_index(stack) };
+        }
+    }
+    idt
+}
 
-        idt
-    });
-
-    let idtr = DescriptorTablePointer {
+fn pointer(idt: &[Entry<()>]) -> DescriptorTablePointer {
+    DescriptorTablePointer {
         limit: (size_of_val(idt) - 1) as u16,
         base: VirtAddr::new(idt.as_ptr().addr() as u64),
-    };
-    // SAFETY: The IDT is valid to load because:
-    //  - It lives for `'static`.
-    //  - It contains correct entries at correct indexes: all handlers are defined in `trap.S` with
-    //    correct handler signatures.
-    unsafe { lidt(&idtr) };
+    }
+}
+
+/// Returns the native and protected-image IDT descriptors after boot setup.
+pub(crate) fn carrier_idtrs() -> (DescriptorTablePointer, DescriptorTablePointer) {
+    (
+        pointer(GLOBAL_IDT.get().unwrap()),
+        pointer(IMAGE_IDT.get().unwrap()),
+    )
+}
+
+/// Initializes the native IDT and prepares the image-only IST variant.
+pub(super) fn init_on_cpu() {
+    let idt = GLOBAL_IDT.call_once(|| build_idt(false));
+    IMAGE_IDT.call_once(|| build_idt(true));
+    // SAFETY: The table is immutable, permanent, and contains the audited handlers.
+    unsafe { lidt(&pointer(idt)) };
 }

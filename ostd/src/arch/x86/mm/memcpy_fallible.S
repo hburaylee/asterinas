@@ -23,6 +23,6 @@ __memcpy_fallible: # (dst: *mut u8, src: *const u8, size: usize) -> usize
 
 .pushsection .ex_table, "a", @progbits
     .align 8
-    .quad [.move]
-    .quad [.memcpy_exit]
+    .quad .move - .
+    .quad .memcpy_exit - .
 .popsection

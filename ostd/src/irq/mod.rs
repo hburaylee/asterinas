@@ -78,6 +78,8 @@ mod top_half;
 
 pub use bottom_half::{register_bottom_half_handler_l1, register_bottom_half_handler_l2};
 pub use guard::{DisabledLocalIrqGuard, disable_local};
+#[cfg(not(feature = "kernelet"))]
+pub(crate) use level::INTERRUPT_LEVEL;
 pub use level::InterruptLevel;
 pub use top_half::{IrqCallbackFunction, IrqLine};
 
@@ -97,5 +99,20 @@ pub(crate) fn call_irq_callback_functions(
             bottom_half::process(hw_irq_line.irq_num());
         },
         cpu_priv_at_irq,
+    );
+}
+
+/// Runs counted virtual timer callbacks at the interrupted task's IRQ level.
+#[cfg(feature = "kernelet")]
+pub(crate) fn with_virtual_interrupt_level(f: impl FnOnce(), privilege: PrivilegeLevel) {
+    level::enter(f, privilege);
+}
+
+/// Runs a deferred virtual timer callback at the nested interrupt level.
+#[cfg(feature = "kernelet")]
+pub(crate) fn with_virtual_l2_level(f: impl FnOnce()) {
+    level::enter(
+        || level::enter(f, PrivilegeLevel::Kernel),
+        PrivilegeLevel::Kernel,
     );
 }

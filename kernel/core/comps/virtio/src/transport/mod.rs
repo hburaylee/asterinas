@@ -16,7 +16,9 @@ use ostd::{
 };
 use ostd_pod::Pod;
 
-use self::{mmio::virtio_mmio_init, pci::virtio_pci_init};
+use self::mmio::virtio_mmio_init;
+#[cfg(not(feature = "kernelet"))]
+use self::pci::virtio_pci_init;
 use crate::{
     VirtioDeviceType,
     queue::{AvailRing, Descriptor, UsedRing},
@@ -309,6 +311,7 @@ impl Drop for DeviceTransport {
 }
 
 pub(super) fn init() {
+    #[cfg(not(feature = "kernelet"))]
     virtio_pci_init();
     virtio_mmio_init();
 }

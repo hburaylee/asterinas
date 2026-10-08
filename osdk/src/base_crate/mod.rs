@@ -5,7 +5,7 @@
 
 use std::{
     fs,
-    io::{Read, Result},
+    io::{ErrorKind, Read, Result},
     path::{Path, PathBuf},
     str::FromStr,
 };
@@ -18,6 +18,11 @@ const LINKER_SCRIPTS: &[(&str, &str)] = &[
     ("loongarch64.ld", include_str!("loongarch64.ld.template")),
     ("aarch64.ld", include_str!("aarch64.ld.template")),
 ];
+
+/// The generated linker script of the kernelet base crate, emitted beside the
+/// host's scripts. It is rendered from its template with the entry table's
+/// ABI constants and the OSTD source hash baked in.
+const KERNELET_LINKER_SCRIPT: &str = "x86_64-kernelet.ld";
 
 /// Compares two files byte-by-byte to check if they are identical.
 /// Returns `Ok(true)` if files are identical, `Ok(false)` if they are different, or `Err` if any I/O operation fails.
@@ -55,7 +60,7 @@ fn are_base_crate_reuse_inputs_identical(
     existing_base_crate_path: &Path,
     candidate_base_crate_path: &Path,
 ) -> bool {
-    ["Cargo.toml", "src/main.rs"]
+    ["Cargo.toml", "Cargo.lock.source", "src/main.rs"]
         .into_iter()
         .chain(LINKER_SCRIPTS.iter().map(|(file_name, _)| *file_name))
         .all(|file_name| {
@@ -73,9 +78,53 @@ pub enum BaseCrateType {
     Run,
     /// The base crate is for testing the target crate.
     Test,
+    /// The base crate is for building the position-independent kernelet image
+    /// from the same kernel crate. The source hash is the OSTD source tree and
+    /// toolchain hash that the generated linker script bakes into the image's
+    /// entry table.
+    Kernelet { source_hash: [u8; 32] },
     /// The base crate is for other actions using Cargo.
     #[expect(unused)]
     Other,
+}
+
+/// Returns the name of the Cargo package generated for the base crate.
+pub fn base_crate_package_name(base_type: BaseCrateType, dep_crate_name: &str) -> String {
+    let suffix = match base_type {
+        BaseCrateType::Kernelet { .. } => "-kernelet-bin",
+        _ => "-osdk-bin",
+    };
+    dep_crate_name.to_string() + suffix
+}
+
+/// Returns the name of the Cargo package of the kernelet base crate.
+pub fn kernelet_package_name(dep_crate_name: &str) -> String {
+    base_crate_package_name(
+        BaseCrateType::Kernelet {
+            source_hash: [0; 32],
+        },
+        dep_crate_name,
+    )
+}
+
+/// Renders the kernelet linker script from its template, baking in the entry
+/// table's ABI constants and the OSTD source hash.
+fn render_kernelet_linker_script(source_hash: &[u8; 32]) -> String {
+    let hash_quads: String = source_hash
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|chunk| {
+            let word = u64::from_le_bytes(*chunk);
+            format!("        QUAD(0x{word:016X});\n")
+        })
+        .collect();
+    include_str!("x86_64-kernelet.ld.template")
+        .replace(
+            "#ENTRY_TABLE_SIZE#",
+            &format!("{}", crate::kernelet::abi::entry_table::SIZE),
+        )
+        .replace("#SOURCE_HASH_QUADS#", &hash_quads)
 }
 
 /// Create a new base crate that will be built by cargo.
@@ -97,6 +146,7 @@ pub fn new_base_crate(
             + match base_type {
                 BaseCrateType::Run => "-run-base",
                 BaseCrateType::Test => "-test-base",
+                BaseCrateType::Kernelet { .. } => "-kernelet-base",
                 BaseCrateType::Other => "-base",
             })
         .to_string(),
@@ -107,6 +157,7 @@ pub fn new_base_crate(
         let base_crate_tmp_path = base_crate_path.join("tmp");
         do_new_base_crate(
             &base_crate_tmp_path,
+            base_type,
             dep_crate_name,
             &dep_crate_path,
             link_unit_test_kernel,
@@ -121,6 +172,7 @@ pub fn new_base_crate(
     }
     do_new_base_crate(
         &base_crate_path,
+        base_type,
         dep_crate_name,
         dep_crate_path,
         link_unit_test_kernel,
@@ -131,6 +183,7 @@ pub fn new_base_crate(
 
 fn do_new_base_crate(
     base_crate_path: impl AsRef<Path>,
+    base_type: BaseCrateType,
     dep_crate_name: &str,
     dep_crate_path: impl AsRef<Path>,
     link_unit_test_kernel: bool,
@@ -171,9 +224,16 @@ fn do_new_base_crate(
     // Create the src directory
     fs::create_dir_all(base_crate_path.as_ref().join("src")).unwrap();
 
+    // Keep the workspace's dependency versions, including reviewed unsafe-code
+    // exceptions, when Cargo resolves the generated package's dependencies.
+    copy_workspace_lockfile(&workspace_root, base_crate_path.as_ref()).unwrap();
+
     // Write Cargo.toml
     let cargo_toml = include_str!("Cargo.toml.template");
-    let cargo_toml = cargo_toml.replace("#NAME#", &(dep_crate_name.to_string() + "-osdk-bin"));
+    let cargo_toml = cargo_toml.replace(
+        "#NAME#",
+        &base_crate_package_name(base_type, dep_crate_name),
+    );
     let cargo_toml = cargo_toml.replace("#VERSION#", dep_crate_version);
     fs::write(base_crate_path.as_ref().join("Cargo.toml"), cargo_toml).unwrap();
 
@@ -181,19 +241,36 @@ fn do_new_base_crate(
     let original_dir = std::env::current_dir().unwrap();
     std::env::set_current_dir(&base_crate_path).unwrap();
 
-    // Add linker script files
-    for (file_name, contents) in LINKER_SCRIPTS {
-        fs::write(base_crate_path.as_ref().join(file_name), contents).unwrap();
+    // The kernelet base crate is linked by the generated kernelet linker
+    // script alone; it has no boot segments and no physical load addresses.
+    if let BaseCrateType::Kernelet { source_hash } = base_type {
+        fs::write(
+            base_crate_path.as_ref().join(KERNELET_LINKER_SCRIPT),
+            render_kernelet_linker_script(&source_hash),
+        )
+        .unwrap();
+    } else {
+        for (file_name, contents) in LINKER_SCRIPTS {
+            fs::write(base_crate_path.as_ref().join(file_name), contents).unwrap();
+        }
     }
 
-    // Overwrite the main.rs file
-    let main_rs = include_str!("main.rs.template");
-    // Replace all occurrence of `#TARGET_NAME#` with the `dep_crate_name`
-    let main_rs = main_rs.replace("#TARGET_NAME#", &dep_crate_name.replace('-', "_"));
+    let default_allocators_cfg = match base_type {
+        BaseCrateType::Kernelet { .. } => "any()",
+        _ => "all()",
+    };
+    let main_rs = include_str!("main.rs.template")
+        .replace("#TARGET_NAME#", &dep_crate_name.replace('-', "_"))
+        .replace("#DEFAULT_ALLOCATORS_CFG#", default_allocators_cfg);
     fs::write("src/main.rs", main_rs).unwrap();
 
     // Add dependencies to the Cargo.toml
-    add_manifest_dependency(dep_crate_name, dep_crate_path, link_unit_test_kernel);
+    add_manifest_dependency(
+        dep_crate_name,
+        dep_crate_path,
+        link_unit_test_kernel,
+        base_type,
+    );
 
     // Copy the manifest configurations from the target crate to the base crate
     copy_profile_configurations(workspace_root);
@@ -215,10 +292,27 @@ fn do_new_base_crate(
     std::env::set_current_dir(original_dir).unwrap();
 }
 
+fn copy_workspace_lockfile(workspace_root: &Path, base_crate_path: &Path) -> Result<()> {
+    // Cargo can add the generated package and prune unrelated workspace members.
+    // Keep the original bytes separately so reuse detects source lockfile changes.
+    let source_snapshot = base_crate_path.join("Cargo.lock.source");
+    let source = match fs::read(workspace_root.join("Cargo.lock")) {
+        Ok(source) => source,
+        Err(error) if error.kind() == ErrorKind::NotFound => {
+            // An unlocked workspace is valid; record that state for reuse checks.
+            return fs::write(source_snapshot, []);
+        }
+        Err(error) => return Err(error),
+    };
+    fs::write(base_crate_path.join("Cargo.lock"), &source)?;
+    fs::write(source_snapshot, source)
+}
+
 fn add_manifest_dependency(
     crate_name: &str,
     crate_path: impl AsRef<Path>,
     link_unit_test_kernel: bool,
+    base_type: BaseCrateType,
 ) {
     let manifest_path = "Cargo.toml";
 
@@ -248,6 +342,14 @@ fn add_manifest_dependency(
     ))
     .unwrap();
     dependencies.as_table_mut().unwrap().extend(target_dep);
+
+    // The kernelet image gets its memory from the Host's services, so it does
+    // not link the default boot allocators or depend on `ostd` directly.
+    if matches!(base_type, BaseCrateType::Kernelet { .. }) {
+        let content = toml::to_string(&manifest).unwrap();
+        fs::write(manifest_path, content).unwrap();
+        return;
+    }
 
     if link_unit_test_kernel {
         add_manifest_dependency_to(
@@ -355,9 +457,14 @@ fn add_feature_entries(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
+
+    // Base-crate generation temporarily changes the process working directory.
+    static BASE_CRATE_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn changed_linker_script_prevents_base_crate_reuse() {
+        let _guard = BASE_CRATE_TEST_LOCK.lock().unwrap();
         // Regression test for https://github.com/asterinas/asterinas/issues/3649.
         let temp_dir = tempfile::tempdir().unwrap();
         let base_crate_path_stem = temp_dir.path().join("generated");
@@ -384,5 +491,74 @@ mod tests {
 
             assert_eq!(fs::read(linker_script_path).unwrap(), contents.as_bytes());
         }
+    }
+
+    #[test]
+    fn kernelet_base_crate_has_no_boot_allocators() {
+        let _guard = BASE_CRATE_TEST_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_crate_path_stem = temp_dir.path().join("generated");
+        let base_crate_path = new_base_crate(
+            BaseCrateType::Kernelet {
+                source_hash: [0; 32],
+            },
+            &base_crate_path_stem,
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_MANIFEST_DIR"),
+            false,
+        );
+        let manifest = fs::read_to_string(base_crate_path.join("Cargo.toml")).unwrap();
+        assert!(manifest.contains("kernelet-bin"));
+        assert!(!manifest.contains("osdk-frame-allocator"));
+        assert!(!manifest.contains("osdk-heap-allocator"));
+        assert!(!fs::exists(base_crate_path.join("x86_64.ld")).unwrap());
+        assert!(fs::exists(base_crate_path.join(KERNELET_LINKER_SCRIPT)).unwrap());
+        assert_eq!(
+            fs::read(base_crate_path.join("Cargo.lock")).unwrap(),
+            fs::read(Path::new(env!("CARGO_MANIFEST_DIR")).join("Cargo.lock")).unwrap()
+        );
+    }
+
+    #[test]
+    fn changed_workspace_lockfile_prevents_base_crate_reuse() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let workspace_root = temp_dir.path().join("workspace");
+        let existing = temp_dir.path().join("existing");
+        let candidate = temp_dir.path().join("candidate");
+        fs::create_dir(&workspace_root).unwrap();
+        for path in [&existing, &candidate] {
+            fs::create_dir_all(path.join("src")).unwrap();
+            fs::write(path.join("Cargo.toml"), "same manifest").unwrap();
+            fs::write(path.join("src/main.rs"), "same entry").unwrap();
+            for (file_name, contents) in LINKER_SCRIPTS {
+                fs::write(path.join(file_name), contents).unwrap();
+            }
+        }
+
+        fs::write(workspace_root.join("Cargo.lock"), "reviewed versions").unwrap();
+        copy_workspace_lockfile(&workspace_root, &existing).unwrap();
+        copy_workspace_lockfile(&workspace_root, &candidate).unwrap();
+        // Cargo's generated package may change its own lockfile without changing
+        // the source dependency selection that controls reuse.
+        fs::write(existing.join("Cargo.lock"), "resolved generated package").unwrap();
+        assert!(are_base_crate_reuse_inputs_identical(&existing, &candidate));
+
+        fs::write(workspace_root.join("Cargo.lock"), "new reviewed versions").unwrap();
+        copy_workspace_lockfile(&workspace_root, &candidate).unwrap();
+        assert!(!are_base_crate_reuse_inputs_identical(
+            &existing, &candidate
+        ));
+    }
+
+    #[test]
+    fn rendered_kernelet_linker_script_carries_the_hash() {
+        let script = render_kernelet_linker_script(&[0xab; 32]);
+        assert!(script.contains(&format!(
+            "QUAD({});",
+            crate::kernelet::abi::entry_table::SIZE
+        )));
+        assert!(!script.contains("#SOURCE_HASH_QUADS#"));
+        assert!(!script.contains("#ENTRY_TABLE_SIZE#"));
+        assert_eq!(script.matches("QUAD(0xAB").count(), 4);
     }
 }

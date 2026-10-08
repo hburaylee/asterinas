@@ -74,14 +74,22 @@ impl WaitQueue {
             return res;
         }
 
-        let (waiter, _) = Waiter::new_pair();
+        let (waiter, waker) = Waiter::new_pair();
         let cond = || {
-            self.enqueue(waiter.waker());
+            // This waiter is queued on only this queue. A wake removes its
+            // registration before `wait` can return and check again.
+            self.enqueue(waker.clone());
             cond()
         };
-        waiter
+        let result = waiter
             .wait_until_or_cancelled(cond, || Ok::<(), ()>(()))
-            .unwrap()
+            .unwrap();
+        // The condition may become true after registration without a wake.
+        // Drop the waiter first so a racing wake cannot requeue this Task,
+        // then remove its registration and the Task reference it holds.
+        drop(waiter);
+        self.remove_waker(&waker);
+        result
     }
 
     /// Wakes up one waiting thread, if there is one at the point of time when this method is
@@ -107,24 +115,26 @@ impl WaitQueue {
         }
     }
 
-    /// Wakes up all waiting threads, returning the number of threads that were woken up.
+    /// Wakes up all currently waiting threads, returning the number of threads that were woken up.
+    ///
+    /// Waiters that register again during this call wait for a subsequent wake.
     pub fn wake_all(&self) -> usize {
         // Fast path
         if self.is_empty() {
             return 0;
         }
 
-        let mut num_woken = 0;
-
-        loop {
+        let wakers = {
             let mut wakers = self.wakers.lock();
-            let Some(waker) = wakers.pop_front() else {
-                break;
-            };
-            self.num_wakers.fetch_sub(1, Ordering::Release);
-            // Avoid holding lock when calling `wake_up`
-            drop(wakers);
+            // A woken Task may run and register again before this call returns.
+            // Detach this batch so re-registration cannot extend the wake loop.
+            self.num_wakers
+                .fetch_sub(wakers.len() as u32, Ordering::Release);
+            core::mem::take(&mut *wakers)
+        };
 
+        let mut num_woken = 0;
+        for waker in wakers {
             if waker.wake_up() {
                 num_woken += 1;
             }
@@ -138,6 +148,42 @@ impl WaitQueue {
         // atomic loading with `Ordering::Release`. It performs much better than naively
         // translating `fetch_add(0)` to `lock; xadd`.
         self.num_wakers.fetch_add(0, Ordering::Release) == 0
+    }
+
+    /// Registers a waker unless this same waker is already queued.
+    ///
+    /// This supports an event loop that checks several queues after any one
+    /// source wakes it. A repeated scan does not accumulate stale registrations.
+    pub fn enqueue_once(&self, waker: Arc<Waker>) {
+        let mut wakers = self.wakers.lock();
+        if wakers
+            .iter()
+            .any(|registered| Arc::ptr_eq(registered, &waker))
+        {
+            return;
+        }
+        wakers.push_back(waker);
+        self.num_wakers.fetch_add(1, Ordering::Acquire);
+    }
+
+    fn remove_waker(&self, waker: &Arc<Waker>) {
+        loop {
+            let removed = {
+                let mut wakers = self.wakers.lock();
+                let Some(index) = wakers
+                    .iter()
+                    .position(|registered| Arc::ptr_eq(registered, waker))
+                else {
+                    return;
+                };
+                let removed = wakers.remove(index).unwrap();
+                self.num_wakers.fetch_sub(1, Ordering::Release);
+                removed
+            };
+            // Releasing the last Task reference may free its stack, so do it
+            // after leaving the queue's IRQ-disabling spin lock.
+            drop(removed);
+        }
     }
 
     /// Enqueues the input [`Waker`] to the wait queue.
@@ -324,6 +370,45 @@ mod test {
         queue_wake(|queue| {
             queue.wake_all();
         });
+    }
+
+    #[ktest]
+    fn wake_all_counts_live_waiters() {
+        let queue = WaitQueue::new();
+        let (closed_waiter, closed_waker) = Waiter::new_pair();
+        let (waiter, waker) = Waiter::new_pair();
+        queue.enqueue(closed_waker);
+        queue.enqueue(waker.clone());
+        queue.enqueue(waker.clone());
+        drop(closed_waiter);
+
+        assert_eq!(queue.wake_all(), 1);
+        assert!(queue.is_empty());
+        assert_eq!(queue.wake_all(), 0);
+        waiter.wait();
+
+        // A fresh registration after the notification must remain wakeable.
+        queue.enqueue(waker);
+        assert!(!queue.is_empty());
+        assert_eq!(queue.wake_all(), 1);
+        waiter.wait();
+        assert!(queue.is_empty());
+    }
+
+    #[ktest]
+    fn completed_wait_releases_its_task_reference() {
+        let queue = WaitQueue::new();
+        let task = Task::current().unwrap().cloned();
+        let references = Arc::strong_count(&task);
+        let mut probes = 0;
+
+        queue.wait_until(|| {
+            probes += 1;
+            (probes == 2).then_some(())
+        });
+
+        assert!(queue.is_empty());
+        assert_eq!(Arc::strong_count(&task), references);
     }
 
     #[ktest]

@@ -2,25 +2,22 @@
 
 //! Configure the Global Descriptor Table (GDT).
 
-use core::{
-    cell::UnsafeCell,
-    mem::offset_of,
-    sync::atomic::{AtomicU64, Ordering},
-};
+#[cfg(not(feature = "kernelet"))]
+use core::{cell::UnsafeCell, sync::atomic::Ordering};
+use core::{mem::offset_of, sync::atomic::AtomicU64};
 
+use x86_64::{PrivilegeLevel, structures::gdt::SegmentSelector};
+#[cfg(not(feature = "kernelet"))]
 use x86_64::{
-    PrivilegeLevel, VirtAddr,
+    VirtAddr,
     instructions::tables::{lgdt, load_tss},
     registers::segmentation::{CS, Segment},
-    structures::{
-        DescriptorTablePointer,
-        gdt::{Descriptor, SegmentSelector},
-        tss::TaskStateSegment,
-    },
+    structures::{DescriptorTablePointer, gdt::Descriptor, tss::TaskStateSegment},
 };
 
+use crate::const_assert;
+#[cfg(not(feature = "kernelet"))]
 use crate::{
-    const_assert,
     cpu::{
         CpuId,
         local::{CpuLocal, StaticCpuLocal},
@@ -40,6 +37,7 @@ use crate::{
 ///
 /// The caller must ensure that no preemption can occur during the method, otherwise we may
 /// accidentally load a wrong GDT and TSS that actually belongs to another CPU.
+#[cfg(not(feature = "kernelet"))]
 pub(super) unsafe fn init_on_cpu() {
     // No races because the caller guarantees that no preemption can occur.
     let gdt = GDT.get_on_cpu(CpuId::current_racy());
@@ -81,16 +79,19 @@ pub(super) unsafe fn init_on_cpu() {
 }
 
 /// Returns the current CPU's GDT base address.
+#[cfg(not(feature = "kernelet"))]
 pub(in crate::arch) fn gdt_base(_guard: &DisabledLocalIrqGuard) -> Vaddr {
     GDT.as_ptr() as Vaddr
 }
 
 /// Returns the GDT limit.
+#[cfg(not(feature = "kernelet"))]
 pub(in crate::arch) fn gdt_limit() -> u16 {
     (size_of::<Gdt>() - 1) as u16
 }
 
 /// Returns the current CPU's TSS base address.
+#[cfg(not(feature = "kernelet"))]
 pub(in crate::arch) fn tss_base(_guard: &DisabledLocalIrqGuard) -> Vaddr {
     UnsafeCell::raw_get(LOCAL_TSS.as_ptr()) as Vaddr
 }
@@ -105,6 +106,7 @@ pub(in crate::arch) fn tss_base(_guard: &DisabledLocalIrqGuard) -> Vaddr {
 // wrap the TSS in an `UnsafeCell`. See `syscall.S` for details.
 //
 // SAFETY: This is properly handled in the linker script.
+#[cfg(not(feature = "kernelet"))]
 #[unsafe(link_section = ".cpu_local_tss")]
 static LOCAL_TSS: StaticCpuLocal<UnsafeCell<TaskStateSegment>> = {
     let tss = UnsafeCell::new(TaskStateSegment::new());
@@ -128,6 +130,7 @@ struct Gdt {
     tss1: AtomicU64,
 }
 
+#[cfg(not(feature = "kernelet"))]
 cpu_local! {
     static GDT: Gdt = Gdt {
         _reserved: 0,
@@ -140,6 +143,23 @@ cpu_local! {
         tss0: AtomicU64::new(0), // To be set in `init_on_cpu`.
         tss1: AtomicU64::new(0), // To be set in `init_on_cpu`.
     };
+}
+
+/// Installs the five landing stacks reserved by the image-only IDT.
+///
+/// # Safety
+/// IRQs and preemption must be disabled. Each nonzero top must name a writable
+/// Host-owned stack that remains mapped while the image IDT can be active.
+#[cfg(not(feature = "kernelet"))]
+pub(crate) unsafe fn set_carrier_stacks(tops: [usize; 5]) {
+    let tss = UnsafeCell::raw_get(LOCAL_TSS.as_ptr());
+    // SAFETY: This CPU exclusively owns its packed TSS, and no references to
+    // these hardware IST slots coexist with the unaligned writes.
+    let slots = unsafe { core::ptr::addr_of_mut!((*tss).interrupt_stack_table) }.cast::<VirtAddr>();
+    for (index, top) in tops.into_iter().enumerate() {
+        // SAFETY: Five reserved slots are within the architectural seven-slot array.
+        unsafe { slots.add(index).write_unaligned(VirtAddr::new(top as u64)) };
+    }
 }
 
 // ========= Descriptors =========

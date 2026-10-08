@@ -2,13 +2,18 @@
 
 //! Tasks are the unit of code execution.
 
+pub(crate) mod accounting;
 pub mod atomic_mode;
-mod kernel_stack;
+#[cfg_attr(feature = "kernelet", path = "kernelet_stack.rs")]
+pub(crate) mod kernel_stack;
 mod preempt;
+
 mod processor;
 pub mod scheduler;
 mod utils;
 
+#[cfg(feature = "kernelet")]
+use core::sync::atomic::{AtomicU32, Ordering};
 use core::{
     any::Any,
     borrow::Borrow,
@@ -19,11 +24,14 @@ use core::{
 };
 
 use kernel_stack::KernelStack;
+#[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+pub(crate) use preempt::carrier as carrier_preempt;
 use processor::current_task;
 use spin::Once;
 use utils::ForceSync;
 
 pub use self::{
+    accounting::CpuTimeMeasurement,
     preempt::{DisabledPreemptGuard, disable_preempt, halt_cpu},
     scheduler::info::{AtomicCpuId, TaskScheduleInfo},
 };
@@ -70,10 +78,42 @@ pub struct Task {
     /// See [`processor::switch_to_task`] for more details.
     switched_to_cpu: AtomicBool,
 
+    /// Defers virtual interrupt delivery while this Task finishes an upcall
+    /// or moves from a scheduler decision to a context switch.
+    #[cfg(feature = "kernelet")]
+    virq_deferral_depth: AtomicU32,
+
     schedule_info: TaskScheduleInfo,
+    accounting: accounting::TaskAccounting,
 }
 
 impl Task {
+    /// Attaches an account to this currently executing native Task.
+    pub(crate) fn attach_cpu_account(
+        &self,
+        account: Arc<dyn accounting::CpuTimeAccount>,
+    ) -> Result<()> {
+        if !Task::current().is_some_and(|task| core::ptr::eq(&*task, self)) {
+            return Err(crate::Error::InvalidArgs);
+        }
+        self.accounting.attach(account)
+    }
+
+    pub(crate) fn detach_cpu_account(&self, owner: usize) -> Result<()> {
+        debug_assert!(Task::current().is_some_and(|task| core::ptr::eq(&*task, self)));
+        self.accounting.detach(Some(owner))
+    }
+
+    /// Installs the calling Task's pinned carrier context, or clears it with zero.
+    ///
+    /// # Safety
+    /// The nonzero address must remain a live carrier context until this Task
+    /// clears it. The caller must hold physical IRQs disabled and own this Task.
+    pub(crate) unsafe fn set_carrier_context(&self, address: usize) {
+        // SAFETY: The caller supplies the Task-owned lifetime and IRQ exclusion.
+        unsafe { self.accounting.set_carrier_context(address) };
+    }
+
     /// Gets the current task.
     ///
     /// It returns `None` if the function is called in the bootstrap context.
@@ -123,6 +163,51 @@ impl Task {
     /// Get the attached scheduling information.
     pub fn schedule_info(&self) -> &TaskScheduleInfo {
         &self.schedule_info
+    }
+}
+
+#[cfg(feature = "kernelet")]
+crate::cpu_local_cell! {
+    static BOOT_VIRQ_DEFERRAL_DEPTH: u32 = 0;
+}
+
+/// Returns whether the current Task is in a virtual-interrupt deferral region.
+#[cfg(feature = "kernelet")]
+pub(crate) fn virq_delivery_deferred() -> bool {
+    Task::current().map_or_else(
+        || BOOT_VIRQ_DEFERRAL_DEPTH.load() != 0,
+        |task| task.virq_deferral_depth.load(Ordering::Relaxed) != 0,
+    )
+}
+
+/// Holds off nested virtual interrupts until this Task has finished its
+/// scheduler transition. The mark follows the Task across a context switch;
+/// another Task can still receive pending notices on the same vCPU.
+#[cfg(feature = "kernelet")]
+pub(crate) struct VirtualIrqDeferral;
+
+#[cfg(feature = "kernelet")]
+impl VirtualIrqDeferral {
+    pub(crate) fn new() -> Self {
+        if let Some(task) = Task::current() {
+            task.virq_deferral_depth.fetch_add(1, Ordering::Relaxed);
+        } else {
+            BOOT_VIRQ_DEFERRAL_DEPTH.add_assign(1);
+        }
+        Self
+    }
+}
+
+#[cfg(feature = "kernelet")]
+impl Drop for VirtualIrqDeferral {
+    fn drop(&mut self) {
+        if let Some(task) = Task::current() {
+            let previous = task.virq_deferral_depth.fetch_sub(1, Ordering::Relaxed);
+            debug_assert!(previous > 0);
+        } else {
+            debug_assert!(BOOT_VIRQ_DEFERRAL_DEPTH.load() > 0);
+            BOOT_VIRQ_DEFERRAL_DEPTH.sub_assign(1);
+        }
     }
 }
 
@@ -207,6 +292,7 @@ impl TaskOptions {
             // However, `current_task` _borrows_ the current task without holding
             // an extra reference count. So we do nothing here.
 
+            let _ = current_task.accounting.detach(None);
             scheduler::exit_current();
         }
 
@@ -228,12 +314,15 @@ impl TaskOptions {
         ctx.set_stack_pointer(kstack.end_vaddr() - 16);
 
         let new_task = Task {
+            accounting: accounting::TaskAccounting::new(),
             func: ForceSync::new(Cell::new(self.func)),
             data: self.data.unwrap_or_else(|| Box::new(())),
             local_data: ForceSync::new(self.local_data.unwrap_or_else(|| Box::new(()))),
             ctx: SyncUnsafeCell::new(ctx),
             kstack,
             switched_to_cpu: AtomicBool::new(false),
+            #[cfg(feature = "kernelet")]
+            virq_deferral_depth: AtomicU32::new(0),
             schedule_info: TaskScheduleInfo {
                 cpu: AtomicCpuId::default(),
             },
@@ -266,6 +355,12 @@ impl !Send for CurrentTask {}
 impl !Sync for CurrentTask {}
 
 impl CurrentTask {
+    /// Begins measuring execution accounted by this Task's scheduler,
+    /// excluding time spent asleep or running other Tasks.
+    pub fn measure_cpu_time(&self) -> CpuTimeMeasurement {
+        CpuTimeMeasurement::start(self.cloned())
+    }
+
     /// # Safety
     ///
     /// The caller must ensure that `task` is the current task.

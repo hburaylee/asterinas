@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: MPL-2.0
+[package]
+name = "kernelet-abi"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+
+[dependencies]
+ostd-pod = { path = "../../ostd/libs/ostd-pod" }
+zerocopy = { version = "0.8.34", features = ["derive"] }
+
+[lints]
+workspace = true
+
+[dev-dependencies]
+cbindgen = "0.29"

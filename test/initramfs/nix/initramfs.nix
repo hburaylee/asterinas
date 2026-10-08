@@ -10,6 +10,7 @@
   conformance,
   regression,
   dnsServer,
+  kernelet ? null,
 }:
 let
   boot_hello = builtins.path { path = ./../src/boot_hello.sh; };
@@ -72,6 +73,17 @@ stdenvNoCC.mkDerivation {
 
     ${lib.optionalString (conformance != null) ''
       cp -r "${conformance.package}"/* $out/
+    ''}
+
+    ${lib.optionalString (kernelet != null) ''
+      mkdir -p $out/usr/libexec $out/opt/kernelet
+      cp ${kernelet.runtime} $out/usr/bin/kernelet-runtime
+      cp ${kernelet.agent} $out/usr/libexec/kernelet-agent
+      cp ${kernelet.shim} $out/usr/bin/containerd-shim-kernelet-v2
+      chmod 0755 $out/usr/bin/kernelet-runtime $out/usr/libexec/kernelet-agent $out/usr/bin/containerd-shim-kernelet-v2
+      cp -L ${kernelet.mke2fs}/bin/mke2fs $out/usr/libexec/kernelet-mke2fs
+      chmod 0755 $out/usr/libexec/kernelet-mke2fs
+      cp -r ${kernelet.bashBundle} $out/opt/kernelet/bash-bundle
     ''}
 
     ${lib.optionalString (conformance != null && conformance.testSuite == "gvisor") ''

@@ -68,15 +68,32 @@
 mod fifo_scheduler;
 pub mod info;
 
+#[cfg(feature = "kernelet")]
+use core::sync::atomic::Ordering;
+
 use spin::Once;
 
 use super::{Task, preempt::cpu_local, processor};
 use crate::{
-    cpu::{CpuId, CpuSet, PinCurrentCpu},
+    cpu::{CpuId, PinCurrentCpu},
     prelude::*,
     task::disable_preempt,
     timer,
 };
+
+/// Returns the execution clock used to charge the current Task's runtime.
+///
+/// Charges elapsed execution to the current Task's attached CPU account using
+/// the same clock reading.
+///
+/// On a kernelet vCPU, complete Host off-CPU intervals are removed from this
+/// clock. The offset is local to the current vCPU; a scheduler must retain a
+/// starting value only while the Task runs on that vCPU.
+pub fn runtime_ticks() -> u64 {
+    Task::current()
+        .and_then(|task| task.accounting.sample(true))
+        .unwrap_or_else(super::accounting::runtime_ticks)
+}
 
 /// Injects a custom implementation of task scheduler into OSTD.
 ///
@@ -512,10 +529,26 @@ fn set_need_preempt(cpu_id: CpuId) {
     if preempt_guard.current_cpu() == cpu_id {
         cpu_local::set_need_preempt();
     } else {
-        crate::smp::inter_processor_call(&CpuSet::from(cpu_id), || {
+        #[cfg(feature = "kernelet")]
+        {
+            // KICK publishes the runnable work and wakes an idle carrier. The
+            // target sets its own CPU-local preemption flag on delivery.
+            let result = (crate::kernelet::entry::services().vcpu_kick)(u32::from(cpu_id));
+            // A failed kick would leave the remote runnable task stranded.
+            assert_eq!(result, 0, "failed to kick a virtual CPU");
+        }
+
+        #[cfg(not(feature = "kernelet"))]
+        crate::smp::inter_processor_call(&crate::cpu::CpuSet::from(cpu_id), || {
             cpu_local::set_need_preempt();
         });
     }
+}
+
+/// Marks the current vCPU for a scheduler check after a virtual KICK.
+#[cfg(feature = "kernelet")]
+pub(crate) fn mark_need_preempt_on_current_cpu() {
+    cpu_local::set_need_preempt();
 }
 
 /// Dequeues the current task from its runqueue.
@@ -568,6 +601,13 @@ fn reschedule<F>(mut f: F)
 where
     F: FnMut(&mut dyn LocalRunQueue) -> ReschedAction,
 {
+    // The runqueue guard enables virtual IRQs after publishing its decision.
+    // Keep this Task from recursively entering the scheduler until its chosen
+    // context switch has installed the next Task. The next Task has its own
+    // deferral state and can receive the pending notice.
+    #[cfg(feature = "kernelet")]
+    let _virq_deferral = super::VirtualIrqDeferral::new();
+
     // Even if the decision below is `DoNothing`, we should clear this flag. Meanwhile, to avoid
     // race conditions, we should do this before making the decision.
     cpu_local::clear_need_preempt();

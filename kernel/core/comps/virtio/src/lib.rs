@@ -22,7 +22,9 @@ use device::{
 };
 use ostd::{error, warn};
 use spin::Once;
-use transport::{DeviceStatus, mmio::VIRTIO_MMIO_DRIVER, pci::VIRTIO_PCI_DRIVER};
+#[cfg(not(feature = "kernelet"))]
+use transport::pci::VIRTIO_PCI_DRIVER;
+use transport::{DeviceStatus, mmio::VIRTIO_MMIO_DRIVER};
 
 use crate::transport::{DeviceTransport, VirtioTransport};
 
@@ -124,6 +126,7 @@ fn virtio_component_init() -> Result<(), ComponentInitError> {
 }
 
 fn pop_device_transport() -> Option<Box<dyn VirtioTransport>> {
+    #[cfg(not(feature = "kernelet"))]
     if let Some(device) = VIRTIO_PCI_DRIVER.get().unwrap().pop_device_transport() {
         return Some(device);
     }

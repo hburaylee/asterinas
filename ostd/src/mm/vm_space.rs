@@ -8,9 +8,13 @@
 //! the page table cursor, providing efficient, powerful concurrent accesses
 //! to the page table.
 
+#[cfg(feature = "kernelet")]
+use core::sync::atomic::AtomicBool;
 use core::{ops::Range, sync::atomic::Ordering};
 
 use super::{AnyUFrameMeta, PagingLevel, page_table::PageTableConfig};
+#[cfg(not(feature = "kernelet"))]
+use crate::mm::kspace::KERNEL_PAGE_TABLE;
 use crate::{
     Error,
     arch::mm::{PageTableEntry, PagingConsts, current_page_table_paddr},
@@ -22,7 +26,6 @@ use crate::{
         VmWriter,
         frame::FrameRef,
         io::Fallible,
-        kspace::KERNEL_PAGE_TABLE,
         page_prop::{CachePolicy, PageFlags},
         page_table::{self, PageTable, PageTableFrag},
         tlb::{TlbFlushOp, TlbFlusher},
@@ -72,15 +75,37 @@ pub struct VmSpace {
     pt: PageTable<UserPtConfig>,
     cpus: AtomicCpuSet,
     iomems: SpinLock<Vec<IoMem>>,
+    #[cfg(feature = "kernelet")]
+    registered: AtomicBool,
+}
+
+#[cfg(feature = "kernelet")]
+impl Drop for VmSpace {
+    fn drop(&mut self) {
+        if self.registered.load(Ordering::Acquire) {
+            let result = (crate::kernelet::entry::services().pt_root_unregister)(
+                self.pt.root_paddr() as u64,
+            );
+            assert_eq!(
+                result, 0,
+                "Host refused to unregister a user page-table root"
+            );
+        }
+    }
 }
 
 impl VmSpace {
     /// Creates a new VM address space.
     pub fn new() -> Self {
         Self {
+            #[cfg(not(feature = "kernelet"))]
             pt: KERNEL_PAGE_TABLE.get().unwrap().create_user_page_table(),
+            #[cfg(feature = "kernelet")]
+            pt: PageTable::new_kernelet_user_page_table(),
             cpus: AtomicCpuSet::new(CpuSet::new_empty()),
             iomems: SpinLock::new(Vec::new()),
+            #[cfg(feature = "kernelet")]
+            registered: AtomicBool::new(false),
         }
     }
 
@@ -137,6 +162,17 @@ impl VmSpace {
         // `Acquire` to ensure the modification to the PT is visible by this CPU.
         self.cpus.add(cpu, Ordering::Acquire);
 
+        #[cfg(feature = "kernelet")]
+        {
+            let root = self.pt.root_paddr() as u64;
+            if !self.registered.swap(true, Ordering::AcqRel) {
+                let status = (crate::kernelet::entry::services().pt_root_register)(root);
+                assert_eq!(status, 0, "Host refused to register a user page-table root");
+            }
+            let status = (crate::kernelet::entry::services().pt_activate)(root);
+            assert_eq!(status, 0, "Host refused to activate a user page-table root");
+        }
+
         let self_ptr = Arc::into_raw(Arc::clone(self)) as *mut VmSpace;
         ACTIVATED_VM_SPACE.store(self_ptr);
 
@@ -147,6 +183,7 @@ impl VmSpace {
             last.cpus.remove(cpu, Ordering::Relaxed);
         }
 
+        #[cfg(not(feature = "kernelet"))]
         self.pt.activate();
     }
 

@@ -8,7 +8,7 @@ mod new;
 mod profile;
 mod run;
 mod test;
-mod util;
+pub(crate) mod util;
 
 pub use self::{
     build::execute_build_command, debug::execute_debug_command, new::execute_new_command,

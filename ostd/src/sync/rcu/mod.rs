@@ -539,6 +539,50 @@ pub(crate) unsafe fn finish_grace_period() {
     }
 }
 
+/// Marks the current vCPU as idle after its last internal Task has stopped.
+///
+/// The caller must have virtual IRQs disabled and hold no preemption guard.
+/// It must call [`leave_idle`] before enabling virtual IRQs again. Returns
+/// false if completed callbacks need active kernelet context instead of the
+/// Host idle service.
+///
+/// # Safety
+///
+/// The caller must be the current vCPU's idle Task, with virtual IRQs off and
+/// no RCU reader or preemption guard. It must leave the idle state before any
+/// internal Task or virtual-interrupt handler can start an RCU reader.
+#[cfg(feature = "kernelet")]
+pub(crate) unsafe fn enter_idle() -> bool {
+    RCU_MONITOR.get().unwrap().enter_idle()
+}
+
+/// Checks whether the idle vCPU can park after discovering its next deadline.
+///
+/// The caller must still have virtual IRQs disabled. A false result retracts
+/// the extended quiescent state so that callbacks can run in task context.
+///
+/// # Safety
+///
+/// The current vCPU must still be in the idle state returned by [`enter_idle`],
+/// with virtual IRQs disabled and no RCU reader.
+#[cfg(feature = "kernelet")]
+pub(crate) unsafe fn can_park_idle() -> bool {
+    RCU_MONITOR.get().unwrap().can_park_idle()
+}
+
+/// Ends the current vCPU's extended quiescent state before it can run a Task.
+///
+/// The caller must still have virtual IRQs disabled.
+///
+/// # Safety
+///
+/// The current vCPU must still be in the idle state returned by [`enter_idle`],
+/// with virtual IRQs disabled and no RCU reader.
+#[cfg(feature = "kernelet")]
+pub(crate) unsafe fn leave_idle() {
+    RCU_MONITOR.get().unwrap().leave_idle();
+}
+
 static RCU_MONITOR: Once<RcuMonitor> = Once::new();
 
 pub(super) fn init() {

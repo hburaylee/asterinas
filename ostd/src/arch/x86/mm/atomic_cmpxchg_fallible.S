@@ -21,6 +21,6 @@ __atomic_cmpxchg_fallible: # (ptr: *mut u32, old_val: u32, new_val: u32) -> u64
 
 .pushsection .ex_table, "a", @progbits
     .align 8
-    .quad [.cmpxchg]
-    .quad [.cmpxchg_fault]
+    .quad .cmpxchg - .
+    .quad .cmpxchg_fault - .
 .popsection

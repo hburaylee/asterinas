@@ -15,7 +15,10 @@ pub(super) fn resolve_bind_iface_and_config(
     endpoint: &IpEndpoint,
     can_reuse: bool,
 ) -> Result<(Arc<Iface>, BindPortConfig)> {
-    check_port_privilege(endpoint.port)?;
+    // Port zero requests an ephemeral IP port, without binding a privileged port.
+    if endpoint.port != 0 {
+        check_port_privilege(endpoint.port)?;
+    }
 
     let iface = route::lookup_local_iface(endpoint.addr)?;
 

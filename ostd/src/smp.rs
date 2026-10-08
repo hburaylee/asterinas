@@ -40,9 +40,43 @@ use crate::{
 ///
 /// This function will panic if a hardware error occurs while sending an IPI to
 /// a remote processor.
+#[cfg(not(feature = "kernelet"))]
 pub fn inter_processor_call(targets: &CpuSet, call_fn: fn()) -> PendingIpis {
     let ipi_sender = IPI_SENDER.get().unwrap();
     ipi_sender.inter_processor_call(targets, call_fn)
+}
+
+/// Publishes calls to virtual CPUs through their kick service.
+#[cfg(feature = "kernelet")]
+pub fn inter_processor_call(targets: &CpuSet, call_fn: fn()) -> PendingIpis {
+    let guard = irq::disable_local();
+    let current = guard.current_cpu();
+    let mut pending = PendingIpis::new_empty();
+    for cpu in targets.iter() {
+        if cpu == current {
+            call_fn();
+            continue;
+        }
+        {
+            let mut queue = CALL_QUEUES.get_on_cpu(cpu).lock();
+            queue.push_back(call_fn);
+            HAS_PENDING_IPIS
+                .get_on_cpu(cpu)
+                .store(true, Ordering::Release);
+        }
+        pending.add(cpu);
+        let result = (crate::kernelet::entry::services().vcpu_kick)(cpu.as_usize() as u32);
+        // A failed kick would leave the published call queue undrained.
+        assert_eq!(result, 0, "failed to deliver a virtual IPI");
+    }
+    pending
+}
+
+/// Executes the queued virtual-CPU work after acquiring a KICK publication.
+#[cfg(feature = "kernelet")]
+pub(crate) fn do_virtual_inter_processor_call() {
+    // SAFETY: The virtual interrupt dispatcher holds local virtual IRQs masked.
+    unsafe { do_inter_processor_call(&TrapFrame::default()) };
 }
 
 /// Pending remote inter-processor calls.

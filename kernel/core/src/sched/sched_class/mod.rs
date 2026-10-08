@@ -8,7 +8,6 @@ use alloc::{boxed::Box, sync::Arc};
 use core::{fmt, ops::Bound, sync::atomic::Ordering};
 
 use ostd::{
-    arch::read_tsc as sched_clock,
     cpu::{CpuId, CpuSet, PinCurrentCpu, all_cpus},
     irq::disable_local,
     sync::{LocalIrqDisabled, SpinLock},
@@ -16,7 +15,7 @@ use ostd::{
         AtomicCpuId, Task,
         scheduler::{
             EnqueueFlags, LocalRunQueue, Scheduler, UpdateFlags, enable_preemption_on_cpu,
-            info::CommonSchedInfo, inject_scheduler,
+            info::CommonSchedInfo, inject_scheduler, runtime_ticks as sched_clock,
         },
     },
     util::id_set::Id,

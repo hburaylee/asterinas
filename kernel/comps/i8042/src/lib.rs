@@ -4,6 +4,7 @@
 #![no_std]
 #![deny(unsafe_code)]
 #![cfg(target_arch = "x86_64")]
+#![cfg(not(feature = "kernelet"))]
 
 extern crate alloc;
 

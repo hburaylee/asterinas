@@ -28,7 +28,7 @@ use crate::{
         scheme::{ActionChoice, BootMethod, BootProtocol},
     },
     error::Errno,
-    error_msg,
+    error_msg, kernelet,
     util::{
         CrateInfo, DirGuard, get_cargo_metadata, get_current_crates, get_kernel_crate,
         get_target_directory,
@@ -75,6 +75,14 @@ pub fn create_base_and_cached_build(
     action: ActionChoice,
     rustflags: &[&str],
 ) -> Bundle {
+    // One OSDK invocation builds the kernelet image first and the host image
+    // second, embedding the kernelet image's bytes into the host image.
+    let kernelet_image = kernelet::build_image_if_requested(
+        config,
+        &target_crate,
+        osdk_output_directory.as_ref(),
+        cargo_target_directory.as_ref(),
+    );
     let base_crate_path = new_base_crate(
         match action {
             ActionChoice::Run => BaseCrateType::Run,
@@ -93,6 +101,7 @@ pub fn create_base_and_cached_build(
         config,
         action,
         rustflags,
+        kernelet_image.as_ref(),
     )
 }
 
@@ -131,6 +140,7 @@ pub fn do_cached_build(
     config: &Config,
     action: ActionChoice,
     rustflags: &[&str],
+    kernelet_image: Option<&kernelet::KerneletImage>,
 ) -> Bundle {
     let (build, boot, grub) = match action {
         ActionChoice::Run => (&config.run.build, &config.run.boot, &config.run.grub),
@@ -139,6 +149,20 @@ pub fn do_cached_build(
 
     let mut rustflags = rustflags.to_vec();
     rustflags.push(&build.rustflags);
+    // Host service panics must unwind back through their protected continuation.
+    if build.kernelet {
+        rustflags.push("-C panic=unwind");
+    }
+    let extra_envs = match (build.kernelet, kernelet_image) {
+        (false, _) => Vec::new(),
+        (true, Some(image)) => image.host_envs(),
+        (true, None) => {
+            error_msg!(
+                "The `kernelet` build option is enabled, but this OSDK action does not build the kernelet image first"
+            );
+            process::exit(Errno::Cli as _);
+        }
+    };
     let aster_elf = build_kernel_elf(
         config.target_arch,
         &build.profile,
@@ -147,7 +171,14 @@ pub fn do_cached_build(
         &build.override_configs[..],
         &cargo_target_directory,
         &rustflags,
+        &extra_envs,
     );
+    if build.kernelet {
+        kernelet::audit_host_services(aster_elf.path()).unwrap_or_else(|error| {
+            error_msg!("The Host service table failed the linked ELF audit: {error}");
+            process::exit(Errno::BuildCrate as _);
+        });
+    }
 
     // Check the existing bundle's reusability
     if let Some(existing_bundle) = get_reusable_existing_bundle(&bundle_path, config, action)
@@ -205,6 +236,7 @@ pub fn do_cached_build(
     bundle
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_kernel_elf(
     arch: Arch,
     profile: &str,
@@ -213,6 +245,7 @@ fn build_kernel_elf(
     override_configs: &[String],
     cargo_target_directory: impl AsRef<Path>,
     rustflags: &[&str],
+    extra_envs: &[(String, OsString)],
 ) -> AsterBin {
     let target_os_string = OsString::from(&arch.triple());
     let rustc_linker_script_arg = format!("-C link-arg=-T{}.ld", arch);
@@ -266,6 +299,11 @@ fn build_kernel_elf(
     );
 
     command.env("RUSTFLAGS", rustflags.join(" "));
+    command.envs(
+        extra_envs
+            .iter()
+            .map(|(key, value)| (key.as_str(), value.as_os_str())),
+    );
     command.arg("build");
     command.arg("--features").arg(features.join(" "));
     if no_default_features {

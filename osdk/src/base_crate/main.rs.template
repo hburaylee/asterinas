@@ -1,7 +1,7 @@
 #![no_std]
 #![no_main]
 
-#![feature(linkage)]
+#![cfg_attr(#DEFAULT_ALLOCATORS_CFG#, feature(linkage))]
 
 extern crate #TARGET_NAME#;
 
@@ -13,6 +13,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     unsafe { __ostd_panic_handler(info); }
 }
 
+#[cfg(#DEFAULT_ALLOCATORS_CFG#)]
 mod default_frame_allocator {
     use ostd::mm::frame::GlobalFrameAllocator;
 
@@ -25,6 +26,7 @@ mod default_frame_allocator {
     static __GLOBAL_FRAME_ALLOCATOR_REF: &'static dyn GlobalFrameAllocator = &FRAME_ALLOCATOR;
 }
 
+#[cfg(#DEFAULT_ALLOCATORS_CFG#)]
 mod default_heap_allocator {
     use ostd::mm::heap::GlobalHeapAllocator;
 

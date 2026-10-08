@@ -30,41 +30,22 @@ impl RcuMonitor {
     }
 
     pub(super) unsafe fn finish_grace_period(&self) {
-        // Fast path
+        // There may be completed callbacks even when no grace period is active.
         if !self.is_monitoring.load(Relaxed) {
             return;
         }
 
-        // Check if the current GP is complete after passing the quiescent state
-        // on the current CPU. If GP is complete, take the callbacks of the current
-        // GP.
         let callbacks = {
             let mut state = self.state.disable_irq().lock();
             let cpu = state.as_atomic_mode_guard().current_cpu();
-            if state.current_gp.is_complete() {
-                return;
-            }
-
-            state.current_gp.finish_grace_period(cpu);
-            if !state.current_gp.is_complete() {
-                return;
-            }
-
-            // Now that the current GP is complete, take its callbacks
-            let current_callbacks = state.current_gp.take_callbacks();
-
-            // Check if we need to watch for a next GP
-            if !state.next_callbacks.is_empty() {
-                let callbacks = core::mem::take(&mut state.next_callbacks);
-                state.current_gp.restart(callbacks);
-            } else {
-                self.is_monitoring.store(false, Relaxed);
-            }
-
-            current_callbacks
+            state.report_quiescent_state(cpu);
+            let callbacks = core::mem::take(&mut state.ready_callbacks);
+            self.is_monitoring.store(state.has_work(), Relaxed);
+            callbacks
         };
 
-        // Invoke the callbacks to notify the completion of GP
+        // A callback may sleep or register another callback. Keep it outside
+        // the monitor lock and run it only in ordinary task context.
         for f in callbacks {
             (f)();
         }
@@ -77,20 +58,53 @@ impl RcuMonitor {
         let mut state = self.state.disable_irq().lock();
 
         state.next_callbacks.push_back(Box::new(f));
+        state.advance_completed_periods();
+        self.is_monitoring.store(state.has_work(), Relaxed);
+    }
 
-        if !state.current_gp.is_complete() {
-            return;
-        }
+    /// Enters an extended quiescent state before the idle Host service.
+    ///
+    /// Returns false when completed callbacks need an active virtual CPU.
+    /// In that case this call retracts the idle state; the caller enables
+    /// virtual IRQs and drains callbacks instead of parking.
+    #[cfg(feature = "kernelet")]
+    pub(super) fn enter_idle(&self) -> bool {
+        let mut state = self.state.disable_irq().lock();
+        let cpu = state.as_atomic_mode_guard().current_cpu();
+        debug_assert!(!state.idle_cpus.contains(cpu));
+        state.idle_cpus.add(cpu);
+        state.report_quiescent_state(cpu);
+        let should_park = state.can_park_idle(cpu);
+        self.is_monitoring.store(state.has_work(), Relaxed);
+        should_park
+    }
 
-        let callbacks = core::mem::take(&mut state.next_callbacks);
-        state.current_gp.restart(callbacks);
-        self.is_monitoring.store(true, Relaxed);
+    /// Rechecks for callbacks after the idle Task queries its next deadline.
+    /// Deadline discovery can retire timer objects that contain `RcuDrop`s.
+    #[cfg(feature = "kernelet")]
+    pub(super) fn can_park_idle(&self) -> bool {
+        let mut state = self.state.disable_irq().lock();
+        let cpu = state.as_atomic_mode_guard().current_cpu();
+        debug_assert!(state.idle_cpus.contains(cpu));
+        state.can_park_idle(cpu)
+    }
+
+    /// Leaves the extended quiescent state before virtual IRQs are enabled.
+    #[cfg(feature = "kernelet")]
+    pub(super) fn leave_idle(&self) {
+        let mut state = self.state.disable_irq().lock();
+        let cpu = state.as_atomic_mode_guard().current_cpu();
+        debug_assert!(state.idle_cpus.contains(cpu));
+        state.idle_cpus.remove(cpu);
     }
 }
 
 struct State {
     current_gp: GracePeriod,
     next_callbacks: Callbacks,
+    ready_callbacks: Callbacks,
+    /// A Host pause never changes this set. Only the inner idle path does.
+    idle_cpus: CpuSet,
 }
 
 impl State {
@@ -98,6 +112,44 @@ impl State {
         Self {
             current_gp: GracePeriod::new(),
             next_callbacks: VecDeque::new(),
+            ready_callbacks: VecDeque::new(),
+            idle_cpus: CpuSet::new_empty(),
+        }
+    }
+
+    fn has_work(&self) -> bool {
+        !self.current_gp.is_complete()
+            || !self.next_callbacks.is_empty()
+            || !self.ready_callbacks.is_empty()
+    }
+
+    #[cfg(any(feature = "kernelet", ktest))]
+    fn can_park_idle(&mut self, cpu: CpuId) -> bool {
+        if self.ready_callbacks.is_empty() {
+            return true;
+        }
+        self.idle_cpus.remove(cpu);
+        false
+    }
+
+    fn report_quiescent_state(&mut self, cpu: CpuId) {
+        if !self.current_gp.is_complete() {
+            self.current_gp.finish_grace_period(cpu);
+        }
+        self.advance_completed_periods();
+    }
+
+    fn advance_completed_periods(&mut self) {
+        while self.current_gp.is_complete() {
+            self.ready_callbacks
+                .extend(self.current_gp.take_callbacks());
+            if self.next_callbacks.is_empty() {
+                break;
+            }
+            let callbacks = core::mem::take(&mut self.next_callbacks);
+            // An idle vCPU has had no reader since it entered idle. It also
+            // satisfies a grace period that starts while it remains idle.
+            self.current_gp.restart(callbacks, &self.idle_cpus);
         }
     }
 }
@@ -135,9 +187,72 @@ impl GracePeriod {
         core::mem::take(&mut self.callbacks)
     }
 
-    fn restart(&mut self, callbacks: Callbacks) {
-        self.is_complete = false;
-        self.cpu_mask.store(&CpuSet::new_empty(), Relaxed);
+    fn restart(&mut self, callbacks: Callbacks, idle_cpus: &CpuSet) {
+        self.cpu_mask.store(idle_cpus, Relaxed);
+        self.is_complete = self.cpu_mask.load(Relaxed).is_full();
         self.callbacks = callbacks;
+    }
+}
+
+#[cfg(ktest)]
+mod test {
+    use super::*;
+    use crate::{cpu::all_cpus, prelude::ktest};
+
+    #[ktest]
+    fn idle_cpu_satisfies_grace_periods_until_it_wakes() {
+        let mut state = State::new();
+        let cpus: Vec<_> = all_cpus().collect();
+        let idle_cpu = *cpus.last().unwrap();
+
+        state.next_callbacks.push_back(Box::new(|| {}));
+        state.advance_completed_periods();
+        for &cpu in &cpus[..cpus.len() - 1] {
+            state.report_quiescent_state(cpu);
+        }
+        assert!(state.ready_callbacks.is_empty());
+
+        state.idle_cpus.add(idle_cpu);
+        state.report_quiescent_state(idle_cpu);
+        assert_eq!(state.ready_callbacks.len(), 1);
+
+        // A later period may count a CPU that remained idle throughout it.
+        state.next_callbacks.push_back(Box::new(|| {}));
+        state.advance_completed_periods();
+        for &cpu in &cpus[..cpus.len() - 1] {
+            state.report_quiescent_state(cpu);
+        }
+        assert_eq!(state.ready_callbacks.len(), 2);
+
+        // Once it wakes, a new period must wait for a real switch/checkpoint.
+        state.idle_cpus.remove(idle_cpu);
+        state.next_callbacks.push_back(Box::new(|| {}));
+        state.advance_completed_periods();
+        for &cpu in &cpus[..cpus.len() - 1] {
+            state.report_quiescent_state(cpu);
+        }
+        assert_eq!(state.ready_callbacks.len(), 2);
+        state.report_quiescent_state(idle_cpu);
+        assert_eq!(state.ready_callbacks.len(), 3);
+    }
+
+    #[ktest]
+    fn callback_queued_during_deadline_query_prevents_park() {
+        let mut state = State::new();
+        let cpus: Vec<_> = all_cpus().collect();
+        let idle_cpu = *cpus.last().unwrap();
+
+        state.idle_cpus.add(idle_cpu);
+        assert!(state.can_park_idle(idle_cpu));
+
+        // The deadline callback can queue a drop after the first idle check.
+        state.next_callbacks.push_back(Box::new(|| {}));
+        state.advance_completed_periods();
+        for &cpu in &cpus[..cpus.len() - 1] {
+            state.report_quiescent_state(cpu);
+        }
+        assert_eq!(state.ready_callbacks.len(), 1);
+        assert!(!state.can_park_idle(idle_cpu));
+        assert!(!state.idle_cpus.contains(idle_cpu));
     }
 }

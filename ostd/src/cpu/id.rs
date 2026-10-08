@@ -62,6 +62,15 @@ impl TryFrom<usize> for CpuId {
     }
 }
 
+/// Native current-CPU slot read by the compiled virtual-CPU lookup stub.
+#[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+pub(crate) fn host_cpu_gs_offset() -> u32 {
+    current::CURRENT_CPU
+        .static_offset()
+        .try_into()
+        .expect("CPU-local offset exceeds ABI")
+}
+
 /// Returns the number of CPUs.
 pub fn num_cpus() -> usize {
     // SAFETY: As far as the safe APIs are concerned, `NUM_CPUS` is

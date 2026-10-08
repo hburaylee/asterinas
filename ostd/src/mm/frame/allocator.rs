@@ -16,6 +16,16 @@ use crate::{
     util::ops::range_difference,
 };
 
+fn allocate_layout(layout: Layout) -> Option<usize> {
+    let allocator = get_global_frame_allocator();
+    let result = allocator.alloc(layout);
+    #[cfg(feature = "kernelet")]
+    if result.is_none() && crate::kernelet::image_grant::request_grains(layout.size()) {
+        return allocator.alloc(layout);
+    }
+    result
+}
+
 /// Options for allocating physical memory frames.
 pub struct FrameAllocOptions {
     zeroed: bool,
@@ -53,8 +63,7 @@ impl FrameAllocOptions {
     /// Allocates a single frame with additional metadata.
     pub fn alloc_frame_with<M: AnyFrameMeta>(&self, metadata: M) -> Result<Frame<M>> {
         let single_layout = Layout::from_size_align(PAGE_SIZE, PAGE_SIZE).unwrap();
-        let frame = get_global_frame_allocator()
-            .alloc(single_layout)
+        let frame = allocate_layout(single_layout)
             .map(|paddr| Frame::from_unused(paddr, metadata).unwrap())
             .ok_or(Error::NoMemory)?;
 
@@ -70,6 +79,28 @@ impl FrameAllocOptions {
     /// Allocates a contiguous range of untyped frames without metadata.
     pub fn alloc_segment(&self, nframes: usize) -> Result<Segment<()>> {
         self.alloc_segment_with(nframes, |_| ())
+    }
+
+    /// Allocates a physically contiguous segment at a specified alignment.
+    ///
+    /// The alignment must be a power of two and at least one page. The Host
+    /// uses this for 2 MiB-aligned kernelet grain grants.
+    pub fn alloc_segment_aligned(&self, nframes: usize, align: usize) -> Result<Segment<()>> {
+        if nframes == 0 || align < PAGE_SIZE || !align.is_power_of_two() {
+            return Err(Error::InvalidArgs);
+        }
+        let bytes = nframes.checked_mul(PAGE_SIZE).ok_or(Error::Overflow)?;
+        let layout = Layout::from_size_align(bytes, align).map_err(|_| Error::InvalidArgs)?;
+        let start = allocate_layout(layout).ok_or(Error::NoMemory)?;
+        let segment = Segment::from_unused(start..start + bytes, |_| ()).unwrap();
+
+        if self.zeroed {
+            let addr = paddr_to_vaddr(start) as *mut u8;
+            // SAFETY: The newly allocated segment is valid and exclusively owned.
+            unsafe { core::ptr::write_bytes(addr, 0, bytes) }
+        }
+
+        Ok(segment)
     }
 
     /// Allocates a contiguous range of frames with additional metadata.
@@ -88,8 +119,7 @@ impl FrameAllocOptions {
             return Err(Error::InvalidArgs);
         }
         let layout = Layout::from_size_align(nframes * PAGE_SIZE, PAGE_SIZE).unwrap();
-        let segment = get_global_frame_allocator()
-            .alloc(layout)
+        let segment = allocate_layout(layout)
             .map(|start| {
                 Segment::from_unused(start..start + nframes * PAGE_SIZE, metadata_fn).unwrap()
             })
@@ -186,6 +216,12 @@ pub(super) fn get_global_frame_allocator() -> &'static dyn GlobalFrameAllocator 
     // `global_frame_allocator` attribute. If they use safe code only, the
     // up-call is safe.
     unsafe { __GLOBAL_FRAME_ALLOCATOR_REF }
+}
+
+/// Adds a published Host grant to the image's ordinary frame allocator.
+#[cfg(feature = "kernelet")]
+pub(crate) fn add_kernelet_grant(paddr: usize, bytes: usize) {
+    get_global_frame_allocator().add_free_memory(paddr, bytes);
 }
 
 /// Initializes the global frame allocator.

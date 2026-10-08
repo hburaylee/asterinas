@@ -119,6 +119,7 @@ default-members = [
 # Their crate-level `Cargo.toml` files are not affected
 # by the shared in-kernel workspace configuration.
 exclude = [
+    "kernelet",
     "kernel/libs/comp-sys/cargo-component",
     "kernel/libs/comp-sys/component",
     "kernel/libs/comp-sys/component-macro",
@@ -151,7 +152,8 @@ license = "MPL-2.0"
 edition = "2024"
 
 [workspace.dependencies]
-ostd = { path = "ostd", version = "0.19.0" }
+ostd = { path = "ostd", version = "0.19.0", default-features = false }
+kernelet-abi = { path = "kernelet/abi" }
 
 # Crates under ostd/libs
 align_ext = { path = "ostd/libs/align_ext", version = "0.1.0" }

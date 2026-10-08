@@ -410,6 +410,12 @@ pub struct CommonArgs {
     )]
     pub strip_elf: bool,
     #[arg(
+        long,
+        help = "Build and embed a kernelet image alongside the host kernel",
+        global = true
+    )]
+    pub kernelet: bool,
+    #[arg(
         long = "target-arch",
         value_name = "ARCH",
         help = "The architecture to build for",

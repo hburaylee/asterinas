@@ -1,9 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use core::{
-    sync::atomic::{AtomicU64, Ordering},
-    time::Duration,
-};
+#[cfg(not(feature = "kernelet"))]
+use core::sync::atomic::{AtomicU64, Ordering};
+use core::time::Duration;
 
 use super::TIMER_FREQ;
 
@@ -14,6 +13,7 @@ use super::TIMER_FREQ;
 #[derive(Clone, Copy, Debug)]
 pub struct Jiffies(u64);
 
+#[cfg(not(feature = "kernelet"))]
 pub(crate) static ELAPSED: AtomicU64 = AtomicU64::new(0);
 
 impl Jiffies {
@@ -27,7 +27,15 @@ impl Jiffies {
 
     /// Returns the elapsed time since the system boots up.
     pub fn elapsed() -> Self {
-        Self::new(ELAPSED.load(Ordering::Relaxed))
+        #[cfg(feature = "kernelet")]
+        {
+            Self::new(crate::kernelet::entry::clock_now_ns() / (1_000_000_000 / TIMER_FREQ))
+        }
+
+        #[cfg(not(feature = "kernelet"))]
+        {
+            Self::new(ELAPSED.load(Ordering::Relaxed))
+        }
     }
 
     /// Gets the number of jiffies.

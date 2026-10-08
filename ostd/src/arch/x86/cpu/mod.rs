@@ -5,4 +5,5 @@
 pub mod context;
 pub mod cpuid;
 pub mod extension;
+#[cfg_attr(feature = "kernelet", path = "kernelet_local.rs")]
 pub mod local;

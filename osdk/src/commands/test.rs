@@ -113,6 +113,10 @@ pub static KTEST_CRATE_WHITELIST: Option<&[&str]> = Some(&{:#?});
         config,
         ActionChoice::Test,
         &["--cfg ktest", "-C panic=unwind"],
+        // Ktest kernels run in the host boot path; the kernelet image is not
+        // built here. A kernelet-enabled manifest fails the build with an
+        // explicit error inside `do_cached_build`.
+        None,
     );
     drop(dir_guard);
 

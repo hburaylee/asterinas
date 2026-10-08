@@ -15,12 +15,17 @@
 
 mod ex_table;
 
+#[cfg(feature = "kernelet")]
+use core::sync::atomic::Ordering;
+
 use spin::Once;
 
 #[cfg(not(target_arch = "loongarch64"))]
 use crate::arch::cpu::context::CpuException;
 #[cfg(target_arch = "loongarch64")]
 use crate::arch::cpu::context::CpuExceptionInfo as CpuException;
+#[cfg(feature = "kernelet")]
+use crate::arch::cpu::context::{PageFaultErrorCode, RawPageFaultInfo};
 use crate::{
     arch::trap::TrapFrame,
     mm::{MAX_USERSPACE_VADDR, Vaddr, fault::ex_table::ExTable},
@@ -40,6 +45,46 @@ static USER_PAGE_FAULT_HANDLER: Once<UserPageFaultHandler> = Once::new();
 /// The function may be called only once; subsequent calls take no effect.
 pub fn inject_user_page_fault_handler(handler: UserPageFaultHandler) {
     USER_PAGE_FAULT_HANDLER.call_once(|| handler);
+}
+
+/// Clears stale result state before an image-side fallible access.
+/// A Host upcall is deferred while the marker is set by a fixup.
+#[cfg(feature = "kernelet")]
+pub(crate) fn clear_image_copy_fault() {
+    crate::kernelet::entry::copy_fault_record()
+        .pending
+        .store(0, Ordering::Release);
+}
+
+/// Takes the hardware fault published by the Host's validated image fixup.
+/// Keep the pending marker set until both fields are in local values, so a
+/// physical IRQ cannot deliver an upcall that overwrites them mid-read.
+#[cfg(feature = "kernelet")]
+pub(crate) fn take_image_copy_fault() -> Option<CpuException> {
+    let record = crate::kernelet::entry::copy_fault_record();
+    if record.pending.load(Ordering::Acquire) == 0 {
+        return None;
+    }
+    let addr = record.addr.load(Ordering::Relaxed) as usize;
+    let error = record.error.load(Ordering::Relaxed) as usize;
+    record.pending.store(0, Ordering::Release);
+    if !(0..MAX_USERSPACE_VADDR).contains(&addr) {
+        return None;
+    }
+    let error_code = PageFaultErrorCode::from_bits(error)?;
+    Some(CpuException::PageFault(RawPageFaultInfo {
+        error_code,
+        addr,
+    }))
+}
+
+/// Lets the kernel proper resolve an image-side user-copy page fault.
+#[cfg(feature = "kernelet")]
+pub(crate) fn resolve_image_copy_fault(exception: &CpuException) -> bool {
+    USER_PAGE_FAULT_HANDLER
+        .get()
+        .expect("a page fault handler is missing")(exception)
+    .is_ok()
 }
 
 /// The common interface that every CPU architecture-specific [`TrapFrame`] implements.

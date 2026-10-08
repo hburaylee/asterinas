@@ -44,6 +44,7 @@ fdt-util.workspace = true
 [features]
 all = ["cvm_guest"]
 cvm_guest = ["dep:tdx-guest", "ostd/cvm_guest"]
+kernelet = ["ostd/kernelet", "aster-pci/kernelet"]
 
 [lints]
 workspace = true

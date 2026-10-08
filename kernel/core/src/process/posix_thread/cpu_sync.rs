@@ -78,19 +78,10 @@ use ostd::irq::DisabledLocalIrqGuard;
 /// and uses `Cell`/`RefCell` for interior mutability accordingly.
 /// It is **not** `Sync` and must not be accessed across threads.
 ///
-/// All methods assume kernel preemption cannot occur
-/// for the duration of the call.
-/// In the current architecture, this is always true
-/// because kernel preemption was never implemented.
-///
-/// More importantly, we cannot implement kernel preemption
-/// without refactoring the `ThreadLocal` mechanism
-/// because `ThreadLocal` cannot be accessed in interrupt handlers
-/// for soundness reasons.
-/// But such access is necessary for the preempted schedule.
-///
-/// Therefore, we omit the preemption guards for better performance and
-/// defer preemption considerations to future work.
+/// Native kernel execution does not preempt these methods. A kernelet can be
+/// preempted by a virtual timer interrupt, so the accessors hold a preemption
+/// guard across their location transition and any borrow of `reg`. The two
+/// lifecycle hooks are called with local interrupts disabled.
 ///
 /// [`before_schedule`]: Self::before_schedule
 /// [`before_user_exec`]: Self::before_user_exec
@@ -124,6 +115,9 @@ impl<R: UserReg> CpuSync<R> {
     where
         R: Clone,
     {
+        #[cfg(feature = "kernelet")]
+        let _preempt_guard = ostd::task::disable_preempt();
+
         if self.location.get() == CanonicalValueLocation::OnCpu {
             self.reg.borrow_mut().save_from_cpu();
             self.location.set(CanonicalValueLocation::Both);
@@ -147,6 +141,9 @@ impl<R: UserReg> CpuSync<R> {
     ///
     /// [`before_user_exec`]: Self::before_user_exec
     pub(crate) fn set(&self, new_reg: R) {
+        #[cfg(feature = "kernelet")]
+        let _preempt_guard = ostd::task::disable_preempt();
+
         *self.reg.borrow_mut() = new_reg;
         if self.location.get() != CanonicalValueLocation::InMemory {
             self.location.set(CanonicalValueLocation::InMemory);

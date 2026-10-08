@@ -2,6 +2,7 @@
 
 //! Platform-specific code for the x86 platform.
 
+#[cfg(not(feature = "kernelet"))]
 pub(crate) mod boot;
 pub mod cpu;
 pub mod device;
@@ -13,7 +14,10 @@ pub(crate) mod mm;
 pub mod power;
 pub mod serial;
 pub(crate) mod task;
+#[cfg(not(feature = "kernelet"))]
 mod timer;
+#[cfg(not(feature = "kernelet"))]
+pub(crate) use timer::is_timer_irq;
 pub mod trap;
 pub mod vm;
 
@@ -83,6 +87,7 @@ pub(crate) fn init_cvm_guest(boot_params: &linux_boot_params::BootParams) {
 ///    bootstrapping processor.
 /// 2. This function must be called after the kernel page table is activated on
 ///    the bootstrapping processor.
+#[cfg(not(feature = "kernelet"))]
 pub(crate) unsafe fn late_init_on_bsp() {
     // SAFETY: This is only called once on this BSP in the boot context.
     unsafe { trap::init_on_cpu() };
@@ -132,23 +137,63 @@ pub(crate) unsafe fn late_init_on_bsp() {
 /// 2. This function must be called after the BSP's call to [`late_init_on_bsp`]
 ///    and before any other architecture-specific code in this module is called
 ///    on this AP.
+#[cfg(not(feature = "kernelet"))]
 pub(crate) unsafe fn init_on_ap() {
     timer::init_on_ap();
 }
 
 /// Returns the frequency of TSC. The unit is Hz.
 pub fn tsc_freq() -> u64 {
-    use core::sync::atomic::Ordering;
+    #[cfg(feature = "kernelet")]
+    return crate::kernelet::entry::boot_args().tsc_freq_hz;
 
-    kernel::tsc::TSC_FREQ.load(Ordering::Acquire)
+    #[cfg(not(feature = "kernelet"))]
+    {
+        use core::sync::atomic::Ordering;
+
+        kernel::tsc::TSC_FREQ.load(Ordering::Acquire)
+    }
 }
 
 /// Reads the current value of the processor's time-stamp counter (TSC).
+#[cfg(not(feature = "kernelet"))]
 pub fn read_tsc() -> u64 {
     use core::arch::x86_64::_rdtsc;
 
     // SAFETY: It is safe to read a time-related counter.
     unsafe { _rdtsc() }
+}
+
+/// Reads the current value of the virtual time-stamp counter.
+#[cfg(feature = "kernelet")]
+pub fn read_tsc() -> u64 {
+    let nanos = crate::kernelet::entry::clock_now_ns();
+    // Keep the Host's cycle unit: runtime_ticks() still samples the raw TSC
+    // and uses the same frequency for execution-time accounting.
+    let cycles = (u128::from(nanos) * u128::from(tsc_freq())) / 1_000_000_000;
+    cycles.min(u128::from(u64::MAX)) as u64
+}
+
+/// Reads the TSC between load-ordering fences.
+///
+/// The kernelet scheduler samples a Host-published offset around this read.
+/// Both fences keep the TSC observation between those two atomic loads.
+#[cfg(feature = "kernelet")]
+pub(crate) fn read_tsc_ordered() -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: Reading the TSC is safe, and LFENCE only orders local execution.
+    unsafe {
+        core::arch::asm!(
+            "lfence",
+            "rdtsc",
+            "lfence",
+            out("eax") low,
+            out("edx") high,
+            options(nostack, preserves_flags),
+        );
+    }
+    (u64::from(high) << 32) | u64::from(low)
 }
 
 /// Reads a hardware generated 64-bit random value.
@@ -229,6 +274,13 @@ pub(crate) fn enable_cpu_features() {
     cpu::context::enable_essential_features();
 
     mm::enable_essential_features();
+}
+
+/// Records instruction-set features already enabled by the Host processor.
+#[cfg(feature = "kernelet")]
+pub(crate) fn init_kernelet_cpu_features() {
+    cpu::extension::init();
+    cpu::context::record_fpu_features();
 }
 
 /// Inserts a TDX-specific code block.

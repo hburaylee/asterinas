@@ -11,6 +11,7 @@ bitflags.workspace = true
 component.workspace = true
 ostd.workspace = true
 spin.workspace = true
+time = { workspace = true, optional = true }
 
 [target.riscv64imac-unknown-none-elf.dependencies]
 chrono.workspace = true
@@ -25,3 +26,6 @@ fdt-util.workspace = true
 
 [lints]
 workspace = true
+
+[features]
+kernelet = ["ostd/kernelet", "dep:time"]

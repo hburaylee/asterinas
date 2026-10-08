@@ -12,6 +12,8 @@ pub(crate) mod tty;
 use device_id::DeviceId;
 pub(crate) use mem::{getrandom, geturandom};
 pub(crate) use pty::{PtyMaster, PtySlave, new_pty_pair};
+#[cfg(not(feature = "kernelet"))]
+pub(crate) use registry::char::register as register_char_device;
 pub(crate) use registry::lookup;
 
 use crate::{

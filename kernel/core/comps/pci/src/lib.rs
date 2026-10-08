@@ -76,12 +76,14 @@ mod device_info;
 
 extern crate alloc;
 
+#[cfg(not(feature = "kernelet"))]
 use component::{ComponentInitError, init_component};
 pub use device_info::{PciDeviceId, PciDeviceLocation};
 use ostd::sync::Mutex;
 
 use self::{bus::PciBus, common_device::PciCommonDevice};
 
+#[cfg(not(feature = "kernelet"))]
 #[init_component]
 fn pci_init() -> Result<(), ComponentInitError> {
     init();

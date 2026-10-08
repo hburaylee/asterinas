@@ -3,15 +3,18 @@
 //! Symmetric multiprocessing (SMP) boot support.
 
 use alloc::{boxed::Box, collections::btree_map::BTreeMap, vec::Vec};
+#[cfg(feature = "kernelet")]
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Once;
 
+#[cfg(not(feature = "kernelet"))]
+use crate::mm::{FrameAllocOptions, HasPaddrRange, paddr_to_vaddr};
 use crate::{
     arch::irq::HwCpuId,
     mm::{
-        FrameAllocOptions, HasPaddrRange, PAGE_SIZE,
+        PAGE_SIZE,
         frame::{Segment, meta::KernelMeta},
-        paddr_to_vaddr,
     },
     sync::SpinLock,
     task::Task,
@@ -58,6 +61,8 @@ unsafe impl Send for PerApRawInfo {}
 unsafe impl Sync for PerApRawInfo {}
 
 static HW_CPU_ID_MAP: SpinLock<BTreeMap<u32, HwCpuId>> = SpinLock::new(BTreeMap::new());
+#[cfg(feature = "kernelet")]
+static ONLINE_VCPUS: AtomicU64 = AtomicU64::new(0);
 
 /// Boots all application processors.
 ///
@@ -69,6 +74,7 @@ static HW_CPU_ID_MAP: SpinLock<BTreeMap<u32, HwCpuId>> = SpinLock::new(BTreeMap:
 ///
 /// This function can only be called in the boot context of the BSP where APs have
 /// not yet been booted.
+#[cfg(not(feature = "kernelet"))]
 pub(crate) unsafe fn boot_all_aps() {
     // Mark the BSP as started.
     report_online_and_hw_cpu_id(crate::cpu::CpuId::bsp().as_usize().try_into().unwrap());
@@ -115,6 +121,24 @@ pub(crate) unsafe fn boot_all_aps() {
     crate::info!("All application processors started. The BSP continues to run.");
 }
 
+/// Starts the prepared virtual CPUs before the kernel proper registers its AP entry.
+#[cfg(feature = "kernelet")]
+pub(crate) fn boot_all_aps() {
+    report_kernelet_online(0);
+
+    let num_cpus = crate::cpu::num_cpus();
+    for vcpu in 1..num_cpus {
+        let result = (crate::kernelet::entry::services().vcpu_boot)(vcpu as u32);
+        assert_eq!(result, 0, "Host refused to boot virtual CPU {vcpu}");
+    }
+
+    let expected = u64::MAX >> (u64::BITS as usize - num_cpus);
+    while ONLINE_VCPUS.load(Ordering::Acquire) != expected {
+        crate::kernelet::entry::on_spin();
+        core::hint::spin_loop();
+    }
+}
+
 static AP_LATE_ENTRY: Once<fn()> = Once::new();
 
 /// Registers the entry function for the application processor.
@@ -125,6 +149,32 @@ pub fn register_ap_entry(entry: fn()) {
     AP_LATE_ENTRY.call_once(|| entry);
 }
 
+/// Continues a prepared virtual CPU after its replica and identity are installed.
+#[cfg(feature = "kernelet")]
+pub(crate) fn kernelet_ap_entry() -> ! {
+    let vcpu = crate::cpu::CpuId::current_racy().as_usize();
+    report_kernelet_online(vcpu);
+
+    let entry = loop {
+        if let Some(entry) = AP_LATE_ENTRY.get() {
+            break entry;
+        }
+        crate::kernelet::entry::on_spin();
+        core::hint::spin_loop();
+    };
+    crate::arch::irq::enable_local();
+    entry();
+    Task::yield_now();
+    unreachable!("virtual AP idle task must take over")
+}
+
+#[cfg(feature = "kernelet")]
+fn report_kernelet_online(vcpu: usize) {
+    let bit = 1u64 << vcpu;
+    let previous = ONLINE_VCPUS.fetch_or(bit, Ordering::Release);
+    assert_eq!(previous & bit, 0, "virtual CPU {vcpu} started twice");
+}
+
 /// The AP's entry point of the Rust code portion of Asterinas.
 ///
 /// # Safety
@@ -133,6 +183,7 @@ pub fn register_ap_entry(entry: fn()) {
 ///   assembly code, or via a thin Rust wrapper that does not access uninitialized AP states.
 /// - The caller must follow C calling conventions and put the right arguments in registers.
 // SAFETY: The name does not collide with other symbols.
+#[cfg(not(feature = "kernelet"))]
 #[unsafe(no_mangle)]
 pub(crate) unsafe extern "C" fn ap_early_entry(cpu_id: u32) -> ! {
     // SAFETY:

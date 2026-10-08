@@ -40,7 +40,7 @@ const DEFAULT_STACK_SIZE_IN_PAGES: u32 = 128;
 const KERNEL_STACK_SIZE: usize = STACK_SIZE_IN_PAGES as usize * PAGE_SIZE;
 
 #[derive(Debug)]
-pub(super) struct KernelStack {
+pub(crate) struct KernelStack {
     kvirt_area: KVirtArea,
     tlb_coherent: AtomicCpuSet,
     end_vaddr: Vaddr,
@@ -60,7 +60,7 @@ impl KernelStack {
     // TODO: We map kernel stacks in the kernel virtual areas, which incurs
     // non-negligible TLB and mapping overhead on task creation. This could
     // be improved by caching/reusing kernel stacks with a pool.
-    pub(super) fn new_with_guard_page() -> Result<Self> {
+    pub(crate) fn new_with_guard_page() -> Result<Self> {
         let pages = FrameAllocOptions::new()
             .zeroed(false)
             .alloc_segment_with(KERNEL_STACK_SIZE / PAGE_SIZE, |_| KernelStackMeta)?;
@@ -85,7 +85,7 @@ impl KernelStack {
     }
 
     /// Flushes the TLB for the current CPU if necessary.
-    pub(super) fn flush_tlb(&self, irq_guard: &DisabledLocalIrqGuard) {
+    pub(crate) fn flush_tlb(&self, irq_guard: &DisabledLocalIrqGuard) {
         let cur_cpu = irq_guard.current_cpu();
         if !self.tlb_coherent.contains(cur_cpu, Ordering::Relaxed) {
             tlb_flush_addr_range(&self.kvirt_area.range());
@@ -93,7 +93,7 @@ impl KernelStack {
         }
     }
 
-    pub(super) fn end_vaddr(&self) -> Vaddr {
+    pub(crate) fn end_vaddr(&self) -> Vaddr {
         self.end_vaddr
     }
 }

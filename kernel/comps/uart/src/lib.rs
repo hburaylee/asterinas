@@ -7,6 +7,7 @@
 
 extern crate alloc;
 
+#[cfg(not(feature = "kernelet"))]
 use component::{ComponentInitError, init_component};
 
 // Set this crate's log prefix for `ostd::log`.
@@ -20,10 +21,15 @@ macro_rules! __log_prefix {
 #[cfg_attr(target_arch = "riscv64", path = "arch/riscv/mod.rs")]
 #[cfg_attr(target_arch = "loongarch64", path = "arch/loongarch/mod.rs")]
 #[cfg_attr(target_arch = "aarch64", path = "arch/arm/mod.rs")]
+#[cfg(not(feature = "kernelet"))]
 mod arch;
 
+#[cfg(not(feature = "kernelet"))]
 mod console;
 
+pub const CONSOLE_NAME: &str = "Uart-Console";
+
+#[cfg(not(feature = "kernelet"))]
 #[init_component]
 fn init() -> Result<(), ComponentInitError> {
     arch::init();

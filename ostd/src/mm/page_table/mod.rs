@@ -337,6 +337,25 @@ impl PageTable<UserPtConfig> {
             self.root.activate();
         }
     }
+
+    #[cfg(feature = "kernelet")]
+    pub(in crate::mm) fn new_kernelet_user_page_table() -> Self {
+        let root = PageTableNode::alloc(PagingConsts::NR_LEVELS);
+        let preempt_guard = disable_preempt();
+        let mut node = root.borrow().lock(&preempt_guard);
+        for (index, bits) in crate::kernelet::entry::boot_args()
+            .kernel_half_entries
+            .iter()
+            .enumerate()
+        {
+            // SAFETY: The Host published its stable kernel-half top-level
+            // entries in the immutable boot page. User cursors cannot modify
+            // this index range, and the shared children outlive the image.
+            unsafe { node.write_pte(256 + index, PageTableEntry::from_raw_bits(*bits as usize)) };
+        }
+        drop(node);
+        Self { root }
+    }
 }
 
 impl PageTable<KernelPtConfig> {

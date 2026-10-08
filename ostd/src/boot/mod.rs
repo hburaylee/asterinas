@@ -51,6 +51,20 @@ pub fn boot_info() -> &'static BootInfo {
 
 static INFO: Once<BootInfo> = Once::new();
 
+/// Initializes the boot information supplied by a kernelet Host.
+#[cfg(feature = "kernelet")]
+pub(crate) fn init_kernelet(cmdline: &'static str, memory_regions: MemoryRegionArray) {
+    EARLY_INFO.call_once(|| EarlyBootInfo {
+        bootloader_name: "kernelet",
+        kernel_cmdline: cmdline,
+        initramfs: None,
+        acpi_arg: BootloaderAcpiArg::NotProvided,
+        framebuffer_arg: None,
+        memory_regions,
+    });
+    init_after_heap();
+}
+
 /// ACPI information from the bootloader.
 ///
 /// The boot crate can choose either providing the raw RSDP physical address or
@@ -180,6 +194,7 @@ pub(crate) fn parse_early_cmdline() -> EarlyCmdline {
 /// [`arch::boot`] module.
 ///
 /// [`arch::boot`]: crate::arch::boot
+#[cfg(not(feature = "kernelet"))]
 pub(crate) unsafe fn start_kernel() -> ! {
     // The entry point of kernel code, which should be defined by the package that
     // uses OSTD.

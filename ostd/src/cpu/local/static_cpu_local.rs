@@ -106,6 +106,14 @@ unsafe impl<T: 'static> AnyStorage<T> for StaticStorage<T> {
         self.as_ptr()
     }
 
+    #[cfg(feature = "kernelet")]
+    fn get_ptr_on_target(&self, cpu_id: CpuId) -> *const T {
+        let base =
+            crate::kernelet::entry::record_for_vcpu(cpu_id.as_usize()).cpu_local_base as usize;
+        (base + self.get_offset()) as *const T
+    }
+
+    #[cfg(not(feature = "kernelet"))]
     fn get_ptr_on_target(&self, cpu_id: CpuId) -> *const T {
         super::is_used::debug_set_true();
 

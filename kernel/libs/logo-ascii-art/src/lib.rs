@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Provides ASCII art representations of the Asterinas logo.
+//! Provides ASCII art representations of the Asterinas and Kernelet logos.
 //!
-//! This crate offers two static string slices containing the logo:
+//! This crate offers two static string slices containing the Asterinas logo:
 //! a classic black-and-white version and
 //! a vibrant, gradient-colored one,
 //! suitable for splash screens or command-line tool branding.
+//! It also provides a gradient-colored Kernelet boot banner.
 
 #![no_std]
 
@@ -43,4 +44,12 @@ pub fn get_gradient_color_version() -> &'static str {
     // ```
     static LOGO_ASCII_ART: &str = include_str!("logo_ascii_art_gradient.txt");
     LOGO_ASCII_ART
+}
+
+/// Returns the ASCII art of the Kernelet logo with gradient colors.
+///
+/// The colors are represented using ANSI escape codes,
+/// so this version must be viewed in a terminal.
+pub fn get_kernelet_gradient_color_version() -> &'static str {
+    include_str!("kernelet_ascii_art_gradient.txt")
 }

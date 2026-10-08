@@ -4,8 +4,37 @@ use crate::prelude::Vaddr;
 
 #[repr(C)]
 struct ExTableItem {
+    #[cfg(target_arch = "x86_64")]
+    inst_offset: i64,
+    #[cfg(target_arch = "x86_64")]
+    recovery_offset: i64,
+    #[cfg(not(target_arch = "x86_64"))]
     inst_addr: Vaddr,
+    #[cfg(not(target_arch = "x86_64"))]
     recovery_inst_addr: Vaddr,
+}
+
+impl ExTableItem {
+    #[cfg(target_arch = "x86_64")]
+    fn inst_addr(&self) -> Vaddr {
+        (&self.inst_offset as *const i64 as usize).wrapping_add_signed(self.inst_offset as isize)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn inst_addr(&self) -> Vaddr {
+        self.inst_addr
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    fn recovery_inst_addr(&self) -> Vaddr {
+        (&self.recovery_offset as *const i64 as usize)
+            .wrapping_add_signed(self.recovery_offset as isize)
+    }
+
+    #[cfg(not(target_arch = "x86_64"))]
+    fn recovery_inst_addr(&self) -> Vaddr {
+        self.recovery_inst_addr
+    }
 }
 
 unsafe extern "C" {
@@ -17,14 +46,15 @@ unsafe extern "C" {
 /// This table is used for recovering from specific exception handling faults
 /// occurring at known points in the code.
 ///
-/// To add a recovery instruction for a target assembly instruction, one should add
-/// the following statements:
+/// On x86-64, entries use offsets relative to their own fields so that the
+/// table can reside in the relocation-free text segment. To add a recovery
+/// instruction, use the following statements:
 ///
 /// ```
 /// .pushsection .ex_table, "a"
 /// .align 8
-/// .quad [.target_label],
-/// .quad [.recovery_label],
+/// .quad target_label - .
+/// .quad recovery_label - .
 /// .popsection
 /// ```
 ///
@@ -46,13 +76,13 @@ unsafe extern "C" {
 /// ```
 /// .pushsection .ex_table, "a"
 /// .align 8
-/// .quad [.label1],
-/// .quad [.label2],
+/// .quad .label1 - .
+/// .quad .label2 - .
 /// .popsection
 /// ```
 ///
-/// After that, we can use the API of `ExTable` to resume execution when handling
-/// exceptions caused by `rep movsb` (which `label1` point to) failing.
+/// Other architectures retain absolute address entries. `ExTable` decodes
+/// either form before searching for a recovery instruction.
 pub(super) struct ExTable;
 
 impl ExTable {
@@ -68,8 +98,8 @@ impl ExTable {
         let ex_table =
             unsafe { core::slice::from_raw_parts(__ex_table as *const ExTableItem, table_size) };
         for item in ex_table {
-            if item.inst_addr == inst_addr {
-                return Some(item.recovery_inst_addr);
+            if item.inst_addr() == inst_addr {
+                return Some(item.recovery_inst_addr());
             }
         }
         None

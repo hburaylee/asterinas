@@ -15,9 +15,14 @@ mod commands;
 mod config;
 mod daemon;
 mod error;
+mod kernelet;
 mod util;
 
 fn main() {
+    if std::env::var_os(kernelet::rustc_wrapper::MODE_ENV).is_some() {
+        std::process::exit(kernelet::rustc_wrapper::run());
+    }
+
     // init logger
     let env = Env::new().filter("OSDK_LOG_LEVEL");
     env_logger::init_from_env(env);

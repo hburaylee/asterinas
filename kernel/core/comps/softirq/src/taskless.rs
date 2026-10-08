@@ -3,12 +3,14 @@
 use alloc::{boxed::Box, sync::Arc};
 use core::{
     cell::RefCell,
-    ops::DerefMut,
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use intrusive_collections::{LinkedList, LinkedListAtomicLink, intrusive_adapter};
-use ostd::{cpu::local::StaticCpuLocal, cpu_local, irq};
+use ostd::{
+    cpu::local::StaticCpuLocal,
+    cpu_local, irq,
+    sync::{ArcQueue, ArcQueueItem, ArcQueueLink},
+};
 
 use super::{
     SoftIrqLine,
@@ -61,16 +63,18 @@ pub struct Taskless {
     callback: Box<dyn Fn() + Send + Sync + 'static>,
     /// Whether this `Taskless` is disabled.
     is_disabled: AtomicBool,
-    link: LinkedListAtomicLink,
+    link: Arc<ArcQueueLink<Self>>,
 }
 
-intrusive_adapter!(TasklessAdapter = Arc<Taskless>: Taskless { link: LinkedListAtomicLink });
+impl ArcQueueItem for Taskless {
+    fn queue_link(&self) -> &Arc<ArcQueueLink<Self>> {
+        &self.link
+    }
+}
 
 cpu_local! {
-    static TASKLESS_LIST: RefCell<LinkedList<TasklessAdapter>> =
-        RefCell::new(LinkedList::new(TasklessAdapter::NEW));
-    static TASKLESS_URGENT_LIST: RefCell<LinkedList<TasklessAdapter>> =
-        RefCell::new(LinkedList::new(TasklessAdapter::NEW));
+    static TASKLESS_LIST: RefCell<ArcQueue<Taskless>> = RefCell::new(ArcQueue::new());
+    static TASKLESS_URGENT_LIST: RefCell<ArcQueue<Taskless>> = RefCell::new(ArcQueue::new());
 }
 
 impl Taskless {
@@ -84,7 +88,7 @@ impl Taskless {
             is_running: AtomicBool::new(false),
             callback: Box::new(callback),
             is_disabled: AtomicBool::new(false),
-            link: LinkedListAtomicLink::new(),
+            link: ArcQueueLink::new(),
         })
     }
 
@@ -121,7 +125,7 @@ impl Taskless {
 
 fn do_schedule(
     taskless: &Arc<Taskless>,
-    taskless_list: &'static StaticCpuLocal<RefCell<LinkedList<TasklessAdapter>>>,
+    taskless_list: &'static StaticCpuLocal<RefCell<ArcQueue<Taskless>>>,
 ) {
     if taskless.is_disabled.load(Ordering::Acquire) {
         return;
@@ -134,10 +138,11 @@ fn do_schedule(
         return;
     }
     let irq_guard = irq::disable_local();
-    taskless_list
+    let enqueued = taskless_list
         .get_with(&irq_guard)
         .borrow_mut()
-        .push_front(taskless.clone());
+        .push_back(taskless.clone());
+    debug_assert!(enqueued, "scheduled taskless has no available queue link");
 }
 
 pub(super) fn init() {
@@ -156,27 +161,27 @@ pub(super) fn init() {
 /// If the `Taskless` is ready to be executed, it will be set to not scheduled
 /// and can be scheduled again.
 fn taskless_softirq_handler(
-    taskless_list: &'static StaticCpuLocal<RefCell<LinkedList<TasklessAdapter>>>,
+    taskless_list: &'static StaticCpuLocal<RefCell<ArcQueue<Taskless>>>,
     softirq_id: u8,
 ) {
     let mut processing_list = {
         let irq_guard = irq::disable_local();
         let guard = taskless_list.get_with(&irq_guard);
-        let mut list_mut = guard.borrow_mut();
-        LinkedList::take(list_mut.deref_mut())
+        guard.borrow_mut().take()
     };
 
-    while let Some(taskless) = processing_list.pop_back() {
+    while let Some(taskless) = processing_list.pop_front() {
         if taskless
             .is_running
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             let irq_guard = irq::disable_local();
-            taskless_list
+            let enqueued = taskless_list
                 .get_with(&irq_guard)
                 .borrow_mut()
-                .push_front(taskless);
+                .push_back(taskless);
+            debug_assert!(enqueued, "running taskless has no available queue link");
             SoftIrqLine::get(softirq_id).raise();
             continue;
         }

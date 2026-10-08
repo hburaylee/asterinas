@@ -2,6 +2,7 @@
 
 //! Kernel virtual memory allocation
 
+use alloc::vec::Vec;
 use core::ops::Range;
 
 use self::allocator::kvirt_area_allocator;
@@ -54,6 +55,7 @@ mod allocator {
 #[derive(Debug)]
 pub(crate) struct KVirtArea {
     range: Range<Vaddr>,
+    synchronous_reclaim: bool,
 }
 
 impl HasSize for KVirtArea {
@@ -72,13 +74,29 @@ impl Split for KVirtArea {
         let left_range = old.start()..old.start() + offset;
         let right_range = old.start() + offset..old.end();
         (
-            KVirtArea { range: left_range },
-            KVirtArea { range: right_range },
+            KVirtArea {
+                range: left_range,
+                synchronous_reclaim: old.synchronous_reclaim,
+            },
+            KVirtArea {
+                range: right_range,
+                synchronous_reclaim: old.synchronous_reclaim,
+            },
         )
     }
 }
 
 impl KVirtArea {
+    /// Keeps unmapped frames and the virtual reservation alive until every
+    /// online CPU has invalidated its translations, including Global entries.
+    ///
+    /// Such an area must be dropped in task context with local IRQs enabled.
+    /// This is needed for mappings shared by roots on multiple CPUs.
+    pub(crate) fn with_synchronous_reclaim(mut self) -> Self {
+        self.synchronous_reclaim = true;
+        self
+    }
+
     pub(crate) fn start(&self) -> Vaddr {
         self.range.start
     }
@@ -144,7 +162,48 @@ impl KVirtArea {
             unsafe { cursor.map(MappedItem::Tracked(Frame::from_unsized(frame), prop)) };
         }
 
-        Self { range }
+        Self {
+            range,
+            synchronous_reclaim: false,
+        }
+    }
+
+    /// Maps new tracked pages into an unmapped part of this reservation.
+    ///
+    /// Existing mappings are never replaced. The owner serializes growth and
+    /// retains the area until all users of the new mapping have detached.
+    pub(crate) fn map_additional_frames<T: AnyFrameMeta + ?Sized>(
+        &self,
+        offset: usize,
+        frames: impl ExactSizeIterator<Item = Frame<T>>,
+        prop: PageProperty,
+    ) -> crate::Result<()> {
+        let bytes = frames
+            .len()
+            .checked_mul(PAGE_SIZE)
+            .ok_or(crate::Error::Overflow)?;
+        let end = offset.checked_add(bytes).ok_or(crate::Error::Overflow)?;
+        if !offset.is_multiple_of(PAGE_SIZE) || bytes == 0 || end > self.size() {
+            return Err(crate::Error::InvalidArgs);
+        }
+        let range = self.start() + offset..self.start() + end;
+        let guard = irq::disable_local();
+        let table = KERNEL_PAGE_TABLE.get().unwrap();
+        let mut cursor = table.cursor_mut(&guard, &range).unwrap();
+        // Metadata growth supplies only never-mapped grain slots. Checking the
+        // complete range before modifying it keeps rejection transactional.
+        for addr in range.clone().step_by(PAGE_SIZE) {
+            cursor.jump(addr).unwrap();
+            if cursor.query().unwrap().1.is_some() {
+                return Err(crate::Error::InvalidArgs);
+            }
+        }
+        cursor.jump(range.start).unwrap();
+        for frame in frames {
+            // SAFETY: This reservation owns the previously unmapped range.
+            unsafe { cursor.map(MappedItem::Tracked(Frame::from_unsized(frame), prop)) };
+        }
+        Ok(())
     }
 
     /// Creates a kernel virtual area and maps untracked frames into it.
@@ -198,12 +257,19 @@ impl KVirtArea {
             }
         }
 
-        Self { range }
+        Self {
+            range,
+            synchronous_reclaim: false,
+        }
     }
 }
 
 impl Drop for KVirtArea {
     fn drop(&mut self) {
+        if self.synchronous_reclaim {
+            assert!(crate::arch::irq::is_local_enabled());
+        }
+        let mut retired = Vec::new();
         let irq_guard = irq::disable_local();
 
         // 1. Unmap all mapped pages.
@@ -213,15 +279,101 @@ impl Drop for KVirtArea {
         loop {
             // SAFETY:
             // 1. The range is under `KVirtArea`, so it is safe to unmap.
-            // 2. The caller of `KVirtArea` will ensure TLB conherence when the range is used again,
-            //    so the unmapped items are safe to be dropped immediately.
+            // 2. Synchronous areas retain each removed fragment until the
+            //    acknowledged shootdown below. Other callers retain the
+            //    existing responsibility to ensure TLB coherence before reuse.
             let Some(frag) = (unsafe { cursor.take_next(self.end() - cursor.virt_addr()) }) else {
                 break;
             };
-            drop(frag);
+            if self.synchronous_reclaim {
+                retired.push(frag);
+            } else {
+                drop(frag);
+            }
         }
+        drop(cursor);
+        drop(irq_guard);
 
-        // 2. Free the virtual block.
+        if self.synchronous_reclaim {
+            // All roots share these kernel-half PTEs. Retain both the removed
+            // page-table fragments and the reservation until every CPU has
+            // acknowledged the invalidation. No allocator lock spans the IPI.
+            crate::smp::inter_processor_call(
+                &crate::cpu::CpuSet::new_full(),
+                crate::arch::mm::tlb_flush_all_including_global,
+            )
+            .wait();
+        }
+        drop(retired);
+        // 2. Free the virtual block only after stale translations are gone.
+        let irq_guard = irq::disable_local();
         kvirt_area_allocator(&irq_guard).free(range);
+    }
+}
+
+#[cfg(ktest)]
+mod test {
+    use core::iter;
+
+    use super::{super::MappedItemRef, *};
+    use crate::{
+        mm::{
+            FrameAllocOptions,
+            page_prop::{CachePolicy, PageFlags, PrivilegedPageFlags},
+        },
+        prelude::*,
+        task::disable_preempt,
+    };
+
+    #[ktest]
+    fn tracked_base_pages_unmap_after_shootdown() {
+        let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+        let paddr = frame.paddr();
+        let initial_refs = frame.reference_count();
+        let prop = PageProperty {
+            flags: PageFlags::R,
+            cache: CachePolicy::Writeback,
+            priv_flags: PrivilegedPageFlags::GLOBAL,
+        };
+        let area = KVirtArea::map_frames(2 * PAGE_SIZE, 0, iter::once(frame.clone()), prop)
+            .with_synchronous_reclaim();
+        let start = area.start();
+        assert_eq!(frame.reference_count(), initial_refs + 1);
+
+        // An additional tracked page can be mapped into the unmapped slot.
+        area.map_additional_frames(PAGE_SIZE, iter::once(frame.clone()), prop)
+            .unwrap();
+        assert_eq!(frame.reference_count(), initial_refs + 2);
+        // Already-mapped slots are never replaced; rejection is transactional.
+        assert!(matches!(
+            area.map_additional_frames(0, iter::once(frame.clone()), prop),
+            Err(crate::Error::InvalidArgs)
+        ));
+        assert_eq!(frame.reference_count(), initial_refs + 2);
+
+        let guard = disable_preempt();
+        match area.query(&guard, start) {
+            Some(MappedItemRef::Tracked(mapped, mapped_prop)) => {
+                assert_eq!(mapped.paddr(), paddr);
+                assert_eq!(mapped_prop.flags, PageFlags::R);
+            }
+            _ => panic!("the mapped frame must be tracked"),
+        }
+        drop(guard);
+
+        // Releasing the area waits for the acknowledged shootdown before
+        // retiring the fragments. Their references also wait for RCU readers.
+        drop(area);
+
+        let guard = disable_preempt();
+        let range = start..start + 2 * PAGE_SIZE;
+        let mut cursor = KERNEL_PAGE_TABLE
+            .get()
+            .unwrap()
+            .cursor(&guard, &range)
+            .unwrap();
+        assert!(cursor.query().unwrap().1.is_none());
+        cursor.jump(start + PAGE_SIZE).unwrap();
+        assert!(cursor.query().unwrap().1.is_none());
     }
 }

@@ -58,3 +58,50 @@ cpu_local_cell! {
 
 const NEED_PREEMPT_MASK: u32 = 1 << 31;
 const GUARD_COUNT_MASK: u32 = (1 << 31) - 1;
+
+/// Native preemption state accessed by the kernelet carrier protocol.
+#[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+pub(crate) mod carrier {
+    use super::{GUARD_COUNT_MASK, NEED_PREEMPT_MASK, PREEMPT_INFO};
+
+    pub(crate) fn gs_offset() -> u32 {
+        PREEMPT_INFO.static_offset().try_into().unwrap()
+    }
+
+    pub(crate) fn guard_count() -> u32 {
+        PREEMPT_INFO.load() & GUARD_COUNT_MASK
+    }
+
+    /// Restores Host-private guard ownership without losing a reschedule request.
+    ///
+    /// Callers must mask physical IRQs and have released all temporary Host
+    /// guards. The image's shared mirror bit is never trusted for subtraction.
+    pub(crate) fn restore_guards(baseline: u32) {
+        debug_assert!(!crate::arch::irq::is_local_enabled());
+        debug_assert!(baseline <= GUARD_COUNT_MASK);
+        PREEMPT_INFO.store((PREEMPT_INFO.load() & NEED_PREEMPT_MASK) | baseline);
+    }
+}
+
+#[cfg(all(ktest, target_arch = "x86_64", not(feature = "kernelet")))]
+mod carrier_tests {
+    use super::*;
+    use crate::prelude::*;
+
+    #[ktest]
+    fn carrier_guard_repair_preserves_reschedule_request() {
+        let _irq_guard = crate::irq::disable_local();
+        let saved = PREEMPT_INFO.load();
+        let baseline = saved & GUARD_COUNT_MASK;
+        // A shared mirror must not determine how much the Host subtracts.
+        // Model an extra increment and a reschedule request during image work.
+        inc_guard_count();
+        inc_guard_count();
+        set_need_preempt();
+        carrier::restore_guards(baseline);
+        assert_eq!(get_guard_count(), baseline);
+        assert!(need_preempt());
+        assert_eq!(should_preempt(), baseline == 0);
+        PREEMPT_INFO.store(saved);
+    }
+}

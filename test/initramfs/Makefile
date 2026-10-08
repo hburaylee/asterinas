@@ -13,6 +13,28 @@ ENABLE_REGRESSION_TEST ?= false
 # - linux: Define only `__linux__`. Tests may fail in Asterinas.
 REGRESSION_TEST_PLATFORM ?= asterinas
 DNS_SERVER ?= none
+KERNELET_RUNTIME ?=
+KERNELET_AGENT ?=
+KERNELET_SHIM ?=
+
+ifneq ($(strip $(KERNELET_RUNTIME)$(KERNELET_AGENT)$(KERNELET_SHIM)),)
+ifeq ($(strip $(KERNELET_RUNTIME)),)
+$(error KERNELET_RUNTIME is required when KERNELET_AGENT is set)
+endif
+ifeq ($(strip $(KERNELET_AGENT)),)
+$(error KERNELET_AGENT is required when KERNELET_RUNTIME is set)
+endif
+ifeq ($(strip $(KERNELET_SHIM)),)
+$(error KERNELET_SHIM is required when kernelet userspace is enabled)
+endif
+ifneq ($(TARGET_ARCH),x86_64)
+$(error Kernelet userspace is currently supported only on x86_64)
+endif
+KERNELET_NIX_ARGS := \
+	--argstr kerneletRuntime "$(abspath $(KERNELET_RUNTIME))" \
+	--argstr kerneletAgent "$(abspath $(KERNELET_AGENT))" \
+	--argstr kerneletShim "$(abspath $(KERNELET_SHIM))"
+endif
 # Set Nix's cached tarballs to be live for a longer period of time (30 days) to avoid network traffics.
 # Nix's default value is rather small (1 hour or 3600 seconds).
 NIXPKGS_CACHE_TTL := 2592000 # In seconds
@@ -64,6 +86,7 @@ BOOT_IMAGE_NIX_ARGS := \
 	--argstr regressionTestPlatform $(REGRESSION_TEST_PLATFORM) \
 	--argstr dnsServer ${DNS_SERVER} \
 	--arg smp $(SMP)
+BOOT_IMAGE_NIX_ARGS += $(KERNELET_NIX_ARGS)
 
 .PHONY: initramfs-boot-images
 ifeq ($(TARGET_ARCH), loongarch64)

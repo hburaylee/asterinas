@@ -70,6 +70,100 @@ make kernel TARGET_ARCH=riscv64
 
 The build artifacts (initramfs) can be found in the `test/initramfs/build` directory after the compilation.
 
+### Kernelet userspace
+
+On x86_64, run this command from the repository root inside the development
+container:
+
+```bash
+make run_kernelet
+```
+
+This installs or updates OSDK,
+builds the static runtime, agent, and containerd shim,
+packages them with a Bash OCI bundle in the initramfs,
+and boots a Host with an embedded kernelet image.
+The Host and kernelet kernels use the optimized release profile by default.
+Use `make run_kernelet RELEASE=0` for a development build.
+It defaults to four Host CPUs:
+the runtime's default sandbox uses two vCPUs,
+and those vCPUs share the physical CPUs with the Host's worker threads
+through the Host scheduler;
+no CPU is reserved for a sandbox.
+Use `make run_kernelet SMP=2` to select two.
+When benchmarking `run_kernelet` against other boot targets,
+boot both sides with the same explicitly set `SMP`.
+
+To build the initramfs separately, provide all three static Rust binaries:
+
+```bash
+rustup target add x86_64-unknown-linux-musl
+cargo build --manifest-path kernelet/Cargo.toml --release --target x86_64-unknown-linux-musl
+make initramfs SMP=2 \
+  KERNELET_RUNTIME="$PWD/kernelet/target/x86_64-unknown-linux-musl/release/kernelet-runtime" \
+  KERNELET_AGENT="$PWD/kernelet/target/x86_64-unknown-linux-musl/release/kernelet-agent" \
+  KERNELET_SHIM="$PWD/kernelet/target/x86_64-unknown-linux-musl/release/containerd-shim-kernelet-v2"
+```
+
+The build fails unless all three binaries are supplied.
+These explicit inputs are copied into the Nix store,
+so the resulting image is tied to their contents.
+Nix builds a static musl `mke2fs` for the Host-side ext2 image builder,
+and packages Bash, BusyBox, SQLite, and their ELF loaders and libraries
+in the OCI bundle.
+The installed paths are
+`/usr/bin/kernelet-runtime`,
+`/usr/bin/containerd-shim-kernelet-v2`,
+`/usr/libexec/kernelet-agent`,
+`/usr/libexec/kernelet-mke2fs`,
+and `/opt/kernelet/bash-bundle`.
+
+After booting a Host kernel built with OSDK's `--kernelet` option, run:
+
+```sh
+kernelet-runtime create --bundle /opt/kernelet/bash-bundle bash && kernelet-runtime start --attach bash
+```
+
+Keeping both commands on one line avoids the Host shell echoing a pasted
+second command while `create` is still running.
+The Guest's `kernelet-agent` runs as PID 1 to prepare the environment,
+launch applications, and reap child processes; it appears in Guest `ps` output.
+
+At the `kernelet#` prompt, run SQLite to create and query a database:
+
+```sh
+sqlite3 -bail /tmp/demo.db <<'SQL'
+CREATE TABLE messages (id INTEGER PRIMARY KEY, text TEXT);
+INSERT INTO messages (text) VALUES ('Hello from Kernelet!');
+.headers on
+.mode column
+SELECT * FROM messages;
+PRAGMA integrity_check;
+SQL
+```
+
+The query prints the inserted row, and the integrity check prints `ok`.
+The database is in the Guest's writable overlay and lasts for this sandbox's
+lifetime. Run `exit` to leave Bash.
+
+When Bash exits, check the container state and delete it:
+
+```sh
+kernelet-runtime state bash
+kernelet-runtime delete bash
+```
+
+The bundle sets `terminal` to `true`, so `start --attach` runs Bash
+interactively on the calling terminal and restores the terminal when Bash
+exits. The attached terminal's window size is synchronized automatically.
+For an external console, resize its terminal with
+`kernelet-runtime resize bash <columns> <rows>`.
+A manager that drives the container programmatically can instead pass
+`--console-socket <path>` to `create` to receive the PTY master over a Unix
+socket; the CLI attach needs no console socket.
+The runtime defaults to two vCPUs;
+boot the Host with at least `SMP=2`, or pass `--vcpus 1` before `create`.
+
 ## Supported Benchmarks
 
 The following benchmarks are currently supported:

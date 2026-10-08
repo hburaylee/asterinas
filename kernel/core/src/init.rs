@@ -274,8 +274,13 @@ fn init_in_first_kthread(path_resolver: &PathResolver) {
 }
 
 fn print_banner() {
+    let banner = if cfg!(feature = "kernelet") {
+        logo_ascii_art::get_kernelet_gradient_color_version()
+    } else {
+        logo_ascii_art::get_gradient_color_version()
+    };
     println!("");
-    println!("{}", logo_ascii_art::get_gradient_color_version());
+    println!("{}", banner);
 }
 
 static BOOT_SOURCE: AtomicU8 = AtomicU8::new(BootSource::Initramfs as u8);

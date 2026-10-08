@@ -1,0 +1,147 @@
+ENTRY(_kernelet_entry)
+OUTPUT_ARCH(i386:x86-64)
+OUTPUT_FORMAT(elf64-x86-64)
+
+# The linker script for the kernelet image: a position-independent image whose
+# every address is an offset from the image base, which the Host chooses per
+# instance. See kernelet/ABI.md.
+
+# The offset of the entry table from the image base. The Host finds the table
+# at this fixed offset without consulting a symbol table.
+ENTRY_TABLE_OFFSET = 0x1000;
+
+# Permission transitions and the writable segment's base are aligned to huge
+# pages, so that the shared read-only mapping and the private writable mapping
+# of an instance can both use them.
+HUGE_PAGE = 0x200000;
+
+PHDRS
+{
+    # The executable text segment. The entry table lives here, at offset
+    # ENTRY_TABLE_OFFSET, followed by the code. One physical copy of this
+    # segment serves every instance of a kind.
+    text PT_LOAD FLAGS(5);        # R E
+
+    # The read-only data segment, shared like the text segment.
+    rodata PT_LOAD FLAGS(4);      # R__
+
+    # The writable segment. The Host copies and relocates it per instance.
+    data PT_LOAD FLAGS(6);        # RW_
+
+    # The dynamic table, through which the Host locates the relocation table.
+    dynamic PT_DYNAMIC;
+}
+
+SECTIONS
+{
+    # The image is position independent: the link-time addresses are offsets
+    # from the image base, which is therefore zero.
+    . = 0;
+
+    __kernelet_image_base = .;
+
+    PROVIDE(__executable_start = __kernelet_image_base);
+
+    /* The entry table. The fields are emitted in the declared order of      */
+    /* `ostd::kernelet::abi::EntryTable`; every address-like field is an     */
+    /* image-relative offset, so the shared table needs no relocation.       */
+    .kernelet_entry_table ENTRY_TABLE_OFFSET : {
+        QUAD(#ENTRY_TABLE_SIZE#);                             /* size */
+        QUAD(vcpu_entry - __kernelet_image_base);             /* vcpu_entry_offset */
+        QUAD(virq_entry - __kernelet_image_base);             /* virq_entry_offset */
+        QUAD(__cpu_local_start - __kernelet_image_base);      /* cpu_local_start_offset */
+        QUAD(__cpu_local_end - __kernelet_image_base);        /* cpu_local_end_offset */
+#SOURCE_HASH_QUADS#
+        QUAD(__ex_table - __kernelet_image_base);             /* ex_table_start_offset */
+        QUAD(__ex_table_end - __kernelet_image_base);         /* ex_table_end_offset */
+    } : text
+
+    . = ALIGN(HUGE_PAGE);
+
+    .text : {
+        *(.text .text.*)
+        PROVIDE(__etext = .);
+    } : text
+
+    . = ALIGN(HUGE_PAGE);
+
+    /* The exception table. Under D87 its entries are self-relative offsets, */
+    /* so the table holds no absolute address and is shared like the         */
+    /* read-only data.                                                       */
+    .ex_table : {
+        __ex_table = .;
+        KEEP(*(SORT(.ex_table)))
+        __ex_table_end = .;
+    } : rodata
+
+    .ktest_array : {
+        __ktest_array = .;
+        KEEP(*(SORT(.ktest_array)))
+        __ktest_array_end = .;
+    } : rodata
+
+    .rodata : {
+        *(.rodata .rodata.*)
+    } : rodata
+
+    /* The unwinder selects the `fde-gnu-eh-frame-hdr` mode of the           */
+    /* `unwinding` crate, so the frame description entries and their header  */
+    /* must be findable.                                                     */
+    .eh_frame_hdr : {
+        PROVIDE(__GNU_EH_FRAME_HDR = .);
+        KEEP(*(.eh_frame_hdr .eh_frame_hdr.*))
+    } : rodata
+    .eh_frame : {
+        PROVIDE(__eh_frame = .);
+        KEEP(*(.eh_frame .eh_frame.*))
+    } : rodata
+    .gcc_except_table : {
+        *(.gcc_except_table .gcc_except_table.*)
+    } : rodata
+
+    /* The dynamic linking machinery that the image's own relocations need.  */
+    /* It carries no import: `.dynsym` holds no undefined symbol and there   */
+    /* is no `DT_NEEDED` entry.                                              */
+    .dynsym : { *(.dynsym .dynsym.*) } : rodata
+    .gnu.hash : { *(.gnu.hash) } : rodata
+    .hash : { *(.hash) } : rodata
+    .dynstr : { *(.dynstr .dynstr.*) } : rodata
+    .rela.dyn : { *(.rela.dyn) } : rodata
+    .dynamic : { *(.dynamic .dynamic.*) } : rodata :dynamic
+
+    . = ALIGN(HUGE_PAGE);
+
+    /* Everything that holds an address must be relocated per instance and   */
+    /* is therefore part of the writable data template.                      */
+    .got : {
+        *(.got .got.*)
+    } : data
+    .data.rel.ro : {
+        *(.data.rel.ro .data.rel.ro.*)
+    } : data
+    .init_array : {
+        __sinit_array = .;
+        KEEP(*(SORT(.init_array .init_array.*)))
+        __einit_array = .;
+    } : data
+    .data : {
+        *(.data .data.*)
+    } : data
+
+    /* The CPU-local template. The Host-only `.cpu_local_tss` is absent; the */
+    /* bounds wrap `.cpu_local` alone.                                       */
+    . = ALIGN(4096);
+    __cpu_local_start = .;
+    .cpu_local : {
+        KEEP(*(SORT(.cpu_local)))
+    } : data
+    __cpu_local_end = .;
+
+    .bss : {
+        __bss = .;
+        *(.bss .bss.*) *(COMMON)
+        __bss_end = .;
+    } : data
+
+    __kernelet_image_end = .;
+}

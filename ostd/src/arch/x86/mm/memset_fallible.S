@@ -23,6 +23,6 @@ __memset_fallible: # (dst: *mut u8, value: u8, size: usize) -> usize
 
 .pushsection .ex_table, "a", @progbits
     .align 8
-    .quad [.set]
-    .quad [.memset_exit]
+    .quad .set - .
+    .quad .memset_exit - .
 .popsection

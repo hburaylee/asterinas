@@ -5,7 +5,9 @@ use core::ops::Range;
 
 use aster_cmdline::types::MmioDevice;
 pub(super) use ostd::arch::irq::MappedIrqLine;
-use ostd::{arch::irq::IRQ_CHIP, debug, info, io::IoMem, irq::IrqLine, warn};
+#[cfg(not(feature = "kernelet"))]
+use ostd::arch::irq::IRQ_CHIP;
+use ostd::{debug, info, io::IoMem, irq::IrqLine, warn};
 use spin::Once;
 
 use crate::transport::mmio::{
@@ -15,6 +17,7 @@ use crate::transport::mmio::{
 
 pub(super) fn probe_for_device() {
     probe_from_kernel_cmdline();
+    #[cfg(not(feature = "kernelet"))]
     probe_from_microvm_constants();
 }
 
@@ -55,6 +58,7 @@ fn probe_from_kernel_cmdline() {
     }
 }
 
+#[cfg(not(feature = "kernelet"))]
 fn probe_from_microvm_constants() {
     // TODO: If ACPI tables are present, the correct method for detecting VirtIO-MMIO
     // devices is to parse the ACPI SSDT [1]. It is not supported yet, so we fall
@@ -107,6 +111,12 @@ fn try_register_mmio_device(
 
     super::validate_mmio_device(&io_mem)?;
 
+    #[cfg(feature = "kernelet")]
+    let mapped_irq_line = u8::try_from(gsi_index)
+        .map_err(|_| MmioRegisterError::IrqUnavailable)
+        .and_then(|irq| IrqLine::alloc_specific(irq).map_err(|_| MmioRegisterError::IrqUnavailable))?;
+
+    #[cfg(not(feature = "kernelet"))]
     let mapped_irq_line = if let Ok(irq_line) = IrqLine::alloc()
         && let Ok(mapped_irq_line) = IRQ_CHIP.get().unwrap().map_gsi_pin_to(irq_line, gsi_index)
     {

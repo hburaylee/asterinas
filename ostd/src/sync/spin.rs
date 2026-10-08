@@ -103,6 +103,8 @@ impl<T: ?Sized, G: SpinGuardian> SpinLock<T, G> {
     fn acquire_lock(&self) {
         while !self.try_acquire_lock() {
             core::hint::spin_loop();
+            #[cfg(feature = "kernelet")]
+            crate::kernelet::entry::on_spin();
         }
     }
 

@@ -17,8 +17,14 @@
 //! Handles trap.
 
 pub(super) mod gdt;
+#[cfg(not(feature = "kernelet"))]
 pub(super) mod idt;
+#[cfg(not(feature = "kernelet"))]
 pub(super) mod syscall;
+#[cfg(not(feature = "kernelet"))]
+pub(crate) use gdt::set_carrier_stacks;
+#[cfg(not(feature = "kernelet"))]
+pub(crate) use idt::carrier_idtrs;
 
 use super::cpu::context::GeneralRegs;
 use crate::{
@@ -36,6 +42,7 @@ cfg_select! {
         use tdx_guest::{tdcall, handle_virtual_exception};
         use crate::arch::tdx_guest::TrapFrameWrapper;
     }
+    _ => {}
 }
 
 /// Trap frame of kernel interrupt
@@ -126,6 +133,7 @@ impl TrapFrameApi for TrapFrame {
 /// On the current CPU, this function must be called
 /// - only once and
 /// - before any trap can occur.
+#[cfg(not(feature = "kernelet"))]
 pub(crate) unsafe fn init_on_cpu() {
     // SAFETY: Since there's no traps, no preemption can occur.
     unsafe { gdt::init_on_cpu() };
@@ -202,6 +210,25 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
             );
         }
     }
+}
+
+/// Runs a physical trap from an image on the carrier's protected Host stack.
+///
+/// # Safety
+///
+/// The assembly adapter must install the Host root and enter with the complete
+/// trap frame pinned on this carrier's private IST landing stack.
+#[cfg(not(feature = "kernelet"))]
+#[unsafe(no_mangle)]
+unsafe extern "sysv64" fn kernelet_host_trap_handler(f: &mut TrapFrame) {
+    crate::kernelet::host_run::begin_image_trap();
+    if !crate::kernelet::host_run::contain_image_exception(f) {
+        // SAFETY: The adapter supplied a complete frame under the Host root;
+        // the ordinary handler may process traps that are not image faults.
+        unsafe { trap_handler(f) };
+        crate::kernelet::host_run::finish_image_trap(f);
+    }
+    crate::kernelet::host_run::end_image_trap();
 }
 
 /// User-space code segment selector value.

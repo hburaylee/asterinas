@@ -192,6 +192,19 @@ impl TimerManager {
             .push(timer_callback);
     }
 
+    /// Returns the earliest live expiry in this manager's clock domain.
+    pub(crate) fn next_expiry(&self) -> Option<Duration> {
+        let mut callbacks = self.timer_callbacks.disable_irq().lock();
+        loop {
+            let next = callbacks.peek()?;
+            if next.is_cancelled() || next.timer.strong_count() == 0 {
+                callbacks.pop();
+                continue;
+            }
+            return Some(next.expired_time);
+        }
+    }
+
     /// Checks and processes the managed timers.
     ///
     /// If any of the timers have timed out, call the corresponding callback functions.

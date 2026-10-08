@@ -4,7 +4,10 @@
 
 use crate::task::TaskContextApi;
 
+#[cfg(not(feature = "kernelet"))]
 core::arch::global_asm!(include_str!("switch.S"));
+#[cfg(feature = "kernelet")]
+core::arch::global_asm!(include_str!("kernelet_switch.S"));
 
 #[repr(C)]
 #[derive(Clone, Debug)]
@@ -61,7 +64,22 @@ impl TaskContextApi for TaskContext {
 }
 
 unsafe extern "C" {
+    #[cfg(not(feature = "kernelet"))]
     pub(crate) unsafe fn context_switch(nxt: *const TaskContext, cur: *mut TaskContext);
+    #[cfg(not(feature = "kernelet"))]
     pub(crate) unsafe fn first_context_switch(nxt: *const TaskContext);
+    #[cfg(feature = "kernelet")]
+    pub(crate) unsafe fn context_switch(
+        nxt: *const TaskContext,
+        cur: *mut TaskContext,
+        stack_limit: usize,
+        vcpu_record: *const crate::kernelet::abi::VcpuRecord,
+    );
+    #[cfg(feature = "kernelet")]
+    pub(crate) unsafe fn first_context_switch(
+        nxt: *const TaskContext,
+        stack_limit: usize,
+        vcpu_record: *const crate::kernelet::abi::VcpuRecord,
+    );
     pub(crate) unsafe fn kernel_task_entry_wrapper();
 }
