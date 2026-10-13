@@ -387,6 +387,10 @@ impl FileLike for InodeHandle {
         }
 
         let inode = self.path().inode();
+        if !inode.type_().is_regular_file() {
+            // Only regular files are mappable through their page cache.
+            return_errno_with_message!(Errno::ENODEV, "the file is not mappable");
+        }
         if let Some(page_cache) = inode.page_cache() {
             // Otherwise, if the inode has a page cache, it is a file-backed
             // mapping and we return the VMO as the mappable object.

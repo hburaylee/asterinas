@@ -39,6 +39,10 @@ pub(super) fn sys_getdents(
     let mut reader = DirentBufferReader::<Dirent>::new(writer); // Use the non-64-bit reader
     let _ = inode_handle.readdir(&mut reader)?;
     let read_len = reader.read_len();
+    if read_len == 0 && reader.saw_entry() {
+        // The buffer cannot hold even the first directory entry.
+        return_errno!(Errno::EINVAL);
+    }
     fs::vfs::notify::on_access(&file);
     Ok(SyscallReturn::Return(read_len as _))
 }
@@ -65,6 +69,10 @@ pub(super) fn sys_getdents64(
     let mut reader = DirentBufferReader::<Dirent64>::new(writer);
     let _ = inode_handle.readdir(&mut reader)?;
     let read_len = reader.read_len();
+    if read_len == 0 && reader.saw_entry() {
+        // The buffer cannot hold even the first directory entry.
+        return_errno!(Errno::EINVAL);
+    }
     fs::vfs::notify::on_access(&file);
     Ok(SyscallReturn::Return(read_len as _))
 }
@@ -84,6 +92,8 @@ trait DirentSerializer {
 struct DirentBufferReader<'a, T: DirentSerializer> {
     writer: VmWriter<'a>,
     read_len: usize,
+    /// Whether `readdir` has offered at least one directory entry.
+    saw_entry: bool,
     phantom: PhantomData<T>,
 }
 
@@ -92,6 +102,7 @@ impl<'a, T: DirentSerializer> DirentBufferReader<'a, T> {
         Self {
             writer,
             read_len: 0,
+            saw_entry: false,
             phantom: PhantomData,
         }
     }
@@ -99,10 +110,15 @@ impl<'a, T: DirentSerializer> DirentBufferReader<'a, T> {
     pub(crate) fn read_len(&self) -> usize {
         self.read_len
     }
+
+    pub(crate) fn saw_entry(&self) -> bool {
+        self.saw_entry
+    }
 }
 
 impl<T: DirentSerializer> DirentVisitor for DirentBufferReader<'_, T> {
     fn visit(&mut self, name: &str, ino: u64, type_: InodeType, offset: usize) -> Result<()> {
+        self.saw_entry = true;
         let dirent_serializer = T::new(ino, offset as u64, type_, CString::new(name)?);
         let len = dirent_serializer.len();
         if self.writer.avail() < len {
