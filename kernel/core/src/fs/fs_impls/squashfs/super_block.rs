@@ -74,12 +74,9 @@ struct RawSuperBlock {
 const_assert!(size_of::<RawSuperBlock>() == 96);
 
 impl SuperBlock {
-    pub(super) fn read(
-        device: &Arc<dyn BlockDevice>,
-        offset: u64,
-    ) -> Result<Self, super::SquashFsError> {
+    pub(super) fn read(device: &Arc<dyn BlockDevice>) -> Result<Self, super::SquashFsError> {
         let raw_super_block = device
-            .read_val::<RawSuperBlock>(offset as usize)
+            .read_val::<RawSuperBlock>(0)
             .map_err(|_| super::SquashFsError::IoError)?;
 
         if &raw_super_block.magic != b"hsqs" {
