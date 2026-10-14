@@ -47,6 +47,10 @@ impl Debug for SuperBlock {
 }
 
 /// The on-disk superblock layout.
+///
+/// Reference:
+/// <https://dr-emann.github.io/squashfs/squashfs.html#_the_superblock>
+/// <https://elixir.bootlin.com/linux/v7.0/source/fs/squashfs/squashfs_fs.h#L241>
 #[repr(C)]
 #[derive(Clone, Copy, Pod)]
 struct RawSuperBlock {
