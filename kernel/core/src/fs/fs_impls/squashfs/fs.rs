@@ -51,7 +51,7 @@ pub(crate) struct SquashFs {
 
 impl SquashFs {
     pub(super) fn open(device: Arc<dyn BlockDevice>) -> Result<Arc<Self>> {
-        let super_block = SuperBlock::read(&device, 0)?;
+        let super_block = SuperBlock::read(&device)?;
         let decompress = DecompressContext::new(super_block.compressor);
 
         let id_locations = Self::read_id_table(&device, &super_block)?;
