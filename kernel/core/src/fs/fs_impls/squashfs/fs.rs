@@ -14,7 +14,7 @@ use super::{
     fragment::{FragmentEntry, RawFragmentEntry},
     impl_for_vfs::inode::SquashFsInode,
     inode::{self, BlockSizeInfo, InodeMeta, ParsedInode},
-    meta::{META_MAX, MetaCursor, MetaReader},
+    meta::{self, MetaCursor, MetaReader},
     super_block::SuperBlock,
 };
 use crate::{
@@ -26,7 +26,7 @@ use crate::{
 };
 
 /// Indicates that an optional table (xattr, fragment, or export) is not
-/// present in the filesystem image..
+/// present in the filesystem image.
 const INVALID_BLK: u64 = 0xffffffffffffffff;
 
 /// The location of a compressed metadata block: the absolute byte offset of
@@ -118,7 +118,7 @@ impl SquashFs {
         entry_count: u64,
     ) -> Result<Vec<MetaBlockLocation>, SquashFsError> {
         let total_size = size_of::<T>() * entry_count as usize;
-        let block_count = total_size.div_ceil(META_MAX);
+        let block_count = total_size.div_ceil(meta::META_MAX);
 
         // The pointers are stored contiguously on disk. Read the whole array in
         // one request: each `read_bytes` is a full block-device bio that reads
@@ -184,8 +184,8 @@ impl SquashFs {
     fn get_id(&self, index: u16) -> Result<u32> {
         const ENTRY_SIZE: usize = size_of::<u32>();
         let byte_pos = index as usize * ENTRY_SIZE;
-        let meta_index = byte_pos / META_MAX;
-        let offset = (byte_pos % META_MAX) as u16;
+        let meta_index = byte_pos / meta::META_MAX;
+        let offset = (byte_pos % meta::META_MAX) as u16;
         let block_ptr = *self
             .id_locations
             .get(meta_index)
@@ -207,8 +207,8 @@ impl SquashFs {
     /// the Linux kernel's `squashfs_frag_lookup`.
     pub(super) fn frag_lookup(&self, index: u32) -> Result<FragmentEntry> {
         let byte_pos = index as usize * size_of::<RawFragmentEntry>();
-        let meta_index = byte_pos / META_MAX;
-        let offset = (byte_pos % META_MAX) as u16;
+        let meta_index = byte_pos / meta::META_MAX;
+        let offset = (byte_pos % meta::META_MAX) as u16;
         let block_ptr = *self
             .frag_locations
             .get(meta_index)

@@ -107,7 +107,7 @@ impl<'a> BlockReader<'a> {
     }
 }
 
-/// A single decompressed data block backed.
+/// A single data or fragment block, decompressed and held in page frames.
 #[derive(Clone)]
 pub(super) struct DataBlock {
     seg: Segment<()>,

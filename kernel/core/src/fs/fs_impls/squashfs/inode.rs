@@ -165,13 +165,13 @@ pub(super) struct BlockSizeInfo {
 /// Reference:
 /// <https://dr-emann.github.io/squashfs/squashfs.html#_data_and_fragment_blocks>
 /// <https://elixir.bootlin.com/linux/v7.0/source/fs/squashfs/squashfs_fs.h#L113>
-pub(super) const COMPRESSED_BIT_BLOCK: u32 = 1 << 24;
+pub(super) const UNCOMPRESSED_BIT_BLOCK: u32 = 1 << 24;
 
 impl BlockSizeInfo {
     fn from_raw(raw: u32) -> Self {
         Self {
-            size: raw & !COMPRESSED_BIT_BLOCK,
-            compressed: raw & COMPRESSED_BIT_BLOCK == 0,
+            size: raw & !UNCOMPRESSED_BIT_BLOCK,
+            compressed: raw & UNCOMPRESSED_BIT_BLOCK == 0,
         }
     }
 }

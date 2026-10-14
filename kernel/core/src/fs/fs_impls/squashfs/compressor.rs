@@ -45,7 +45,7 @@ impl TryFrom<u16> for Compressor {
 }
 
 /// Context for decompressing blocks.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(super) struct DecompressContext {
     compressor: Compressor,
 }
