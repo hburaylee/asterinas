@@ -78,16 +78,16 @@ impl SuperBlock {
         device: &Arc<dyn BlockDevice>,
         offset: u64,
     ) -> Result<Self, super::SquashFsError> {
-        let raw: RawSuperBlock = device
-            .read_val(offset as usize)
+        let raw_super_block = device
+            .read_val::<RawSuperBlock>(offset as usize)
             .map_err(|_| super::SquashFsError::IoError)?;
 
-        if &raw.magic != b"hsqs" {
+        if &raw_super_block.magic != b"hsqs" {
             return Err(super::SquashFsError::InvalidMagic);
         }
 
-        let version_major = raw.version_major;
-        let version_minor = raw.version_minor;
+        let version_major = raw_super_block.version_major;
+        let version_minor = raw_super_block.version_minor;
         if version_major != 4 || version_minor != 0 {
             return Err(super::SquashFsError::UnsupportedVersion(
                 version_major,
@@ -95,31 +95,31 @@ impl SuperBlock {
             ));
         }
 
-        let block_size = raw.block_size;
+        let block_size = raw_super_block.block_size;
         if !block_size.is_power_of_two() {
             return Err(super::SquashFsError::InvalidBlockSize(block_size));
         }
 
         let block_log = block_size.ilog2();
-        if !(12..=20).contains(&block_log) || block_log != raw.block_log as u32 {
+        if !(12..=20).contains(&block_log) || block_log != raw_super_block.block_log as u32 {
             return Err(super::SquashFsError::InvalidBlockSize(block_size));
         }
 
-        let compressor = Compressor::try_from(raw.compression)?;
+        let compressor = Compressor::try_from(raw_super_block.compression)?;
 
         Ok(SuperBlock {
-            inode_count: raw.inode_count,
+            inode_count: raw_super_block.inode_count,
             block_size,
-            frag_count: raw.frag_count,
+            frag_count: raw_super_block.frag_count,
             compressor,
-            flags: raw.flags,
-            id_count: raw.id_count,
-            root_inode: raw.root_inode,
-            bytes_used: raw.bytes_used,
-            id_table: raw.id_table,
-            inode_table: raw.inode_table,
-            dir_table: raw.dir_table,
-            frag_table: raw.frag_table,
+            flags: raw_super_block.flags,
+            id_count: raw_super_block.id_count,
+            root_inode: raw_super_block.root_inode,
+            bytes_used: raw_super_block.bytes_used,
+            id_table: raw_super_block.id_table,
+            inode_table: raw_super_block.inode_table,
+            dir_table: raw_super_block.dir_table,
+            frag_table: raw_super_block.frag_table,
         })
     }
 }
