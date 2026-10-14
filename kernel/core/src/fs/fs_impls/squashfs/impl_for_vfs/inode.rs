@@ -21,7 +21,7 @@ use spin::Once;
 use super::super::{
     SquashFs,
     fs::SquashFsIno,
-    inode::{BlockSizeInfo, INVALID_FRAG, InodeBody, InodeMeta, SquashFsInodeType},
+    inode::{self, BlockSizeInfo, InodeBody, InodeMeta, SquashFsInodeType},
 };
 use crate::{
     device,
@@ -224,7 +224,7 @@ impl Inode for SquashFsInode {
             optimal_block_size: self
                 .fs
                 .upgrade()
-                .map_or(4096, |fs| fs.super_block.block_size as usize),
+                .map_or(PAGE_SIZE, |fs| fs.super_block.block_size as usize),
             nr_sectors_allocated: self.size().div_ceil(512),
             last_access_at: Duration::from_secs(self.meta.mtime as u64),
             last_modify_at: Duration::from_secs(self.meta.mtime as u64),
@@ -594,7 +594,7 @@ impl SquashFsPageCacheBackend {
         seg_pos: usize,
         read_len: usize,
     ) -> Result<usize> {
-        if self.frag_index == INVALID_FRAG || self.frag_index >= fs.super_block.frag_count {
+        if self.frag_index == inode::INVALID_FRAG || self.frag_index >= fs.super_block.frag_count {
             return Ok(0);
         }
         let frag_block = fs.fragment_block(self.frag_index)?;

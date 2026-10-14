@@ -2,7 +2,7 @@
 
 use aster_block::BLOCK_SIZE;
 
-use super::super::{SquashFs, super_block::SQUASHFS_MAGIC};
+use super::super::{SquashFs, super_block};
 use crate::{
     fs::{
         utils::NAME_MAX,
@@ -34,7 +34,7 @@ impl FileSystem for SquashFs {
     fn sb(&self) -> SuperBlock {
         let total_blocks = self.super_block.bytes_used.div_ceil(BLOCK_SIZE as u64);
         SuperBlock {
-            magic: SQUASHFS_MAGIC as u64,
+            magic: super_block::SQUASHFS_MAGIC as u64,
             bsize: self.super_block.block_size as usize,
             blocks: total_blocks as usize,
             bfree: 0,

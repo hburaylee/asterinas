@@ -9,7 +9,7 @@
 
 use ostd::const_assert;
 
-use super::inode::COMPRESSED_BIT_BLOCK;
+use super::inode;
 use crate::prelude::*;
 
 /// A decoded fragment table entry: the on-disk location and size of a
@@ -40,8 +40,8 @@ impl RawFragmentEntry {
     pub(super) fn into_entry(self) -> FragmentEntry {
         FragmentEntry {
             start: self.start,
-            size: self.size_raw & !COMPRESSED_BIT_BLOCK,
-            compressed: self.size_raw & COMPRESSED_BIT_BLOCK == 0,
+            size: self.size_raw & !inode::UNCOMPRESSED_BIT_BLOCK,
+            compressed: self.size_raw & inode::UNCOMPRESSED_BIT_BLOCK == 0,
         }
     }
 }
