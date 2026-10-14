@@ -100,16 +100,14 @@ pub(super) struct InodeMeta {
 #[derive(Clone)]
 pub(super) enum InodeBody {
     File {
-        /// On-disk offset of the first data block.
-        blocks_start: u64,
         /// Index into the fragment table, or `INVALID_FRAG` if no fragment.
         frag_index: u32,
         /// Byte offset of this file's data within the fragment block.
         block_offset: u32,
         file_size: u64,
-        /// Per-block size and compression info, shared with the page-cache
-        /// backend without copying.
-        block_sizes: Arc<[BlockSizeInfo]>,
+        /// Per-block on-disk location and compression info, shared with the
+        /// page-cache backend without copying.
+        blocks: Arc<[BlockInfo]>,
     },
     Dir {
         /// Byte offset of the directory data relative to the start of the
@@ -150,12 +148,17 @@ impl InodeBody {
     }
 }
 
-/// Compressed size and compression flag for a single data block.
+/// On-disk location and compression info for a single data block.
+///
+/// `offset` is the absolute byte offset of the block from the start of the
+/// image, precomputed while parsing the inode so that reading a block never has
+/// to re-sum the sizes of all preceding blocks.
 ///
 /// The on-disk format uses bit 24 of the 32-bit size field to indicate
 /// whether the block is compressed.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct BlockSizeInfo {
+pub(super) struct BlockInfo {
+    pub(super) offset: u64,
     pub(super) size: u32,
     pub(super) compressed: bool,
 }
@@ -167,9 +170,10 @@ pub(super) struct BlockSizeInfo {
 /// <https://elixir.bootlin.com/linux/v7.0/source/fs/squashfs/squashfs_fs.h#L113>
 pub(super) const UNCOMPRESSED_BIT_BLOCK: u32 = 1 << 24;
 
-impl BlockSizeInfo {
-    fn from_raw(raw: u32) -> Self {
+impl BlockInfo {
+    fn from_raw(raw: u32, offset: u64) -> Self {
         Self {
+            offset,
             size: raw & !UNCOMPRESSED_BIT_BLOCK,
             compressed: raw & UNCOMPRESSED_BIT_BLOCK == 0,
         }
@@ -413,14 +417,13 @@ fn parse_basic_file_body(
 ) -> Result<(InodeBody, u32), SquashFsError> {
     let raw: RawBasicFile = reader.read_val()?;
     let nblocks = file_block_count(block_size, raw.frag_index, raw.file_size as u64) as usize;
-    let block_sizes = read_block_sizes(reader, nblocks)?;
+    let blocks = read_blocks(reader, nblocks, raw.blocks_start as u64)?;
     Ok((
         InodeBody::File {
-            blocks_start: raw.blocks_start as u64,
             frag_index: raw.frag_index,
             block_offset: raw.block_offset,
             file_size: raw.file_size as u64,
-            block_sizes,
+            blocks,
         },
         // Basic files don't support hard-link accounting.
         1,
@@ -433,29 +436,39 @@ fn parse_extended_file_body(
 ) -> Result<(InodeBody, u32), SquashFsError> {
     let raw: RawExtendedFile = reader.read_val()?;
     let nblocks = file_block_count(block_size, raw.frag_index, raw.file_size) as usize;
-    let block_sizes = read_block_sizes(reader, nblocks)?;
+    let blocks = read_blocks(reader, nblocks, raw.blocks_start)?;
     Ok((
         InodeBody::File {
-            blocks_start: raw.blocks_start,
             frag_index: raw.frag_index,
             block_offset: raw.block_offset,
             file_size: raw.file_size,
-            block_sizes,
+            blocks,
         },
         raw.nlink,
     ))
 }
 
-fn read_block_sizes(
+/// Reads the per-block size table and precomputes each block's absolute
+/// on-disk offset.
+///
+/// Sizes are stored contiguously and blocks are laid out back to back starting
+/// at `blocks_start`, so the offset of each block is the running sum of the
+/// preceding sizes. Computing them once here keeps the per-block read path from
+/// re-summing the prefix on every access.
+fn read_blocks(
     reader: &mut MetaReader,
     nblocks: usize,
-) -> Result<Arc<[BlockSizeInfo]>, SquashFsError> {
-    let mut block_sizes = Vec::with_capacity(nblocks);
+    blocks_start: u64,
+) -> Result<Arc<[BlockInfo]>, SquashFsError> {
+    let mut blocks = Vec::with_capacity(nblocks);
+    let mut offset = blocks_start;
     for _ in 0..nblocks {
         let raw_size: u32 = reader.read_val()?;
-        block_sizes.push(BlockSizeInfo::from_raw(raw_size));
+        let info = BlockInfo::from_raw(raw_size, offset);
+        offset += info.size as u64;
+        blocks.push(info);
     }
-    Ok(block_sizes.into())
+    Ok(blocks.into())
 }
 
 /// Parses the body of a symlink inode (shared by the basic and extended variants).

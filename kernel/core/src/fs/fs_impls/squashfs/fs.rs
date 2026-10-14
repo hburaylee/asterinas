@@ -13,7 +13,7 @@ use super::{
     dir::{DirEntry, DirIter},
     fragment::{FragmentEntry, RawFragmentEntry},
     impl_for_vfs::inode::SquashFsInode,
-    inode::{self, BlockSizeInfo, InodeMeta, ParsedInode},
+    inode::{self, BlockInfo, InodeMeta, ParsedInode},
     meta::{self, MetaCursor, MetaReader},
     super_block::SuperBlock,
 };
@@ -27,6 +27,10 @@ use crate::{
 
 /// Indicates that an optional table (xattr, fragment, or export) is not
 /// present in the filesystem image.
+///
+/// Reference:
+/// <https://dr-emann.github.io/squashfs/squashfs.html#_the_superblock>
+/// <https://elixir.bootlin.com/linux/v7.0/source/fs/squashfs/squashfs_fs.h#L40>
 const INVALID_BLK: u64 = 0xffffffffffffffff;
 
 /// The location of a compressed metadata block: the absolute byte offset of
@@ -325,19 +329,12 @@ impl SquashFs {
     pub(super) fn decompress_data_block(
         &self,
         block_idx: usize,
-        blocks_start: u64,
-        block_sizes: &[BlockSizeInfo],
+        blocks: &[BlockInfo],
         file_size: usize,
     ) -> Result<DataBlock> {
-        let info = block_sizes
+        let info = blocks
             .get(block_idx)
             .ok_or_else(|| Error::with_message(Errno::EIO, "block index out of bounds"))?;
-
-        let disk_pos = blocks_start
-            + block_sizes[..block_idx]
-                .iter()
-                .map(|b| b.size as u64)
-                .sum::<u64>();
 
         let block_size = self.super_block.block_size as usize;
         // The block decompresses to a full `block_size`, except the file's final
@@ -345,7 +342,7 @@ impl SquashFs {
         let capacity = block_size.min(file_size.saturating_sub(block_idx * block_size));
 
         let block = BlockReader::new(&self.device, &self.decompress).read_data(
-            disk_pos,
+            info.offset,
             info.size as usize,
             info.compressed,
             capacity,

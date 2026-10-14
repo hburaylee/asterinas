@@ -37,6 +37,10 @@ struct RawDirHeader {
 const_assert!(size_of::<RawDirHeader>() == 12);
 
 /// On-disk directory entry (fixed part, 8 bytes).
+///
+/// Reference:
+/// <https://dr-emann.github.io/squashfs/squashfs.html#_directory_table>
+/// <https://elixir.bootlin.com/linux/v7.0/source/fs/squashfs/squashfs_fs.h#L410>
 #[repr(C)]
 #[derive(Clone, Copy, Pod)]
 struct RawDirEntry {
@@ -121,7 +125,7 @@ impl<'a, 'r> DirIter<'a, 'r> {
         self.remaining -= size_of::<RawDirEntry>();
         self.entries_left -= 1;
 
-        let name_len = (entry.size + 1) as usize;
+        let name_len = entry.size as usize + 1;
         if name_len > DIR_NAME_MAX {
             return Err(SquashFsError::CorruptedImage("directory name too long"));
         }

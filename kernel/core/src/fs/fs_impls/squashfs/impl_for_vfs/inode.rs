@@ -21,7 +21,7 @@ use spin::Once;
 use super::super::{
     SquashFs,
     fs::SquashFsIno,
-    inode::{self, BlockSizeInfo, InodeBody, InodeMeta, SquashFsInodeType},
+    inode::{self, BlockInfo, InodeBody, InodeMeta, SquashFsInodeType},
 };
 use crate::{
     device,
@@ -292,11 +292,10 @@ impl Inode for SquashFsInode {
 
     fn page_cache(&self) -> Option<Arc<Vmo>> {
         let InodeBody::File {
-            blocks_start,
             frag_index,
             block_offset,
             file_size,
-            block_sizes,
+            blocks,
         } = &self.body
         else {
             return None;
@@ -311,11 +310,10 @@ impl Inode for SquashFsInode {
                 let fs = self.squash_fs()?;
                 let backend = Arc::new(SquashFsPageCacheBackend {
                     fs: self.fs.clone(),
-                    blocks_start: *blocks_start,
                     frag_index: *frag_index,
                     block_offset: *block_offset,
                     block_size: fs.super_block.block_size,
-                    block_sizes: block_sizes.clone(),
+                    blocks: blocks.clone(),
                     file_size: *file_size as usize,
                 });
                 let backend_dyn: Arc<dyn PageCacheBackend> = backend.clone();
@@ -460,11 +458,10 @@ fn to_vfs_inode_type(inode_type: SquashFsInodeType) -> InodeType {
 /// Page cache backend for regular files in Squashfs.
 struct SquashFsPageCacheBackend {
     fs: Weak<SquashFs>,
-    blocks_start: u64,
     frag_index: u32,
     block_offset: u32,
     block_size: u32,
-    block_sizes: Arc<[BlockSizeInfo]>,
+    blocks: Arc<[BlockInfo]>,
     file_size: usize,
 }
 
@@ -539,7 +536,7 @@ impl SquashFsPageCacheBackend {
         let mut file_pos = offset;
 
         while seg_pos < read_len {
-            let in_fragment = file_pos / block_size >= self.block_sizes.len();
+            let in_fragment = file_pos / block_size >= self.blocks.len();
             if in_fragment {
                 // The fragment is always the last data source of a file.
                 seg_pos += self.copy_from_fragment(fs, file_pos, seg, seg_pos, read_len)?;
@@ -565,12 +562,7 @@ impl SquashFsPageCacheBackend {
     ) -> Result<usize> {
         let block_size = self.block_size as usize;
         let block_idx = file_pos / block_size;
-        let block = fs.decompress_data_block(
-            block_idx,
-            self.blocks_start,
-            &self.block_sizes,
-            self.file_size,
-        )?;
+        let block = fs.decompress_data_block(block_idx, &self.blocks, self.file_size)?;
         let in_block_off = file_pos - block_idx * block_size;
         let block_avail = block.len().saturating_sub(in_block_off);
         let file_avail = self.file_size.saturating_sub(file_pos);
@@ -598,7 +590,7 @@ impl SquashFsPageCacheBackend {
             return Ok(0);
         }
         let frag_block = fs.fragment_block(self.frag_index)?;
-        let bytes_before_frag = self.block_sizes.len() * self.block_size as usize;
+        let bytes_before_frag = self.blocks.len() * self.block_size as usize;
         let src_start = self.block_offset as usize + (file_pos - bytes_before_frag);
         let frag_avail = frag_block.len().saturating_sub(src_start);
         let file_avail = self.file_size.saturating_sub(file_pos);
