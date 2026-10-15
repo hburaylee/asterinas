@@ -186,8 +186,17 @@ impl FileOps for SquashFsInode {
             skip,
             |idx, entry| {
                 let child_type = to_vfs_inode_type(entry.inode_type);
-                let name = core::str::from_utf8(entry.name()).unwrap_or("");
-                visitor.visit(name, entry.inode_num as u64, child_type, idx + 3)?;
+                let name = core::str::from_utf8(entry.name())
+                    .map_err(|_| Error::with_message(Errno::EIO, "invalid dir entry name"))?;
+                // A failed visit means the visitor's buffer is full, not that the
+                // iteration failed: it has already serialized the preceding entries
+                // into the user buffer, so stop and keep them.
+                if visitor
+                    .visit(name, entry.inode_num as u64, child_type, idx + 3)
+                    .is_err()
+                {
+                    return Ok(false);
+                }
                 count += 1;
                 Ok(true)
             },
@@ -543,6 +552,9 @@ impl SquashFsPageCacheBackend {
                 break;
             }
             let copied = self.copy_from_data_block(fs, file_pos, seg, seg_pos, read_len)?;
+            if copied == 0 {
+                return_errno_with_message!(Errno::EIO, "truncated data block");
+            }
             seg_pos += copied;
             file_pos += copied;
         }
