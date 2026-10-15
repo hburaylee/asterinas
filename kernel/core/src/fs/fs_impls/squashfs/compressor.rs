@@ -68,6 +68,7 @@ impl DecompressContext {
         match self.compressor {
             Compressor::Zstd => {
                 let mut decoder = FrameDecoder::new();
+                decoder.set_max_window_size(dst.avail());
                 decoder
                     .init(SegmentReader { src: &mut *src })
                     .map_err(|_| SquashFsError::DecompressError)?;

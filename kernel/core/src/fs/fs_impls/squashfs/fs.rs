@@ -93,7 +93,7 @@ impl SquashFs {
         device: &Arc<dyn BlockDevice>,
         sb: &SuperBlock,
     ) -> Result<Vec<MetaBlockLocation>, SquashFsError> {
-        Self::read_index_table::<u32>(device, sb.id_table, sb.id_count as u64)
+        Self::read_index_table::<u32>(device, sb.id_table, sb.id_count as u64, sb.bytes_used)
     }
 
     /// Reads the fragment table's top-level metadata-block pointer array, or an
@@ -105,7 +105,7 @@ impl SquashFs {
         if sb.frag_count == 0 || sb.frag_table == INVALID_BLK {
             return Ok(Vec::new());
         }
-        Self::read_index_table::<RawFragmentEntry>(device, sb.frag_table, sb.frag_count as u64)
+        Self::read_index_table::<RawFragmentEntry>(device, sb.frag_table, sb.frag_count as u64, sb.bytes_used)
     }
 
     /// Reads the top-level pointer array of a two-level lookup table.
@@ -120,8 +120,11 @@ impl SquashFs {
         device: &Arc<dyn BlockDevice>,
         table_pos: u64,
         entry_count: u64,
+        bytes_used: u64,
     ) -> Result<Vec<MetaBlockLocation>, SquashFsError> {
-        let total_size = size_of::<T>() * entry_count as usize;
+        let total_size = size_of::<T>().checked_mul(entry_count as usize)
+            .filter(|&s| s as u64 <= bytes_used)
+            .ok_or(SquashFsError::CorruptedImage("entry count exceeds image size"))?;
         let block_count = total_size.div_ceil(meta::META_MAX);
 
         // The pointers are stored contiguously on disk. Read the whole array in
@@ -165,6 +168,7 @@ impl SquashFs {
                 &mut reader,
                 self.super_block.block_size,
                 self.super_block.inode_count,
+                self.super_block.bytes_used,
             )?
         };
 

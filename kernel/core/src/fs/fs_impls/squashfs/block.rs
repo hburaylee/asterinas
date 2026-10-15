@@ -95,12 +95,22 @@ impl<'a> BlockReader<'a> {
             self.decompress
                 .decompress_stream(&mut src_reader, &mut dst)?
         } else {
+            // The on-disk size is attacker-controlled: reject a block claiming
+            // more bytes than its destination can hold, so `len` can never
+            // exceed the backing segment.
+            if on_disk_size > capacity {
+                return Err(SquashFsError::CorruptedImage(
+                    "uncompressed block larger than destination",
+                ));
+            }
             let mut dst = seg.writer();
             dst.limit(on_disk_size);
+            let mut dst = dst.to_fallible();
+            let avail_before = dst.avail();
             self.device
-                .read(disk_pos as usize, &mut dst.to_fallible())
+                .read(disk_pos as usize, &mut dst)
                 .map_err(|_| SquashFsError::IoError)?;
-            on_disk_size
+            avail_before - dst.avail()
         };
 
         Ok(DataBlock::new(seg, len))
