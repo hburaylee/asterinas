@@ -47,7 +47,7 @@ impl Drop for DisabledPreemptGuard {
         super::cpu_local::dec_guard_count();
         #[cfg(feature = "kernelet")]
         crate::kernelet::entry::leave_preempt_guard();
-        #[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+        #[cfg(all(target_arch = "x86_64", feature = "kernelet-host"))]
         super::check_preempt();
     }
 }

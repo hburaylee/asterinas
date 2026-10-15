@@ -6,7 +6,7 @@ mod guard;
 pub use self::guard::{DisabledPreemptGuard, disable_preempt};
 
 /// Checks for preemption after leaving an atomic section.
-#[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+#[cfg(all(target_arch = "x86_64", feature = "kernelet-host"))]
 #[inline]
 pub(crate) fn check_preempt() {
     if !cpu_local::should_preempt() {

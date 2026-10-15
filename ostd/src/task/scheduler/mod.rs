@@ -764,6 +764,72 @@ mod test {
         assert!(!super::super::scheduling_in_progress());
     }
 
+    #[cfg(not(any(feature = "kernelet-host", feature = "kernelet")))]
+    #[ktest]
+    fn native_pending_preempt_waits_for_explicit_yield() {
+        // The standalone OSTD test kernel uses the default FIFO scheduler.
+        // Its workers are queued on the BSP, so one CPU excludes remote progress.
+        if crate::cpu::num_cpus() != 1 {
+            crate::early_println!(
+                "skipping native pending-preempt progress test: requires one CPU"
+            );
+            return;
+        }
+        assert!(Task::current().is_some());
+        assert!(crate::arch::irq::is_local_enabled());
+        assert!(!super::super::scheduling_in_progress());
+
+        fn observe_boundary(reenable_irqs: bool) -> bool {
+            let ran = Arc::new(AtomicBool::new(false));
+            let worker_ran = ran.clone();
+            let preempt_guard = disable_preempt();
+            let worker = crate::task::TaskOptions::new(move || {
+                worker_ran.store(true, Ordering::Release);
+            })
+            .spawn()
+            .unwrap();
+            assert!(!ran.load(Ordering::Acquire));
+
+            // First phase drops the final preemption guard with IRQs masked,
+            // then restores IRQs. Second phase drops it with IRQs enabled.
+            let irq_guard = reenable_irqs.then(crate::irq::disable_local);
+            cpu_local::set_need_preempt();
+            drop(preempt_guard);
+            drop(irq_guard);
+            let ran_before_yield = ran.load(Ordering::Acquire);
+
+            // Always finish the real worker before asserting the boundary,
+            // including when the old automatic-preemption path already ran it.
+            // FIFO's explicit yield selects queued work, and this worker exits
+            // immediately after publishing progress, before we resume.
+            for _ in 0..16 {
+                Task::yield_now();
+                if ran.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            let completed = ran.load(Ordering::Acquire);
+            drop(worker);
+            assert!(
+                completed,
+                "Native worker did not complete after 16 explicit yields"
+            );
+            ran_before_yield
+        }
+
+        let ran_on_irq_enable = observe_boundary(true);
+        let ran_on_guard_drop = observe_boundary(false);
+        // Both workers have completed even when either assertion must fail.
+        assert!(
+            !ran_on_irq_enable,
+            "Native pending preemption ran a worker at IRQ enable"
+        );
+        assert!(
+            !ran_on_guard_drop,
+            "Native pending preemption ran a worker at guard drop"
+        );
+    }
+
     #[cfg(not(feature = "kernelet"))]
     #[ktest]
     fn rcu_destructor_can_yield_before_scheduler_decision() {

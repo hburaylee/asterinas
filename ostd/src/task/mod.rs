@@ -28,7 +28,7 @@ use core::{
 };
 
 use kernel_stack::KernelStack;
-#[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+#[cfg(all(target_arch = "x86_64", feature = "kernelet-host"))]
 pub(crate) use preempt::check_preempt;
 use processor::current_task;
 use spin::Once;

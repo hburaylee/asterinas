@@ -12,6 +12,7 @@ pub(crate) fn enable_local() {
     // followed by a RET instruction. It is a BUG of QEMU, see the following patch for details.
     // https://lore.kernel.org/qemu-devel/20231210190147.129734-2-lrh2000@pku.edu.cn/
     x86_64::instructions::nop();
+    #[cfg(feature = "kernelet-host")]
     crate::task::check_preempt();
 }
 
@@ -36,6 +37,7 @@ pub(crate) fn enable_local_and_halt() {
         // interrupts won't occur between enabling the local IRQs and halting the CPU.
         core::arch::asm!("sti", "hlt", options(nomem, nostack, preserves_flags),)
     };
+    #[cfg(feature = "kernelet-host")]
     crate::task::check_preempt();
 }
 

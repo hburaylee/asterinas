@@ -229,8 +229,9 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
             );
         }
     }
-    // Kernel-origin IRQs reach a native scheduling point after the Host's
-    // interrupt levels and callback guards have unwound.
+    // Host carriers need a physical scheduling point after interrupt levels
+    // and callback guards have unwound. Host-off retains upstream boundaries.
+    #[cfg(feature = "kernelet-host")]
     if f.trap_num >= 32
         && was_irq_enabled
         && crate::irq::InterruptLevel::current().is_task_context()
