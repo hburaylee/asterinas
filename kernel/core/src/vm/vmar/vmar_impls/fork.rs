@@ -17,9 +17,9 @@ impl Vmar {
     /// using copy-on-write (COW) technique.
     pub(crate) fn fork_from(vmar: &Self) -> VmarHandle {
         // Obtain the heap lock and hold it for the entire method to avoid race conditions.
-        let heap_guard = vmar.process_vm.heap().lock();
+        let heap_guard = vmar.process_vm().heap().lock();
 
-        let new_vmar = VmarHandle::new(ProcessVm::fork_from(&vmar.process_vm, &heap_guard));
+        let new_vmar = VmarHandle::new(ProcessVm::fork_from(vmar.process_vm(), &heap_guard));
 
         {
             let inner = vmar.inner.read();

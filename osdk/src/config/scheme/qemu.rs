@@ -41,7 +41,7 @@ pub struct QemuScheme {
     pub with_daemons: Option<Vec<DaemonScheme>>,
 }
 
-#[derive(Clone, Debug, Deserialize, Eq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct Qemu {
     pub args: String,
     /// This finalized config has a unorthodox `Option` because
@@ -72,24 +72,22 @@ impl Default for Qemu {
     }
 }
 
-// Implements `PartialEq` for `Qemu`, comparing `args` while ignoring numeric characters
-// (random ports), and comparing the remaining settings normally.
-impl PartialEq for Qemu {
-    fn eq(&self, other: &Self) -> bool {
-        fn strip_numbers(input: &str) -> String {
-            input.chars().filter(|c| !c.is_numeric()).collect()
-        }
-
-        strip_numbers(&self.args) == strip_numbers(&other.args)
-            && self.bootdev_append_options == other.bootdev_append_options
-            && self.path == other.path
-            && self.with_monitor == other.with_monitor
-            && self.log_file == other.log_file
-            && self.with_daemons == other.with_daemons
-    }
-}
-
 impl Qemu {
+    /// Checks bundle reuse while allowing newly allocated host forwarding ports.
+    /// Guest ports, addresses and all other QEMU settings must still match.
+    pub fn is_bundle_compatible(&self, other: &Self) -> bool {
+        let host_port = regex::Regex::new(r"(hostfwd=(?:tcp|udp):[^,\s]*:)[0-9]+-")
+            .expect("constant host forwarding pattern is valid");
+        let normalize = |qemu: &Self| {
+            let mut normalized = qemu.clone();
+            normalized.args = host_port
+                .replace_all(&qemu.args, "${1}<host-port>-")
+                .into_owned();
+            normalized
+        };
+        normalize(self) == normalize(other)
+    }
+
     pub fn apply_qemu_args(&mut self, args: &Vec<String>) {
         let mut joined = split_to_kv_array(&self.args);
 
@@ -101,6 +99,37 @@ impl Qemu {
         apply_kv_array(&mut joined, args, " ", MULTI_VALUE_KEYS);
 
         self.args = joined.join(" ");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bundle_reuse_ignores_only_host_forwarding_ports() {
+        let original = Qemu {
+            args: "-m 4G -smp 2 -cpu x86-64-v2 -netdev user,id=n0,hostfwd=tcp::1234-:22".into(),
+            ..Qemu::default()
+        };
+        let mut changed = original.clone();
+        changed.args = original.args.replace("1234", "5678");
+        assert_ne!(original, changed);
+        assert!(original.is_bundle_compatible(&changed));
+        for (before, after) in [
+            ("4G", "8G"),
+            ("-smp 2", "-smp 8"),
+            ("v2", "v3"),
+            ("-:22", "-:23"),
+            ("n0", "n1"),
+        ] {
+            changed.args = original.args.replace(before, after);
+            assert_ne!(original, changed);
+            assert!(
+                !original.is_bundle_compatible(&changed),
+                "{before} -> {after}"
+            );
+        }
     }
 }
 

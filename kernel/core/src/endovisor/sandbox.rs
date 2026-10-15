@@ -15,6 +15,10 @@ mod file;
 mod lifecycle;
 
 pub(super) use file::create_sandbox;
+#[cfg(all(kernelet_rq1_crossing_diag, not(feature = "kernelet")))]
+pub(crate) use file::rq1_crossing_capture;
+#[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
+pub(crate) use file::rq1_tlb_capture;
 use kernelet_abi::StatusRaw;
 use ostd::{kernelet::control::Kernelet, sync::WaitQueue};
 

@@ -6,9 +6,10 @@ use vsc::VscLaunchConfig;
 
 use super::{
     build::create_base_and_cached_build,
-    util::{DEFAULT_TARGET_RELPATH, is_tdx_enabled},
+    util::{is_tdx_enabled, resolve_output_directory},
 };
 use crate::{
+    cli::RunArgs,
     config::{Config, scheme::ActionChoice},
     error::Errno,
     error_msg,
@@ -16,15 +17,20 @@ use crate::{
     warn_msg,
 };
 
-pub fn execute_run_command(config: &Config, gdb_server_args: Option<&str>) {
+pub fn execute_run_command(config: &Config, args: &RunArgs) {
     let cargo_target_directory = get_target_directory();
-    let osdk_output_directory = cargo_target_directory.join(DEFAULT_TARGET_RELPATH);
+    let osdk_output_directory =
+        resolve_output_directory(args.output_args.output.as_deref(), &cargo_target_directory)
+            .unwrap_or_else(|error| {
+                error_msg!("Failed to resolve the OSDK output directory: {error}");
+                exit(Errno::Cli as _);
+            });
 
     let target_info = get_kernel_crate();
 
     let mut config = config.clone();
 
-    let _vsc_launch_file = if let Some(gdb_server_str) = gdb_server_args {
+    let _vsc_launch_file = if let Some(gdb_server_str) = args.gdb_server.as_deref() {
         adapt_for_gdb_server(&mut config, gdb_server_str)
     } else {
         None

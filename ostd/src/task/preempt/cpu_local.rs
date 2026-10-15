@@ -3,12 +3,15 @@
 //! This module maintains preemption-related information for the current task
 //! on a CPU with a single 32-bit, CPU-local integer value.
 //!
-//! * Bits from 0 to 30 represents an unsigned counter called `guard_count`,
+//! * Bits from 0 to 30 (0 to 29 in a kernelet) represent `guard_count`,
 //!   which is the number of `DisabledPreemptGuard` instances held by the
 //!   current CPU;
 //! * Bit 31 is set to `!need_preempt`, where `need_preempt` is a boolean value
 //!   that will be set by the scheduler when it decides that the current task
 //!   _needs_ to be preempted.
+//! * In a kernelet, bit 30 defers scheduling of its non-enqueued boot Task.
+//!   It is not included in `guard_count` and does not mask virtual IRQs or
+//!   represent an RCU read-side critical section.
 //!
 //! Thus, the current task on a CPU _should_ be preempted if and only if this
 //! integer is equal to zero.
@@ -16,13 +19,13 @@
 //! The initial value of this integer is equal to `1 << 31`.
 //!
 //! This module provides a set of functions to access and manipulate
-//! `guard_count` and `need_preempt`.
+//! the guard count, preemption request, and kernelet boot phase.
 
 use crate::cpu_local_cell;
 
 /// Returns whether the current task _should_ be preempted or not.
 ///
-/// `should_preempt() == need_preempt() && get_guard_count() == 0`.
+/// This requires a preemption request, no guards, and (in a kernelet) no boot Task.
 pub(in crate::task) fn should_preempt() -> bool {
     PREEMPT_INFO.load() == 0
 }
@@ -43,6 +46,29 @@ pub(in crate::task) fn get_guard_count() -> u32 {
     PREEMPT_INFO.load() & GUARD_COUNT_MASK
 }
 
+/// Defers inner scheduling while a non-enqueued boot Task owns this CPU.
+///
+/// This is not a preemption guard or an RCU reader. Virtual IRQs remain
+/// deliverable, and `should_preempt` retains its single comparison with zero.
+#[cfg(feature = "kernelet")]
+pub(in crate::task) fn enter_boot_task() {
+    debug_assert_eq!(PREEMPT_INFO.load() & (BOOT_TASK_MASK | GUARD_COUNT_MASK), 0);
+    PREEMPT_INFO.bitor_assign(BOOT_TASK_MASK);
+}
+
+#[cfg(feature = "kernelet")]
+pub(in crate::task) fn in_boot_task() -> bool {
+    PREEMPT_INFO.load() & BOOT_TASK_MASK != 0
+}
+
+/// Transfers boot's scheduling exclusion to an already-held SchedulingGuard.
+#[cfg(feature = "kernelet")]
+pub(in crate::task) fn leave_boot_task() {
+    debug_assert!(super::super::scheduling_in_progress());
+    debug_assert!(in_boot_task());
+    PREEMPT_INFO.bitand_assign(!BOOT_TASK_MASK);
+}
+
 pub(in crate::task) fn inc_guard_count() {
     PREEMPT_INFO.add_assign(1);
 }
@@ -57,51 +83,9 @@ cpu_local_cell! {
 }
 
 const NEED_PREEMPT_MASK: u32 = 1 << 31;
+#[cfg(feature = "kernelet")]
+const BOOT_TASK_MASK: u32 = 1 << 30;
+#[cfg(feature = "kernelet")]
+const GUARD_COUNT_MASK: u32 = BOOT_TASK_MASK - 1;
+#[cfg(not(feature = "kernelet"))]
 const GUARD_COUNT_MASK: u32 = (1 << 31) - 1;
-
-/// Native preemption state accessed by the kernelet carrier protocol.
-#[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
-pub(crate) mod carrier {
-    use super::{GUARD_COUNT_MASK, NEED_PREEMPT_MASK, PREEMPT_INFO};
-
-    pub(crate) fn gs_offset() -> u32 {
-        PREEMPT_INFO.static_offset().try_into().unwrap()
-    }
-
-    pub(crate) fn guard_count() -> u32 {
-        PREEMPT_INFO.load() & GUARD_COUNT_MASK
-    }
-
-    /// Restores Host-private guard ownership without losing a reschedule request.
-    ///
-    /// Callers must mask physical IRQs and have released all temporary Host
-    /// guards. The image's shared mirror bit is never trusted for subtraction.
-    pub(crate) fn restore_guards(baseline: u32) {
-        debug_assert!(!crate::arch::irq::is_local_enabled());
-        debug_assert!(baseline <= GUARD_COUNT_MASK);
-        PREEMPT_INFO.store((PREEMPT_INFO.load() & NEED_PREEMPT_MASK) | baseline);
-    }
-}
-
-#[cfg(all(ktest, target_arch = "x86_64", not(feature = "kernelet")))]
-mod carrier_tests {
-    use super::*;
-    use crate::prelude::*;
-
-    #[ktest]
-    fn carrier_guard_repair_preserves_reschedule_request() {
-        let _irq_guard = crate::irq::disable_local();
-        let saved = PREEMPT_INFO.load();
-        let baseline = saved & GUARD_COUNT_MASK;
-        // A shared mirror must not determine how much the Host subtracts.
-        // Model an extra increment and a reschedule request during image work.
-        inc_guard_count();
-        inc_guard_count();
-        set_need_preempt();
-        carrier::restore_guards(baseline);
-        assert_eq!(get_guard_count(), baseline);
-        assert!(need_preempt());
-        assert_eq!(should_preempt(), baseline == 0);
-        PREEMPT_INFO.store(saved);
-    }
-}

@@ -74,6 +74,12 @@ impl Sandbox {
         Ok(unsafe { File::from_raw_fd(fd) })
     }
 
+    /// Updates one peer route using a sandbox descriptor from this process.
+    pub fn vsock_policy(&self, args: &VsockPolicyArgs) -> Result<()> {
+        call(&self.file, VSOCK_POLICY, args as *const _ as usize)?;
+        Ok(())
+    }
+
     pub fn start(&self) -> Result<()> {
         call(&self.file, START, 0)?;
         Ok(())

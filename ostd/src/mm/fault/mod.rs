@@ -97,6 +97,9 @@ pub(crate) trait TrapFrameApi {
 }
 
 /// Handles page fault from user space.
+///
+/// Kernel-address faults remain fatal unless a caller first applies the
+/// separately scoped Host record-copy recovery.
 pub(crate) fn handle_user_page_fault(
     f: &mut TrapFrame,
     exception: &CpuException,
@@ -129,4 +132,16 @@ pub(crate) fn handle_user_page_fault(
     } else {
         panic!("Cannot handle user page fault; trapframe: {:#x?}", f);
     }
+}
+
+/// Applies an exception-table fixup after the caller has authenticated a
+/// scoped kernel read fault.
+/// This does not change the normal page-fault policy.
+#[cfg(all(target_arch = "x86_64", feature = "kernelet-host"))]
+pub(crate) fn recover_kernel_copy_fault(frame: &mut TrapFrame) -> bool {
+    let Some(recovery) = ExTable::find_recovery_inst_addr(frame.instruction_pointer()) else {
+        return false;
+    };
+    frame.set_instruction_pointer(recovery);
+    true
 }

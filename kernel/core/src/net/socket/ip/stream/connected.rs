@@ -207,6 +207,11 @@ impl ConnectedStream {
         }
     }
 
+    #[cfg(kernelet_nat_failure_diag_host)]
+    pub(super) fn reset_diagnostic(&self) -> aster_bigtcp::socket::TcpResetDiagnostic {
+        self.tcp_conn.reset_diagnostic()
+    }
+
     pub(super) fn set_raw_option<R>(
         &self,
         set_option: impl FnOnce(&dyn RawTcpSetOption) -> R,

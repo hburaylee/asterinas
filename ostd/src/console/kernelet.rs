@@ -9,7 +9,7 @@ use crate::{
         abi::{LEVEL_CONSOLE, MAX_LOG_MODULE_BYTES, MAX_LOG_TEXT_BYTES},
         entry,
     },
-    log::{self, LevelFilter, Log, Record},
+    log::{self, Log, Record},
 };
 
 const MODULE: &[u8] = b"ostd";
@@ -20,7 +20,6 @@ pub(super) fn write(args: Arguments) {
 
 pub(super) fn init() {
     static LOGGER: KerneletLogger = KerneletLogger;
-    log::set_max_level(LevelFilter::Info);
     log::inject_logger(&LOGGER);
 }
 

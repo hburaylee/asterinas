@@ -61,6 +61,14 @@ use crate::{
 /// [`PageTableGuard`].
 pub(crate) type PageTableNode<C> = Frame<PageTablePageMeta<C>>;
 
+#[cfg(feature = "kernelet-host")]
+crate::cpu_local_cell! {
+    // Owns the native root's forgotten Frame reference. A registered tenant
+    // root may temporarily borrow CR3 without Host frame metadata, so the
+    // hardware register alone cannot identify this reference's owner.
+    static MANAGED_ROOT_PADDR: crate::mm::Paddr = 0;
+}
+
 impl<C: PageTableConfig> PageTableNode<C> {
     pub(super) fn level(&self) -> PagingLevel {
         self.meta().level
@@ -68,11 +76,17 @@ impl<C: PageTableConfig> PageTableNode<C> {
 
     /// Allocates a new empty page table node.
     pub(super) fn alloc(level: PagingLevel) -> Self {
+        Self::try_alloc(level).expect("Failed to allocate a page table node")
+    }
+
+    /// Allocates a node without turning physical memory exhaustion into panic.
+    pub(super) fn try_alloc(level: PagingLevel) -> crate::Result<Self> {
+        #[cfg(ktest)]
+        if super::test::fail_node_allocation() {
+            return Err(crate::Error::NoMemory);
+        }
         let meta = PageTablePageMeta::new(level);
-        FrameAllocOptions::new()
-            .zeroed(true)
-            .alloc_frame_with(meta)
-            .expect("Failed to allocate a page table node")
+        FrameAllocOptions::new().zeroed(true).alloc_frame_with(meta)
     }
 
     /// Activates the page table assuming it is a root page table.
@@ -94,15 +108,32 @@ impl<C: PageTableConfig> PageTableNode<C> {
     pub(super) unsafe fn activate(&self) {
         use crate::arch::mm::{activate_page_table, current_page_table_paddr};
 
+        #[cfg(feature = "kernelet-host")]
+        let _irq_guard = crate::irq::disable_local();
         assert_eq!(self.level(), C::NR_LEVELS);
 
+        #[cfg(feature = "kernelet-host")]
+        let last_activated_paddr = MANAGED_ROOT_PADDR.load();
+        #[cfg(feature = "kernelet-host")]
+        assert_ne!(last_activated_paddr, 0, "native root was not initialized");
+        #[cfg(not(feature = "kernelet-host"))]
         let last_activated_paddr = current_page_table_paddr();
         if last_activated_paddr == self.paddr() {
+            // Returning from a borrowed tenant root needs a CR3 write but
+            // already owns exactly one native CPU reference.
+            #[cfg(feature = "kernelet-host")]
+            if current_page_table_paddr() != self.paddr() {
+                // SAFETY: The safety is upheld by the caller.
+                unsafe { activate_page_table(self.paddr()) };
+            }
             return;
         }
 
+        let paddr = self.clone().into_raw();
         // SAFETY: The safety is upheld by the caller.
-        unsafe { activate_page_table(self.clone().into_raw()) };
+        unsafe { activate_page_table(paddr) };
+        #[cfg(feature = "kernelet-host")]
+        MANAGED_ROOT_PADDR.store(paddr);
 
         // Restore and drop the last activated page table.
         // SAFETY: The physical address is valid and points to a forgotten page table node.
@@ -116,8 +147,11 @@ impl<C: PageTableConfig> PageTableNode<C> {
     pub(super) unsafe fn first_activate(&self) {
         use crate::arch::mm::activate_page_table;
 
+        let paddr = self.clone().into_raw();
         // SAFETY: The safety is upheld by the caller.
-        unsafe { activate_page_table(self.clone().into_raw()) };
+        unsafe { activate_page_table(paddr) };
+        #[cfg(feature = "kernelet-host")]
+        MANAGED_ROOT_PADDR.store(paddr);
     }
 }
 

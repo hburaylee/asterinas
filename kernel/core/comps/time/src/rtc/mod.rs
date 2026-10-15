@@ -38,8 +38,6 @@ macro_rules! declare_rtc_drivers {
 mod cmos;
 #[cfg(target_arch = "riscv64")]
 mod goldfish;
-#[cfg(all(target_arch = "x86_64", feature = "kernelet"))]
-mod kernelet;
 #[cfg(target_arch = "loongarch64")]
 mod loongson;
 #[cfg(target_arch = "aarch64")]
@@ -47,7 +45,6 @@ mod pl031;
 
 declare_rtc_drivers! {
     #[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))] cmos::RtcCmos,
-    #[cfg(all(target_arch = "x86_64", feature = "kernelet"))] kernelet::RtcKernelet,
     #[cfg(target_arch = "riscv64")] goldfish::RtcGoldfish,
     #[cfg(target_arch = "loongarch64")] loongson::RtcLoongson,
     #[cfg(target_arch = "aarch64")] pl031::RtcPl031,

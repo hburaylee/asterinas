@@ -2,12 +2,11 @@
 
 use core::time::Duration;
 
-use aster_time::read_monotonic_time;
 use aster_util::fixed_point::FixedU64;
 use ostd::mm::VmIo;
 
 use super::SyscallReturn;
-use crate::{prelude::*, process::pid_table, sched::loadavg};
+use crate::{prelude::*, process::pid_table, sched::loadavg, time};
 
 #[padding_struct]
 #[repr(C)]
@@ -32,7 +31,7 @@ pub(super) fn sys_sysinfo(sysinfo_addr: Vaddr, ctx: &Context) -> Result<SyscallR
 
     let loadavg = loadavg::get_loadavg();
     let info = SysInfo {
-        uptime: read_monotonic_time().as_secs_round_up() as i64,
+        uptime: time::read_monotonic_time().as_secs_round_up() as i64,
         loads: [
             SysinfoLoadAvg::from(loadavg[0]).raw(),
             SysinfoLoadAvg::from(loadavg[1]).raw(),

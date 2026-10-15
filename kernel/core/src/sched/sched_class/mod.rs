@@ -5,8 +5,14 @@
 #![warn(unused)]
 
 use alloc::{boxed::Box, sync::Arc};
+#[cfg(feature = "kernelet-host")]
+use core::num::NonZeroU16;
 use core::{fmt, ops::Bound, sync::atomic::Ordering};
 
+#[cfg(not(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest)))]
+use ostd::arch::read_tsc as sched_clock;
+#[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
+use ostd::task::scheduler::runtime_ticks as sched_clock;
 use ostd::{
     cpu::{CpuId, CpuSet, PinCurrentCpu, all_cpus},
     irq::disable_local,
@@ -15,7 +21,7 @@ use ostd::{
         AtomicCpuId, Task,
         scheduler::{
             EnqueueFlags, LocalRunQueue, Scheduler, UpdateFlags, enable_preemption_on_cpu,
-            info::CommonSchedInfo, inject_scheduler, runtime_ticks as sched_clock,
+            info::CommonSchedInfo, inject_scheduler,
         },
     },
     util::id_set::Id,
@@ -167,6 +173,17 @@ impl SchedAttr {
                 _ => Nice::default(),
             }),
         }
+    }
+
+    /// Divides the thread's fair weight before it is first published to a run queue.
+    #[cfg(feature = "kernelet-host")]
+    pub(crate) fn with_fair_weight_divisor(mut self, divisor: NonZeroU16) -> Self {
+        let nice = match self.policy() {
+            SchedPolicy::Fair(nice) => nice,
+            _ => Nice::default(),
+        };
+        self.fair = fair::FairAttr::new_with_weight_divisor(nice, divisor);
+        self
     }
 
     /// Retrieves the current scheduling policy of the thread.

@@ -5,6 +5,49 @@ use std::fs::{self, File};
 use super::*;
 
 #[test]
+fn invocation_rustflags_reach_both_actions_without_repeating_inherited_flags() {
+    let mut config = Config {
+        work_dir: PathBuf::from("/workspace"),
+        target_arch: Arch::X86_64,
+        build: Build {
+            rustflags: "--cfg global".into(),
+            ..Default::default()
+        },
+        run: Action {
+            build: Build {
+                rustflags: "--cfg global --cfg run".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        test: Action {
+            build: Build {
+                rustflags: "--cfg global --cfg test".into(),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    };
+    let before = config.clone();
+    config.append_rustflags("");
+    assert_eq!(config, before);
+    let environment = "--cfg kernelet_nat_failure_diag_host";
+    config.append_rustflags(environment);
+    assert_eq!(
+        config.build.rustflags,
+        "--cfg global --cfg kernelet_nat_failure_diag_host"
+    );
+    assert_eq!(
+        config.run.build.rustflags,
+        "--cfg global --cfg run --cfg kernelet_nat_failure_diag_host"
+    );
+    assert_eq!(
+        config.test.build.rustflags,
+        "--cfg global --cfg test --cfg kernelet_nat_failure_diag_host"
+    );
+}
+
+#[test]
 fn deserialize_toml_manifest() {
     let content = include_str!("OSDK.toml.full");
     let toml_manifest: manifest::TomlManifest = toml::from_str(content).unwrap();

@@ -36,7 +36,9 @@ use super::{
     vsock_switch::{Packet, SwitchRef, VsockSwitch},
 };
 use crate::{
-    prelude::{Errno, Error},
+    events::IoEvents,
+    prelude::{Errno, Error, Result},
+    process::signal::{PollHandle, Pollee},
     thread::kernel_thread::ThreadOptions,
 };
 
@@ -47,6 +49,25 @@ const TX: usize = 1;
 const EVENT: usize = 2;
 const MAX_PACKET_BYTES: usize = 4096;
 const MAX_INBOUND: usize = 64;
+
+#[cfg(kernelet_host_connect_gate)]
+struct ConnectGate {
+    identity: super::vsock_switch::DiagConnectIdentity,
+    generation: u64,
+    host_port: u32,
+    peer_port: u32,
+    delay_ms: u64,
+}
+
+#[cfg(kernelet_host_connect_gate)]
+struct ConnectGateWake(Arc<WaitQueue>);
+
+#[cfg(kernelet_host_connect_gate)]
+impl crate::events::Observer<IoEvents> for ConnectGateWake {
+    fn on_events(&self, _: &IoEvents) {
+        self.0.wake_all();
+    }
+}
 const MAGIC: u32 = 0x7472_6976;
 const VERSION: u32 = 2;
 const DEVICE_ID_VSOCK: u32 = 19;
@@ -56,24 +77,15 @@ const FEATURE_VERSION_1: u64 = 1 << 32;
 const DEVICE_NEEDS_RESET: u32 = 1 << 6;
 const DEVICE_CHARGE: usize = size_of::<VirtioVsock>()
     + size_of::<Request>() * (QUEUE_SIZE * 2 + 1)
-    + size_of::<QueuedPacket>() * MAX_INBOUND;
+    + size_of::<QueuedPacket>() * MAX_INBOUND
+    + CONNECT_GATE_CHARGE;
 
-#[derive(Clone, Copy, Default)]
-struct Buffer {
-    paddr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
-}
+#[cfg(kernelet_host_connect_gate)]
+const CONNECT_GATE_CHARGE: usize = size_of::<WaitQueue>() + size_of::<ConnectGateWake>();
+#[cfg(not(kernelet_host_connect_gate))]
+const CONNECT_GATE_CHARGE: usize = 0;
 
-impl Buffer {
-    fn writable(self) -> bool {
-        self.flags & 2 != 0
-    }
-    fn has_next(self) -> bool {
-        self.flags & 1 != 0
-    }
-}
+type Buffer = super::virtio_mmio::Descriptor;
 
 struct Request {
     head: u16,
@@ -81,6 +93,45 @@ struct Request {
     buffers: [Buffer; QUEUE_SIZE],
     len: usize,
     capacity: usize,
+}
+
+/// Walks an already validated descriptor chain across header/payload calls.
+struct BufferCursor<'a> {
+    buffers: &'a [Buffer],
+    offset: usize,
+}
+
+impl<'a> BufferCursor<'a> {
+    fn new(buffers: &'a [Buffer]) -> Self {
+        Self { buffers, offset: 0 }
+    }
+
+    fn copy(
+        &mut self,
+        len: usize,
+        mut copy: impl FnMut(u64, core::ops::Range<usize>) -> ostd::Result<()>,
+    ) -> ostd::Result<()> {
+        let mut copied = 0;
+        while copied < len {
+            let Some(buffer) = self.buffers.first() else {
+                return Err(ostd::Error::InvalidArgs);
+            };
+            if self.offset == buffer.len as usize {
+                self.buffers = &self.buffers[1..];
+                self.offset = 0;
+                continue;
+            }
+            let count = (len - copied).min(buffer.len as usize - self.offset);
+            let paddr = buffer
+                .paddr
+                .checked_add(self.offset as u64)
+                .ok_or(ostd::Error::InvalidArgs)?;
+            copy(paddr, copied..copied + count)?;
+            copied += count;
+            self.offset += count;
+        }
+        Ok(())
+    }
 }
 
 struct Registers {
@@ -97,8 +148,8 @@ struct Registers {
     rx: VecDeque<Request>,
     tx: VecDeque<Request>,
     events: VecDeque<Request>,
-    inbound: VecDeque<QueuedPacket>,
-    next_rx: bool,
+    inbound: InboundQueue<QueuedPacket>,
+    rx_is_next: bool,
 }
 
 pub(super) struct PacketCharge {
@@ -112,14 +163,22 @@ impl PacketCharge {
         owner: Arc<Kernelet>,
         admission: Arc<Admission>,
         bytes: usize,
-    ) -> Option<Arc<Self>> {
-        let reservation = admission.reserve_endpoint_bytes(bytes).ok()?;
-        owner.charge_host_bytes(bytes).ok()?;
-        Some(Arc::new(Self {
+    ) -> Option<Self> {
+        Self::try_reserve(owner, admission, bytes).ok()
+    }
+
+    pub(super) fn try_reserve(
+        owner: Arc<Kernelet>,
+        admission: Arc<Admission>,
+        bytes: usize,
+    ) -> Result<Self> {
+        let reservation = admission.reserve_endpoint_bytes(bytes)?;
+        owner.charge_host_bytes(bytes)?;
+        Ok(Self {
             owner,
             bytes,
             _admission: reservation,
-        }))
+        })
     }
 }
 
@@ -131,8 +190,85 @@ impl Drop for PacketCharge {
 
 pub(super) struct QueuedPacket {
     pub(super) packet: Packet,
-    pub(super) charge: Arc<PacketCharge>,
+    // Retain the full payload allocation and its single charge while receiving
+    // successive prefixes. The slot stays active until the remainder is back.
+    pub(super) payload_offset: usize,
+    pub(super) charge: PacketCharge,
     pub(super) switch_ref: Option<SwitchRef>,
+}
+
+pub(super) enum EnqueueError {
+    Full(Packet),
+    Failed(Error),
+}
+
+/// The bounded receive queue keeps an in-flight packet's slot until any
+/// remaining payload has been put back. All methods run under the device
+/// register lock; the pollee reports space in this queue, not peer credit.
+struct InboundQueue<T> {
+    pending: VecDeque<T>,
+    active: usize,
+    space: Pollee,
+}
+
+impl<T> InboundQueue<T> {
+    fn new() -> Self {
+        Self {
+            pending: VecDeque::with_capacity(MAX_INBOUND),
+            active: 0,
+            space: Pollee::new(),
+        }
+    }
+
+    fn has_space(&self) -> bool {
+        self.pending.len() + self.active < MAX_INBOUND
+    }
+
+    fn push(&mut self, packet: T) -> Result<(), T> {
+        if !self.has_space() {
+            return Err(packet);
+        }
+        self.pending.push_back(packet);
+        if !self.has_space() {
+            self.space.invalidate();
+        }
+        Ok(())
+    }
+
+    fn take(&mut self) -> Option<T> {
+        let packet = self.pending.pop_front()?;
+        self.active += 1;
+        Some(packet)
+    }
+
+    fn finish(&mut self, remaining: Option<T>) {
+        let was_full = !self.has_space();
+        self.active -= 1;
+        if let Some(remaining) = remaining {
+            self.pending.push_front(remaining);
+        }
+        self.notify_space(was_full);
+    }
+
+    fn remove(&mut self, index: usize) -> Option<T> {
+        let was_full = !self.has_space();
+        let packet = self.pending.remove(index);
+        self.notify_space(was_full);
+        packet
+    }
+
+    fn clear(&mut self) -> VecDeque<T> {
+        let was_full = !self.has_space();
+        let pending = core::mem::take(&mut self.pending);
+        self.notify_space(was_full);
+        pending
+    }
+
+    fn notify_space(&self, was_full: bool) {
+        if was_full && self.has_space() {
+            self.space.notify(IoEvents::OUT);
+        }
+    }
 }
 
 impl Registers {
@@ -151,8 +287,8 @@ impl Registers {
             rx: VecDeque::with_capacity(QUEUE_SIZE),
             tx: VecDeque::with_capacity(QUEUE_SIZE),
             events: VecDeque::with_capacity(1),
-            inbound: VecDeque::with_capacity(MAX_INBOUND),
-            next_rx: false,
+            inbound: InboundQueue::new(),
+            rx_is_next: false,
         }
     }
 
@@ -161,8 +297,8 @@ impl Registers {
         self.rx.clear();
         self.tx.clear();
         self.events.clear();
-        let pending = core::mem::take(&mut self.inbound);
-        self.next_rx = false;
+        let pending = self.inbound.clear();
+        self.rx_is_next = false;
         for queue in &mut self.queues {
             queue.ready = false;
             queue.last_avail = 0;
@@ -190,6 +326,12 @@ impl Registers {
 
 /// A device instance is bound to one immutable, Host-assigned CID.
 pub(super) struct VirtioVsock {
+    #[cfg(kernelet_host_connect_gate)]
+    connect_gate_used: AtomicU32,
+    #[cfg(kernelet_host_connect_gate)]
+    connect_gate: SpinLock<Option<ConnectGate>>,
+    #[cfg(kernelet_host_connect_gate)]
+    connect_gate_changes: Arc<WaitQueue>,
     kernelet: Arc<Kernelet>,
     admission: Arc<Admission>,
     _reservation: EndpointReservation,
@@ -200,7 +342,31 @@ pub(super) struct VirtioVsock {
     registers: SpinLock<Registers>,
     interrupt_status: AtomicU32,
     changes: WaitQueue,
+    inbound_space: Pollee,
     worker_started: AtomicBool,
+}
+
+/// Retains the inbound slot while the worker copies a packet. A partial
+/// packet replaces that slot; reset discards any remainder from the old
+/// generation. Drop also releases the slot if the copy unwinds.
+struct InboundReceive<'a> {
+    device: &'a VirtioVsock,
+    generation: u64,
+    remaining: Option<QueuedPacket>,
+}
+
+impl Drop for InboundReceive<'_> {
+    fn drop(&mut self) {
+        let mut registers = self.device.registers.lock();
+        let remaining = if registers.generation == self.generation && !registers.cancelled {
+            self.remaining.take()
+        } else {
+            None
+        };
+        registers.inbound.finish(remaining);
+        // Any rejected remainder's charges and peer references drop only
+        // after this guard releases the device register lock.
+    }
 }
 
 impl VirtioVsock {
@@ -219,7 +385,15 @@ impl VirtioVsock {
             ));
         }
         let memory = kernelet.guest_memory();
+        let registers = Registers::new();
+        let inbound_space = registers.inbound.space.clone();
         let device = Arc::new(Self {
+            #[cfg(kernelet_host_connect_gate)]
+            connect_gate_used: AtomicU32::new(0),
+            #[cfg(kernelet_host_connect_gate)]
+            connect_gate: SpinLock::new(None),
+            #[cfg(kernelet_host_connect_gate)]
+            connect_gate_changes: Arc::new(WaitQueue::new()),
             kernelet,
             admission,
             _reservation: reservation,
@@ -227,9 +401,10 @@ impl VirtioVsock {
             cid,
             irq,
             switch: switch.clone(),
-            registers: SpinLock::new(Registers::new()),
+            registers: SpinLock::new(registers),
             interrupt_status: AtomicU32::new(0),
             changes: WaitQueue::new(),
+            inbound_space,
             worker_started: AtomicBool::new(false),
         });
         // CIDs are allocated monotonically by CREATE and must be unique.
@@ -249,35 +424,150 @@ impl VirtioVsock {
         let pending = {
             let mut registers = self.registers.lock();
             registers.cancelled = true;
-            core::mem::take(&mut registers.inbound)
+            registers.inbound.clear()
         };
         drop(pending);
+        self.inbound_space.notify(IoEvents::ERR);
         self.changes.wake_all();
+        #[cfg(kernelet_host_connect_gate)]
+        self.connect_gate_changes.wake_all();
     }
 
     /// Called by the switch without holding its routing lock.
     pub(super) fn enqueue(&self, packet: Packet) -> bool {
-        self.enqueue_with_ref(packet, None)
+        self.try_enqueue(packet).is_ok()
     }
 
-    pub(super) fn enqueue_with_ref(&self, packet: Packet, switch_ref: Option<SwitchRef>) -> bool {
-        let (owner, admission) = self.switch.charge_account(packet.src_cid, self);
-        let bytes = size_of::<Packet>() + packet.payload.len();
-        let Some(charge) = PacketCharge::reserve(owner, admission, bytes) else {
-            return false;
+    pub(super) fn try_enqueue(&self, packet: Packet) -> core::result::Result<(), EnqueueError> {
+        self.try_enqueue_with_ref(packet, None)
+            .map_err(|(error, _)| error)
+    }
+
+    /// Returns the original connection lease on failure, without cloning it.
+    pub(super) fn enqueue_with_ref(
+        &self,
+        packet: Packet,
+        switch_ref: Option<SwitchRef>,
+    ) -> core::result::Result<(), (EnqueueError, Option<SwitchRef>)> {
+        self.try_enqueue_with_ref(packet, switch_ref)
+    }
+
+    fn try_enqueue_with_ref(
+        &self,
+        packet: Packet,
+        mut switch_ref: Option<SwitchRef>,
+    ) -> core::result::Result<(), (EnqueueError, Option<SwitchRef>)> {
+        let mut packet = packet;
+        let charge = if let Some(charge) = packet.payload_charge.take() {
+            // Guest TX charged its authenticated sender; Host TX charged the
+            // endpoint's instance before creating this payload. Do not look up
+            // a possibly retired sender or charge these bytes a second time.
+            charge
+        } else {
+            if packet.payload.capacity() != 0 {
+                return Err((
+                    EnqueueError::Failed(Error::with_message(
+                        Errno::EINVAL,
+                        "vsock payload has no reservation",
+                    )),
+                    switch_ref,
+                ));
+            }
+            let (owner, admission) = self.switch.charge_account(packet.src_cid, self);
+            PacketCharge::try_reserve(owner, admission, size_of::<Packet>())
+                .map_err(|error| (EnqueueError::Failed(error), switch_ref.take()))?
         };
-        let mut registers = self.registers.lock();
-        if registers.cancelled || registers.inbound.len() == MAX_INBOUND {
-            return false;
-        }
-        registers.inbound.push_back(QueuedPacket {
+        let mut queued = QueuedPacket {
             packet,
+            payload_offset: 0,
             charge,
             switch_ref,
-        });
+        };
+        let mut registers = self.registers.lock();
+        if registers.cancelled {
+            drop(registers);
+            let reference = queued.switch_ref.take();
+            drop(queued);
+            return Err((
+                EnqueueError::Failed(Error::with_message(
+                    Errno::ENODEV,
+                    "kernelet vsock device cancelled",
+                )),
+                reference,
+            ));
+        }
+        let queued = registers.inbound.push(queued);
         drop(registers);
+        if let Err(mut queued) = queued {
+            // Full returns a packet for retry. Payload memory must remain
+            // charged for as long as that caller holds it. Empty control
+            // packets retain the existing no-reservation-on-Full behavior.
+            if queued.packet.payload.capacity() != 0 {
+                queued.packet.payload_charge = Some(queued.charge);
+            }
+            return Err((EnqueueError::Full(queued.packet), queued.switch_ref));
+        }
         self.changes.wake_all();
-        true
+        #[cfg(kernelet_host_connect_gate)]
+        self.connect_gate_changes.wake_all();
+        Ok(())
+    }
+
+    /// Pollers subscribe directly to the destination queue's space changes;
+    /// freeing a slot does not scan or broadcast to unrelated endpoints.
+    pub(super) fn poll_inbound_space(&self, poller: Option<&mut PollHandle>) -> IoEvents {
+        self.inbound_space.poll_with(IoEvents::OUT, poller, || {
+            let registers = self.registers.lock();
+            if registers.cancelled {
+                IoEvents::ERR
+            } else if registers.inbound.has_space() {
+                IoEvents::OUT
+            } else {
+                IoEvents::empty()
+            }
+        })
+    }
+
+    pub(super) fn poll_cancelled(&self, poller: Option<&mut PollHandle>) -> IoEvents {
+        if let Some(poller) = poller {
+            self.inbound_space.register_poller(poller, IoEvents::ERR);
+        }
+        if self.registers.lock().cancelled {
+            IoEvents::ERR
+        } else {
+            IoEvents::empty()
+        }
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn take_inbound_for_ktest(&self) -> Option<Packet> {
+        let queued = {
+            let mut registers = self.registers.lock();
+            let queued = registers.inbound.take()?;
+            registers.inbound.finish(None);
+            queued
+        };
+        // Use the production slot-release notification and dispose the
+        // packet's charge after the register lock has been released.
+        Some(queued.packet)
+    }
+
+    #[cfg(ktest)]
+    pub(super) fn take_control_for_ktest(&self) -> Option<Packet> {
+        self.take_control(&self.registers.lock())
+    }
+
+    fn take_control(&self, registers: &Registers) -> Option<Packet> {
+        self.switch
+            .take_host_control(self.cid, |host_port, peer_port| {
+                // Do not publish newer credit ahead of an older header on the
+                // same stream. Other streams cannot consume its reserved state.
+                registers.inbound.pending.iter().any(|queued| {
+                    queued.packet.src_cid == 2
+                        && queued.packet.src_port == host_port
+                        && queued.packet.dst_port == peer_port
+                })
+            })
     }
 
     pub(super) fn account_owner(&self) -> Arc<Kernelet> {
@@ -290,6 +580,8 @@ impl VirtioVsock {
 
     pub(super) fn wake_notice(&self) {
         self.changes.wake_all();
+        #[cfg(kernelet_host_connect_gate)]
+        self.connect_gate_changes.wake_all();
     }
 
     pub(super) fn read(&self, offset: u32, width: u32) -> MmioResult {
@@ -384,6 +676,8 @@ impl VirtioVsock {
                 }
                 self.collect_requests(&mut registers, index);
                 self.changes.wake_all();
+                #[cfg(kernelet_host_connect_gate)]
+                self.connect_gate_changes.wake_all();
             }
             0x64 => {
                 self.interrupt_status.fetch_and(!value, Ordering::AcqRel);
@@ -394,6 +688,8 @@ impl VirtioVsock {
                     self.interrupt_status.store(0, Ordering::Release);
                     drop(registers);
                     drop(pending);
+                    #[cfg(kernelet_host_connect_gate)]
+                    self.connect_gate_changes.wake_all();
                     return 0;
                 } else {
                     registers.status = value;
@@ -421,17 +717,14 @@ impl VirtioVsock {
         } else {
             QUEUE_SIZE
         };
-        queue.num > 0
-            && queue.num as usize <= max
-            && queue.num.is_power_of_two()
-            && queue.desc.is_multiple_of(16)
-            && queue.avail.is_multiple_of(2)
-            && queue.used.is_multiple_of(4)
-            && self.memory.contains(queue.desc, queue.num as usize * 16)
-            && self
-                .memory
-                .contains(queue.avail, 6 + queue.num as usize * 2)
-            && self.memory.contains(queue.used, 6 + queue.num as usize * 8)
+        super::virtio_mmio::layout_valid(
+            &self.memory,
+            queue.num,
+            max,
+            queue.desc,
+            queue.avail,
+            queue.used,
+        )
     }
 
     fn collect_requests(&self, registers: &mut Registers, index: usize) {
@@ -499,14 +792,9 @@ impl VirtioVsock {
             let mut bytes = [0u8; 16];
             self.read_guest(queue.desc.checked_add(slot as u64 * 16)?, &mut bytes)
                 .ok()?;
-            let buffer = Buffer {
-                paddr: u64::from_le_bytes(bytes[0..8].try_into().ok()?),
-                len: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
-                flags: u16::from_le_bytes(bytes[12..14].try_into().ok()?),
-                next: u16::from_le_bytes(bytes[14..16].try_into().ok()?),
-            };
+            let buffer = Buffer::decode(bytes);
             let next_capacity = request.capacity.checked_add(buffer.len as usize)?;
-            if buffer.flags & 4 != 0
+            if !buffer.supported()
                 || buffer.writable() != (index != TX)
                 || next_capacity > MAX_PACKET_BYTES
                 || !self.memory.contains(buffer.paddr, buffer.len as usize)
@@ -535,6 +823,13 @@ impl VirtioVsock {
             return;
         }
         loop {
+            // This adopted worker processes one bounded packet/header per
+            // iteration. Throttle before claiming a request or taking locks.
+            if self.kernelet.wait_for_cpu_budget().is_err() {
+                break;
+            }
+            #[cfg(kernelet_host_connect_gate)]
+            self.hold_connect_request();
             if self.changes.wait_until(|| self.take_work()) {
                 break;
             }
@@ -554,10 +849,21 @@ impl VirtioVsock {
             let request = registers.rx.pop_front().unwrap();
             registers.active += 1;
             drop(registers);
-            self.receive(request, notice);
+            let remaining = self.receive(request, notice);
+            // Switch notices are header-only reset packets.
+            debug_assert!(remaining.is_none());
             return Some(false);
         }
-        if let Some(index) = registers.inbound.iter().position(|queued| {
+        if !registers.rx.is_empty()
+            && let Some(control) = self.take_control(&registers)
+        {
+            let request = registers.rx.pop_front().unwrap();
+            registers.active += 1;
+            drop(registers);
+            self.publish_packet(request, &control, 0..0, None);
+            return Some(false);
+        }
+        if let Some(index) = registers.inbound.pending.iter().position(|queued| {
             !self
                 .switch
                 .delivery_live(&queued.packet, queued.switch_ref.as_ref())
@@ -567,19 +873,29 @@ impl VirtioVsock {
             drop(retired);
             return Some(false);
         }
-        let can_rx = !registers.rx.is_empty() && !registers.inbound.is_empty();
-        if can_rx && (registers.next_rx || registers.tx.is_empty()) {
+        let can_rx = !registers.rx.is_empty() && !registers.inbound.pending.is_empty();
+        if can_rx && (registers.rx_is_next || registers.tx.is_empty()) {
+            #[cfg(kernelet_host_connect_gate)]
+            if self.prepare_connect_gate(&registers) {
+                return Some(false);
+            }
             let request = registers.rx.pop_front().unwrap();
-            let packet = registers.inbound.pop_front().unwrap();
+            let packet = registers.inbound.take().unwrap();
+            let generation = request.generation;
             registers.active += 1;
-            registers.next_rx = false;
+            registers.rx_is_next = false;
             drop(registers);
-            self.receive(request, packet);
+            let mut inbound = InboundReceive {
+                device: self,
+                generation,
+                remaining: None,
+            };
+            inbound.remaining = self.receive(request, packet);
             return Some(false);
         }
         if let Some(request) = registers.tx.pop_front() {
             registers.active += 1;
-            registers.next_rx = true;
+            registers.rx_is_next = true;
             drop(registers);
             self.transmit(request);
             return Some(false);
@@ -587,106 +903,207 @@ impl VirtioVsock {
         None
     }
 
+    #[cfg(kernelet_host_connect_gate)]
+    fn prepare_connect_gate(&self, registers: &Registers) -> bool {
+        let packet = &registers.inbound.pending.front().unwrap().packet;
+        if packet.src_cid != 2 || packet.dst_cid != self.cid || packet.op != Packet::REQUEST {
+            return false;
+        }
+        let (bit, delay_ms) = match packet.dst_port {
+            19003 => (1, 3000),
+            19004 => (2, 5000),
+            _ => return false,
+        };
+        let Some(identity) = self
+            .switch
+            .connect_gate_identity(self.cid, packet.src_port, self)
+        else {
+            return false;
+        };
+        if self.connect_gate_used.fetch_or(bit, Ordering::AcqRel) & bit != 0 {
+            return false;
+        }
+        *self.connect_gate.lock() = Some(ConnectGate {
+            identity,
+            generation: registers.generation,
+            host_port: packet.src_port,
+            peer_port: packet.dst_port,
+            delay_ms,
+        });
+        // The worker returns to its outer loop before parking: neither the
+        // Guest RX descriptor nor inbound packet has been taken or copied.
+        true
+    }
+
+    #[cfg(kernelet_host_connect_gate)]
+    fn hold_connect_request(&self) {
+        use core::time::Duration;
+
+        use crate::{process::signal::PollAdaptor, time::wait::WaitTimeout};
+        let gate = self.connect_gate.lock().take();
+        let Some(gate) = gate else { return };
+        let changes = self.connect_gate_changes.clone();
+        let mut observer = PollAdaptor::with_observer(ConnectGateWake(changes.clone()));
+        let subscribed = self
+            .switch
+            .poll_connect_gate_cancelled(&gate.identity, Some(observer.as_handle_mut()));
+        let start = aster_time::read_monotonic_time();
+        ostd::early_println!(
+            "HOST_CONNECT_GATE_BEGIN cid={} host_port={} peer_port={} generation={} delay_ms={} rx_ready_at_arm=true before_take=true",
+            self.cid,
+            gate.host_port,
+            gate.peer_port,
+            gate.generation,
+            gate.delay_ms
+        );
+        let result = changes.wait_until_or_timeout(
+            || {
+                let local_live = {
+                    let registers = self.registers.lock();
+                    !registers.cancelled
+                        && registers.generation == gate.generation
+                        && registers.inbound.pending.front().is_some_and(|queued| {
+                            queued.packet.src_cid == 2
+                                && queued.packet.src_port == gate.host_port
+                                && queued.packet.dst_cid == self.cid
+                                && queued.packet.dst_port == gate.peer_port
+                                && queued.packet.op == Packet::REQUEST
+                        })
+                };
+                let cancelled = subscribed.contains(IoEvents::ERR)
+                    || self
+                        .switch
+                        .poll_connect_gate_cancelled(&gate.identity, None)
+                        .contains(IoEvents::ERR);
+                (!local_live || cancelled).then_some(())
+            },
+            &Duration::from_millis(gate.delay_ms),
+        );
+        let elapsed = aster_time::read_monotonic_time().saturating_sub(start);
+        let reason = match &result {
+            Ok(()) => "cancel_or_identity_change",
+            Err(error) if error.error() == Errno::ETIME => "hold_timeout",
+            Err(_) => "hold_error",
+        };
+        ostd::early_println!(
+            "HOST_CONNECT_GATE_END cid={} host_port={} peer_port={} generation={} elapsed_ns={} reason={} result={:?}",
+            self.cid,
+            gate.host_port,
+            gate.peer_port,
+            gate.generation,
+            elapsed.as_nanos(),
+            reason,
+            result
+        );
+    }
+
     fn transmit(&self, request: Request) {
-        let mut bytes = [0u8; MAX_PACKET_BYTES];
-        let mut offset = 0;
-        for buffer in request.buffers[..request.len].iter() {
-            let len = buffer.len as usize;
-            if self
-                .read_guest(buffer.paddr, &mut bytes[offset..offset + len])
-                .is_err()
-            {
-                self.registers.lock().status |= DEVICE_NEEDS_RESET;
-                self.complete(TX, request, 0);
-                return;
-            }
-            offset += len;
-        }
-        if let Some(packet) = Packet::from_bytes(&bytes[..offset]) {
-            self.switch.route(self.cid, packet);
-        } else {
+        let mut cursor = BufferCursor::new(&request.buffers[..request.len]);
+        let header = Packet::read_header_from(request.capacity, |bytes| {
+            cursor.copy(bytes.len(), |paddr, range| {
+                self.read_packet_guest(paddr, &mut bytes[range])
+            })
+        });
+        let Ok(Some((mut packet, payload_len))) = header else {
             self.registers.lock().status |= DEVICE_NEEDS_RESET;
+            self.complete(TX, request, 0);
+            return;
+        };
+        if packet
+            .prepare_payload(payload_len, self.kernelet.clone(), self.admission.clone())
+            .is_err()
+        {
+            // Resource rejection is a stream reset, not a malformed virtqueue.
+            // Use the authenticated CID even though the header is untrusted.
+            self.switch.reject_packet(self.cid, &packet);
+            drop(packet);
+            self.complete(TX, request, 0);
+            return;
         }
+        if cursor
+            .copy(payload_len, |paddr, range| {
+                self.read_packet_guest(paddr, &mut packet.payload[range])
+            })
+            .is_err()
+        {
+            self.registers.lock().status |= DEVICE_NEEDS_RESET;
+            drop(packet);
+            self.complete(TX, request, 0);
+            return;
+        }
+        self.switch.route(self.cid, packet);
         self.complete(TX, request, 0);
     }
 
-    fn receive(&self, request: Request, mut queued: QueuedPacket) {
-        let packet = &mut queued.packet;
+    fn receive(&self, request: Request, mut queued: QueuedPacket) -> Option<QueuedPacket> {
+        let packet = &queued.packet;
         if !self
             .switch
             .delivery_live(packet, queued.switch_ref.as_ref())
         {
             self.repark_receive(request);
-            return;
+            return None;
         }
-        if request.capacity < Packet::HEADER_LEN + packet.payload.len() {
-            if packet.op != Packet::RW || request.capacity <= Packet::HEADER_LEN {
-                self.registers.lock().status |= DEVICE_NEEDS_RESET;
-                self.complete(RX, request, 0);
-                return;
-            }
-            let deferred = Packet {
-                src_cid: packet.src_cid,
-                dst_cid: packet.dst_cid,
-                src_port: packet.src_port,
-                dst_port: packet.dst_port,
-                op: packet.op,
-                flags: packet.flags,
-                buf_alloc: packet.buf_alloc,
-                fwd_cnt: packet.fwd_cnt,
-                payload: packet
-                    .payload
-                    .split_off(request.capacity - Packet::HEADER_LEN),
-            };
-            let mut registers = self.registers.lock();
-            if registers.generation == request.generation {
-                registers.inbound.push_front(QueuedPacket {
-                    packet: deferred,
-                    charge: queued.charge.clone(),
-                    switch_ref: queued.switch_ref.clone(),
-                });
-            }
-        }
-        let mut bytes = [0u8; MAX_PACKET_BYTES];
-        let Some(len) = packet.to_bytes(&mut bytes) else {
+        let remaining = packet.payload.len() - queued.payload_offset;
+        let count = remaining.min(request.capacity.saturating_sub(Packet::HEADER_LEN));
+        if request.capacity < Packet::HEADER_LEN + remaining
+            && (packet.op != Packet::RW || request.capacity <= Packet::HEADER_LEN)
+        {
             self.registers.lock().status |= DEVICE_NEEDS_RESET;
             self.complete(RX, request, 0);
-            return;
-        };
-        // Ingress category: the receiving instance pays for copying the
-        // received packet into its guest buffers. Only the copy is charged:
-        // the parked-wait and liveness rechecks around it are not execution.
+            return None;
+        }
+        let end = queued.payload_offset + count;
+        if self.publish_packet(
+            request,
+            packet,
+            queued.payload_offset..end,
+            queued.switch_ref.as_ref(),
+        ) && end < packet.payload.len()
+        {
+            queued.payload_offset = end;
+            Some(queued)
+        } else {
+            None
+        }
+    }
+
+    fn publish_packet(
+        &self,
+        request: Request,
+        packet: &Packet,
+        range: core::ops::Range<usize>,
+        reference: Option<&SwitchRef>,
+    ) -> bool {
+        if !self.switch.delivery_live(packet, reference) {
+            self.repark_receive(request);
+            return false;
+        }
+        if request.capacity < Packet::HEADER_LEN + range.len() {
+            self.registers.lock().status |= DEVICE_NEEDS_RESET;
+            self.complete(RX, request, 0);
+            return false;
+        }
+        // Ingress category: only the actual copy, not waits or liveness checks.
         let span = ChargedSpan::new(&self.kernelet, WorkCategory::Ingress);
-        let mut offset = 0;
-        let mut copy_failed = false;
-        for buffer in request.buffers[..request.len].iter() {
-            let count = (len - offset).min(buffer.len as usize);
-            if count == 0 {
-                break;
-            }
-            if self
-                .write_guest(buffer.paddr, &bytes[offset..offset + count])
-                .is_err()
-            {
-                copy_failed = true;
-                break;
-            }
-            offset += count;
-        }
+        let mut cursor = BufferCursor::new(&request.buffers[..request.len]);
+        let copied = packet.write_range_to(range, |bytes| {
+            cursor.copy(bytes.len(), |paddr, range| {
+                self.write_packet_guest(paddr, &bytes[range])
+            })
+        });
         drop(span);
-        if copy_failed {
+        let Ok(Some(len)) = copied else {
             self.registers.lock().status |= DEVICE_NEEDS_RESET;
             self.complete(RX, request, 0);
-            return;
-        }
-        if !self
-            .switch
-            .delivery_live(packet, queued.switch_ref.as_ref())
-        {
+            return false;
+        };
+        if !self.switch.delivery_live(packet, reference) {
             self.repark_receive(request);
-            return;
+            return false;
         }
         self.complete(RX, request, len as u32);
+        true
     }
 
     fn repark_receive(&self, request: Request) {
@@ -713,11 +1130,15 @@ impl VirtioVsock {
         queue.retire(request.head);
         let slot = queue.next_used as u32 % queue.num;
         let used_entry = queue.used + 4 + slot as u64 * 8;
-        let _ = self.write_guest(used_entry, &(request.head as u32).to_le_bytes());
-        let _ = self.write_guest(used_entry + 4, &used_len.to_le_bytes());
+        let mut entry = [0u8; 8];
+        entry[..4].copy_from_slice(&(request.head as u32).to_le_bytes());
+        entry[4..].copy_from_slice(&used_len.to_le_bytes());
+        let _ = self.write_guest(used_entry, &entry);
         queue.next_used = queue.next_used.wrapping_add(1);
-        let _ = self.write_guest(queue.used + 2, &queue.next_used.to_le_bytes());
         fence(Ordering::Release);
+        let _ = self
+            .memory
+            .write_u16_once(queue.used + 2, queue.next_used.to_le());
         self.interrupt_status.fetch_or(1, Ordering::Release);
         drop(registers);
         let _ = self.kernelet.raise_irq(self.irq);
@@ -725,9 +1146,9 @@ impl VirtioVsock {
     }
 
     fn read_u16(&self, paddr: u64) -> ostd::Result<u16> {
-        let mut bytes = [0u8; 2];
-        self.read_guest(paddr, &mut bytes)?;
-        Ok(u16::from_le_bytes(bytes))
+        let value = self.memory.read_u16_once(paddr)?;
+        fence(Ordering::Acquire);
+        Ok(u16::from_le(value))
     }
 
     fn read_guest(&self, paddr: u64, dst: &mut [u8]) -> ostd::Result<()> {
@@ -736,6 +1157,38 @@ impl VirtioVsock {
             reader
                 .read_fallible(&mut writer)
                 .map_err(|(error, _)| error)
+        })??;
+        Ok(())
+    }
+
+    fn read_packet_guest(&self, paddr: u64, dst: &mut [u8]) -> ostd::Result<()> {
+        self.memory.with_reader(paddr, dst.len(), |reader| {
+            let mut writer = VmWriter::from(dst).to_fallible();
+            #[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
+            let copied = super::io_copy_profile::measure_fallible(
+                super::io_copy_profile::Category::VsockTx,
+                writer.avail(),
+                || reader.read_fallible(&mut writer),
+            );
+            #[cfg(not(all(kernelet_rq1_diagnostics, not(feature = "kernelet"))))]
+            let copied = reader.read_fallible(&mut writer);
+            copied.map_err(|(error, _)| error)
+        })??;
+        Ok(())
+    }
+
+    fn write_packet_guest(&self, paddr: u64, src: &[u8]) -> ostd::Result<()> {
+        self.memory.with_writer(paddr, src.len(), |writer| {
+            let mut reader = VmReader::from(src).to_fallible();
+            #[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
+            let copied = super::io_copy_profile::measure_fallible(
+                super::io_copy_profile::Category::VsockRx,
+                reader.remain(),
+                || reader.read_fallible(writer),
+            );
+            #[cfg(not(all(kernelet_rq1_diagnostics, not(feature = "kernelet"))))]
+            let copied = reader.read_fallible(writer);
+            copied.map_err(|(error, _)| error)
         })??;
         Ok(())
     }
@@ -756,10 +1209,139 @@ impl Drop for VirtioVsock {
 }
 
 #[cfg(ktest)]
-mod reset_tests {
+mod tests {
+    use core::sync::atomic::AtomicUsize;
+
     use ostd::prelude::*;
 
-    use super::{DEVICE_NEEDS_RESET, QUEUE_SIZE, Registers};
+    use super::*;
+    use crate::{events::Observer, process::signal::PollAdaptor};
+
+    struct WriteNotifications(Arc<AtomicUsize>);
+
+    impl Observer<IoEvents> for WriteNotifications {
+        fn on_events(&self, events: &IoEvents) {
+            assert!(events.contains(IoEvents::OUT));
+            self.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    fn writer_observer() -> (Arc<AtomicUsize>, PollAdaptor<WriteNotifications>) {
+        let notifications = Arc::new(AtomicUsize::new(0));
+        let writer = PollAdaptor::with_observer(WriteNotifications(notifications.clone()));
+        (notifications, writer)
+    }
+
+    fn poll_space(
+        queue: &SpinLock<InboundQueue<usize>>,
+        poller: Option<&mut PollHandle>,
+    ) -> IoEvents {
+        let space = queue.lock().space.clone();
+        space.poll_with(IoEvents::OUT, poller, || {
+            if queue.lock().has_space() {
+                IoEvents::OUT
+            } else {
+                IoEvents::empty()
+            }
+        })
+    }
+
+    fn fill(queue: &SpinLock<InboundQueue<usize>>) {
+        let mut queue = queue.lock();
+        for packet in 0..MAX_INBOUND {
+            queue.push(packet).unwrap();
+        }
+    }
+
+    #[ktest]
+    fn vsock_writer_wakes_when_full_queue_gains_space() {
+        // Regression: freeing inbound space never notified Host OUT waiters.
+        let queue = SpinLock::new(InboundQueue::new());
+        // Cache the initial writable state before filling the queue.
+        assert_eq!(poll_space(&queue, None), IoEvents::OUT);
+        fill(&queue);
+        let (notifications, mut writer) = writer_observer();
+        assert!(poll_space(&queue, Some(writer.as_handle_mut())).is_empty());
+        assert_eq!(queue.lock().take(), Some(0));
+        // The worker can still split this packet, so its slot is retained.
+        assert!(queue.lock().push(MAX_INBOUND).is_err());
+        assert!(poll_space(&queue, None).is_empty());
+        queue.lock().finish(None);
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert_eq!(poll_space(&queue, None), IoEvents::OUT);
+        queue.lock().push(MAX_INBOUND).unwrap();
+        assert!(poll_space(&queue, None).is_empty());
+    }
+
+    #[ktest]
+    fn vsock_partial_receive_keeps_its_queue_slot() {
+        let queue = SpinLock::new(InboundQueue::new());
+        fill(&queue);
+        let (notifications, mut writer) = writer_observer();
+        assert!(poll_space(&queue, Some(writer.as_handle_mut())).is_empty());
+        let packet = queue.lock().take();
+        queue.lock().finish(packet);
+        assert!(poll_space(&queue, None).is_empty());
+        assert_eq!(notifications.load(Ordering::Relaxed), 0);
+        assert_eq!(queue.lock().take(), Some(0));
+        queue.lock().finish(None);
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert_eq!(poll_space(&queue, None), IoEvents::OUT);
+    }
+
+    #[ktest]
+    fn vsock_space_recovered_before_poll_is_observed() {
+        let queue = SpinLock::new(InboundQueue::new());
+        fill(&queue);
+        assert!(poll_space(&queue, None).is_empty());
+        queue.lock().take().unwrap();
+        queue.lock().finish(None);
+        let (_, mut writer) = writer_observer();
+        assert_eq!(
+            poll_space(&queue, Some(writer.as_handle_mut())),
+            IoEvents::OUT
+        );
+    }
+
+    #[ktest]
+    fn vsock_space_recovery_during_poll_is_not_lost() {
+        let queue = SpinLock::new(InboundQueue::new());
+        fill(&queue);
+        let space = queue.lock().space.clone();
+        let (notifications, mut writer) = writer_observer();
+        // Force recovery after readiness was read but before poll caches it.
+        let events = space.poll_with(IoEvents::OUT, Some(writer.as_handle_mut()), || {
+            assert!(!queue.lock().has_space());
+            queue.lock().take().unwrap();
+            queue.lock().finish(None);
+            IoEvents::empty()
+        });
+        assert!(events.is_empty());
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        assert_eq!(poll_space(&queue, None), IoEvents::OUT);
+    }
+
+    #[ktest]
+    fn vsock_discarded_packets_release_queue_space() {
+        let queue = SpinLock::new(InboundQueue::new());
+        fill(&queue);
+        let (notifications, mut writer) = writer_observer();
+        assert!(poll_space(&queue, Some(writer.as_handle_mut())).is_empty());
+        assert_eq!(queue.lock().remove(0), Some(0));
+        assert_eq!(notifications.load(Ordering::Relaxed), 1);
+        queue.lock().push(MAX_INBOUND).unwrap();
+        queue.lock().take().unwrap();
+        // Reset drops queued packets but the old in-flight slot is live.
+        assert_eq!(queue.lock().clear().len(), MAX_INBOUND - 1);
+        for packet in 0..MAX_INBOUND - 1 {
+            queue.lock().push(packet).unwrap();
+        }
+        assert!(queue.lock().push(MAX_INBOUND).is_err());
+        assert!(poll_space(&queue, None).is_empty());
+        queue.lock().finish(None);
+        assert_eq!(notifications.load(Ordering::Relaxed), 3);
+        assert_eq!(poll_space(&queue, None), IoEvents::OUT);
+    }
 
     #[ktest]
     fn virtio_vsock_reset_waits_for_active_requests() {

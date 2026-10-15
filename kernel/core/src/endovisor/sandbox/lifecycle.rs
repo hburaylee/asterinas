@@ -79,17 +79,11 @@ impl Drop for UnstartedKernelet {
 }
 
 impl SandboxFile {
-    fn watch_exit(&self, kernelet: Arc<Kernelet>, hooks: Arc<SandboxHooks>) {
+    fn watch_exit(&self, kernelet: Arc<Kernelet>) {
         let state = Arc::downgrade(&self.state);
         let pollee = self.pollee.clone();
-        let cid = self.cid;
         reaper::watch_exit(
-            cid,
             kernelet,
-            Box::new(move || {
-                hooks.cancel();
-                vsock_switch::on_dying(cid);
-            }),
             Box::new(move |exit| {
                 let Some(state) = state.upgrade() else {
                     return;
@@ -125,6 +119,8 @@ impl SandboxFile {
                 }
             }
         };
+        #[cfg(ktest)]
+        tests::before_start_pending(self);
         let mut created = false;
         let (kernelet, hooks) = match self.start_pending(&pending, &mut created) {
             Ok(started) => started,
@@ -159,6 +155,10 @@ impl SandboxFile {
                 if let Some(pending) = pending {
                     pending.revoke_endpoints();
                 }
+                if terminal {
+                    // No instance was created to run its on_dying hook.
+                    vsock_switch::on_dying(self.cid);
+                }
                 self.start_waiters.wake_all();
                 if terminal {
                     self.pollee.notify(IoEvents::IN);
@@ -184,14 +184,20 @@ impl SandboxFile {
             };
             kill
         };
-        self.watch_exit(kernelet.clone(), hooks.clone());
+        self.watch_exit(kernelet.clone());
         if let Some(reason) = kill {
             let _ = kernelet.kill(KillReason::HostPolicy(reason));
+            // Workers can adopt Created, whose inline kill skips on_dying.
+            hooks.cancel();
+            vsock_switch::on_dying(self.cid);
             self.start_waiters.wake_all();
             return_errno_with_message!(Errno::EINTR, "kernelet start was killed");
         }
-        if kernelet.start(hooks.clone()).is_err() {
+        if kernelet.start().is_err() {
             let _ = kernelet.kill(KillReason::Requested);
+            // A concurrent kill can win before OSTD publishes Running.
+            hooks.cancel();
+            vsock_switch::on_dying(self.cid);
             self.start_waiters.wake_all();
             return_errno_with_message!(Errno::EINTR, "kernelet stopped before start");
         }
@@ -267,8 +273,10 @@ impl SandboxFile {
             devices: &devices,
             cpus: placement.cpu_set(),
         };
-        let admission = Admission::reserve(self.owner, pending.max_grains, pending.num_vcpus, 0)?;
+        let kind = crate::endovisor::image_kind()?;
+        let admission = Admission::reserve_instance(self.owner, kind, &config)?;
         let hooks = Arc::new(SandboxHooks {
+            cid: self.cid,
             devices: Once::new(),
             console_endpoint: pending.console.clone(),
             net_endpoint: pending.net.clone(),
@@ -278,9 +286,8 @@ impl SandboxFile {
             _placement: placement,
             carriers: SpinLock::new(Vec::new()),
         });
-        let kind = crate::endovisor::image_kind()?;
         let kernelet = kind
-            .create(&config, hooks.as_ref())
+            .create(&config, hooks.clone())
             .map_err(|_| Error::with_message(Errno::EINVAL, "cannot create kernelet"))?;
         *created = true;
         admission.mark_created();
@@ -298,6 +305,7 @@ impl SandboxFile {
             .map(|(index, block)| {
                 VirtioBlock::new(
                     kernelet.clone(),
+                    admission.clone(),
                     block.backing.clone(),
                     block.capacity_sectors,
                     block.read_only,
@@ -453,7 +461,8 @@ impl SandboxFile {
                     status,
                     retry_queued: false,
                 } => (kernelet, hooks, status),
-                SandboxState::Gone(status) => {
+                SandboxState::Gone(mut status) => {
+                    status.state = STATE_DESTROYED;
                     *state = SandboxState::Gone(status);
                     return Ok(());
                 }
@@ -534,6 +543,113 @@ impl SandboxFile {
                 pollee.notify(IoEvents::IN);
             })),
         );
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use core::sync::atomic::{AtomicU32, Ordering};
+
+    use ostd::{prelude::*, task::TaskOptions};
+
+    use super::{
+        super::config::tests::{assert_listener_removed, listener_args, sandbox, wait_for},
+        *,
+    };
+
+    static START_CHECKPOINT_CID: AtomicU32 = AtomicU32::new(0);
+
+    pub(super) fn before_start_pending(sandbox: &SandboxFile) {
+        if START_CHECKPOINT_CID.load(Ordering::Acquire) != sandbox.cid {
+            return;
+        }
+        wait_for(|| {
+            matches!(
+                &*sandbox.state.lock(),
+                SandboxState::Starting { kill: Some(_) }
+            )
+        });
+    }
+
+    #[ktest]
+    fn destroy_after_configuring_kill_publishes_destroyed() {
+        // A successful Destroy must publish completion even after early Kill.
+        let sandbox = sandbox();
+        sandbox.kill(23).unwrap();
+        {
+            let state = sandbox.state.lock();
+            let SandboxState::Gone(status) = &*state else {
+                panic!("configuring Kill did not become terminal");
+            };
+            assert_eq!(status.state, kernelet_abi::STATE_EXITED);
+        }
+        for _ in 0..2 {
+            sandbox.destroy().unwrap();
+            let state = sandbox.state.lock();
+            let SandboxState::Gone(status) = &*state else {
+                panic!("Destroy did not preserve terminal state");
+            };
+            assert_eq!(status.state, STATE_DESTROYED);
+            assert_eq!(status.reason, kernelet_abi::STATUS_REASON_KILLED);
+            assert_eq!(status.code, 23);
+        }
+    }
+
+    #[ktest]
+    fn killed_early_start_removes_listener() {
+        // Regression: early START failure published Gone without switch cleanup.
+        let sandbox = sandbox();
+        let listener = sandbox.create_vsock_listener(listener_args()).unwrap();
+        START_CHECKPOINT_CID.store(sandbox.cid, Ordering::Release);
+        let start_result = Arc::new(Mutex::new(None));
+        let start_task = {
+            let sandbox = sandbox.clone();
+            let result = start_result.clone();
+            TaskOptions::new(move || {
+                *result.lock() = Some(sandbox.start());
+            })
+            .spawn()
+            .unwrap()
+        };
+        wait_for(|| matches!(&*sandbox.state.lock(), SandboxState::Starting { .. }));
+        let kill_result = Arc::new(Mutex::new(None));
+        let kill_task = {
+            let sandbox = sandbox.clone();
+            let result = kill_result.clone();
+            TaskOptions::new(move || {
+                *result.lock() = Some(sandbox.kill(23));
+            })
+            .spawn()
+            .unwrap()
+        };
+        wait_for(|| start_result.lock().is_some() && kill_result.lock().is_some());
+        START_CHECKPOINT_CID.store(0, Ordering::Release);
+        assert_eq!(
+            start_result.lock().take().unwrap().unwrap_err().error(),
+            Errno::ENODEV
+        );
+        kill_result.lock().take().unwrap().unwrap();
+        {
+            let state = sandbox.state.lock();
+            let SandboxState::Gone(status) = &*state else {
+                panic!("killed START did not become terminal");
+            };
+            assert_eq!(status.reason, kernelet_abi::STATUS_REASON_KILLED);
+            assert_eq!(status.code, 23);
+        }
+        assert_listener_removed(&sandbox);
+        sandbox.destroy().unwrap();
+        {
+            let state = sandbox.state.lock();
+            let SandboxState::Gone(status) = &*state else {
+                panic!("killed START did not complete Destroy");
+            };
+            assert_eq!(status.state, STATE_DESTROYED);
+            assert_eq!(status.reason, kernelet_abi::STATUS_REASON_KILLED);
+            assert_eq!(status.code, 23);
+        }
+        drop(listener);
+        drop((start_task, kill_task));
     }
 }
 

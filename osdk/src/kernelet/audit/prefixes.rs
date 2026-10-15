@@ -20,14 +20,25 @@ pub(super) const CONTEXT_SAVE: &[u8] = &[
 ];
 
 pub(super) const VIRQ_BEFORE_CALL: &[u8] = &[
-    0xf3, 0x0f, 0x1e, 0xfa, 0xff, 0x70, 0xf8, 0x48, 0x8b, 0x00, 0xfb, 0x90, 0x9c, 0x50, 0x53, 0x51,
-    0x52, 0x56, 0x57, 0x55, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x41, 0x54, 0x41, 0x55,
-    0x41, 0x56, 0x41, 0x57, 0x48, 0x89, 0xe3, 0x48, 0x83, 0xe4, 0xf0, 0xfc, 0xe8,
+    0xf3, 0x0f, 0x1e, 0xfa, 0x9c, 0x50, 0x53, 0x51, 0x52, 0x56, 0x57, 0x55, 0x41, 0x50, 0x41, 0x51,
+    0x41, 0x52, 0x41, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57, 0x48, 0x89, 0xe3, 0x48,
+    0x83, 0xe4, 0xf0, 0xfc, 0xfb, 0xe8,
 ];
 pub(super) const VIRQ_AFTER_CALL: &[u8] = &[
-    0x48, 0x89, 0xdc, 0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c, 0x41, 0x5b, 0x41, 0x5a, 0x41,
-    0x59, 0x41, 0x58, 0x5d, 0x5f, 0x5e, 0x5a, 0x59, 0x5b, 0x58, 0x9d, 0xc3,
+    0xfa, 0x48, 0x89, 0xdc, 0x48, 0x8b, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x8c, 0x24,
+    0x98, 0x00, 0x00, 0x00, 0x48, 0x8b, 0x94, 0x24, 0xa0, 0x00, 0x00, 0x00, 0x48, 0x81, 0xca, 0x00,
+    0x02, 0x00, 0x00, 0x48, 0x8b, 0xb4, 0x24, 0x88, 0x00, 0x00, 0x00, 0x48, 0x8b, 0xbc, 0x24, 0xb0,
+    0x00, 0x00, 0x00, 0x48, 0x89, 0x84, 0x24, 0x80, 0x00, 0x00, 0x00, 0x48, 0x89, 0x8c, 0x24, 0x88,
+    0x00, 0x00, 0x00, 0x48, 0x89, 0x94, 0x24, 0x90, 0x00, 0x00, 0x00, 0x48, 0x89, 0xb4, 0x24, 0x98,
+    0x00, 0x00, 0x00, 0x48, 0x89, 0xbc, 0x24, 0xa0, 0x00, 0x00, 0x00, 0x41, 0x5f, 0x41, 0x5e, 0x41,
+    0x5d, 0x41, 0x5c, 0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5d, 0x5f, 0x5e, 0x5a, 0x59,
+    0x5b, 0x58, 0x48, 0x83, 0xc4, 0x08, 0x48, 0xcf,
 ];
+
+pub(super) const EXIT_BEFORE_LOAD: &[u8] = &[
+    0xf3, 0x0f, 0x1e, 0xfa, 0x31, 0xff, 0x31, 0xf6, 0x31, 0xd2, 0x31, 0xc9, 0x48, 0x8b, 0x05,
+];
+pub(super) const EXIT_AFTER_LOAD: &[u8] = &[0xff, 0xa0, 0x90, 0x00, 0x00, 0x00];
 
 pub(super) fn audit(
     image: &ElfImage<'_>,
@@ -36,47 +47,91 @@ pub(super) fn audit(
     image_entry: u64,
     vcpu_entry: u64,
     virq_entry: u64,
+    yield_entry: u64,
+    exit_entry: u64,
+    stub_start: u64,
+    stub_end: u64,
 ) -> Result<(), String> {
     let symbol = |name| find_symbol(symbols, names, name);
     let entry = symbol("_kernelet_entry")?;
     let vcpu = symbol("vcpu_entry")?;
     let virq = symbol("virq_entry")?;
+    let yield_ = symbol("yield_entry")?;
+    let exit = symbol("exit_entry")?;
     let context = symbol("context_switch")?;
     let first_context = symbol("first_context_switch")?;
     let task_wrapper = symbol("kernel_task_entry_wrapper")?;
     let task_entry = symbol("kernel_task_entry")?;
 
-    if entry.value != image_entry || vcpu.value != vcpu_entry || virq.value != virq_entry {
+    if entry.value != image_entry
+        || vcpu.value != vcpu_entry
+        || virq.value != virq_entry
+        || yield_.value != yield_entry
+        || exit.value != exit_entry
+        || symbol("__kernelet_stubs_start")?.value != stub_start
+        || symbol("__kernelet_stubs_end")?.value != stub_end
+    {
         return Err("audit item 11: a linked entry symbol disagrees with its entry table".into());
     }
-    // The virtual upcall's two retired words, 16 pushes, alignment (at most
-    // 15 bytes), and direct call use at most 175
-    // bytes. The Host validates a 64 KiB upcall range before this redirection.
-    const VIRQ_PREFIX_BYTES: usize = 16 + 8 + 16 * 8 + 15 + 8;
+    for stub in [virq, yield_, exit] {
+        if stub.value < stub_start
+            || stub
+                .value
+                .checked_add(stub.size)
+                .is_none_or(|end| end > stub_end)
+        {
+            return Err("audit item 11: the stub range does not contain each complete stub".into());
+        }
+    }
+    // Flags and fifteen GPRs are saved before enabling physical interrupts.
+    // The first IRET has consumed the hardware frame before the stub rewrites
+    // it for the final IRET. The Host checks a 64 KiB reserve for this path.
+    const VIRQ_PREFIX_BYTES: usize = 7 * 8 + 16 * 8 + 15 + 8;
     const _: () = assert!(VIRQ_PREFIX_BYTES <= ENTRY_PREFIX_ALLOWANCE);
+    for (stub, name) in [(virq, "virq_entry"), (yield_, "yield_entry")] {
+        let code = symbol_code(
+            image,
+            stub,
+            VIRQ_BEFORE_CALL.len() + 4 + VIRQ_AFTER_CALL.len(),
+            name,
+        )?;
+        let call_end = VIRQ_BEFORE_CALL.len() + 4;
+        if !code.starts_with(VIRQ_BEFORE_CALL) || code[call_end..] != *VIRQ_AFTER_CALL {
+            return Err(format!(
+                "audit item 11: linked {name} returning prefix changed"
+            ));
+        }
+        let dispatch = relative_target(
+            stub.value,
+            call_end,
+            &code[VIRQ_BEFORE_CALL.len()..call_end],
+        )?;
+        if !symbols
+            .iter()
+            .any(|symbol| symbol.value == dispatch && symbol.info & 0xf == 2)
+            || image.bytes_at_vaddr(dispatch, ENDBR64.len() as u64)? != ENDBR64
+        {
+            return Err(format!(
+                "audit item 11: {name} dispatcher is not a linked function entry"
+            ));
+        }
+    }
     let code = symbol_code(
         image,
-        virq,
-        VIRQ_BEFORE_CALL.len() + 4 + VIRQ_AFTER_CALL.len(),
-        "virq_entry",
+        exit,
+        EXIT_BEFORE_LOAD.len() + 4 + EXIT_AFTER_LOAD.len(),
+        "exit_entry",
     )?;
-    let call_end = VIRQ_BEFORE_CALL.len() + 4;
-    if !code.starts_with(VIRQ_BEFORE_CALL) || code[call_end..] != *VIRQ_AFTER_CALL {
-        return Err("audit item 11: linked virtual-interrupt prefix changed".into());
-    }
-    let dispatch = relative_target(
-        virq.value,
-        call_end,
-        &code[VIRQ_BEFORE_CALL.len()..call_end],
-    )?;
-    if !symbols
-        .iter()
-        .any(|symbol| symbol.value == dispatch && symbol.info & 0xf == 2)
-        || image.bytes_at_vaddr(dispatch, ENDBR64.len() as u64)? != ENDBR64
+    let load_end = EXIT_BEFORE_LOAD.len() + 4;
+    if !code.starts_with(EXIT_BEFORE_LOAD)
+        || code[load_end..] != *EXIT_AFTER_LOAD
+        || relative_target(
+            exit.value,
+            load_end,
+            &code[EXIT_BEFORE_LOAD.len()..load_end],
+        )? != symbol("KERNELET_SERVICES")?.value
     {
-        return Err(
-            "audit item 11: virtual interrupt dispatcher is not a linked function entry".into(),
-        );
+        return Err("audit item 11: linked stack-free exit prefix changed".into());
     }
 
     // The new stack bound is published immediately after loading RSP. The

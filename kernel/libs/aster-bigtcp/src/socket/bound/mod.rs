@@ -6,6 +6,8 @@ mod tcp_listen;
 mod udp;
 
 pub use common::NeedIfacePoll;
+#[cfg(kernelet_nat_failure_diag_host)]
+pub use tcp_conn::TcpResetDiagnostic;
 pub use tcp_conn::{ConnectState, RawTcpSocketExt, TcpConnection};
 pub(crate) use tcp_conn::{TcpConnectionBg, TcpProcessResult};
 pub use tcp_listen::TcpListener;

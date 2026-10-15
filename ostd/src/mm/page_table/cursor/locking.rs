@@ -22,7 +22,7 @@ pub(super) fn lock_range<'rcu, C: PageTableConfig>(
     pt: &'rcu PageTable<C>,
     guard: &'rcu dyn InAtomicMode,
     va: &Range<Vaddr>,
-    min_level: PagingLevel,
+    min_lock_level: PagingLevel,
 ) -> Cursor<'rcu, C> {
     // The re-try loop of finding the sub-tree root.
     //
@@ -30,8 +30,10 @@ pub(super) fn lock_range<'rcu, C: PageTableConfig>(
     // there are no safety concerns, the operations of a cursor on an stray
     // sub-tree will not see the current state and will not change the current
     // state, breaking serializability.
-    let mut subtree_root = loop {
-        if let Some(subtree_root) = try_traverse_and_lock_subtree_root(pt, guard, va, min_level) {
+    let (mut subtree_root, mapping_level_limit) = loop {
+        if let Some(subtree_root) =
+            try_traverse_and_lock_subtree_root(pt, guard, va, min_lock_level)
+        {
             break subtree_root;
         }
     };
@@ -50,6 +52,7 @@ pub(super) fn lock_range<'rcu, C: PageTableConfig>(
         rcu_guard: guard,
         level: guard_level,
         guard_level,
+        mapping_level_limit,
         va: va.start,
         barrier_va: va.clone(),
         _phantom: PhantomData,
@@ -81,9 +84,8 @@ pub(super) fn unlock_range<C: PageTableConfig>(cursor: &mut Cursor<'_, C>) {
 
 /// Finds and locks an intermediate page table node that covers the range.
 ///
-/// If that node (or any of its ancestors) does not exist, we need to lock
-/// the parent and create it. After the creation the lock of the parent will
-/// be released and the new node will be locked.
+/// If a descendant does not exist, lock its closest existing ancestor.
+/// Mapping preparation can create the missing descendants under that lock.
 ///
 /// If this function founds that a locked node is stray (because of racing with
 /// page table recycling), it will return `None`. The caller should retry in
@@ -92,79 +94,54 @@ fn try_traverse_and_lock_subtree_root<'rcu, C: PageTableConfig>(
     pt: &PageTable<C>,
     guard: &'rcu dyn InAtomicMode,
     va: &Range<Vaddr>,
-    min_level: PagingLevel,
-) -> Option<PageTableGuard<'rcu, C>> {
-    let mut cur_node_guard: Option<PageTableGuard<C>> = None;
+    min_lock_level: PagingLevel,
+) -> Option<(PageTableGuard<'rcu, C>, PagingLevel)> {
     let mut cur_pt_addr = pt.root.paddr();
+    let mut mapping_level_limit = min_lock_level;
     for cur_level in (1..=C::NR_LEVELS).rev() {
         let start_idx = pte_index::<C>(va.start, cur_level);
-        let level_too_high = {
-            let end_idx = pte_index::<C>(va.end - 1, cur_level);
-            cur_level > min_level && start_idx == end_idx
-        };
-        if !level_too_high {
+        let end_idx = pte_index::<C>(va.end - 1, cur_level);
+        if cur_level <= min_lock_level || start_idx != end_idx {
+            mapping_level_limit = cur_level;
             break;
         }
-
         let cur_pt_ptr = paddr_to_vaddr(cur_pt_addr) as *mut C::E;
-        // SAFETY:
-        //  - The page table node is alive because (1) the root node is alive and
-        //    (2) all child nodes cannot be recycled because we're in the RCU critical section.
-        //  - The index is inside the bound, so the page table entry is valid.
-        //  - All page table entries are aligned and accessed with atomic operations only.
-        let cur_pte = unsafe { load_pte(cur_pt_ptr.add(start_idx), Ordering::Acquire) };
-
-        match cur_pte.to_repr(cur_level) {
+        // SAFETY: The root is owned by pt; child nodes survive this RCU
+        // critical section. The index is bounded and PTE accesses are atomic.
+        let pte = unsafe { load_pte(cur_pt_ptr.add(start_idx), Ordering::Acquire) };
+        match pte.to_repr(cur_level) {
+            PteScalar::PageTable(child, _) => cur_pt_addr = child,
+            // Querying/unmapping absent memory must not allocate page tables.
+            // A mapping cursor prepares any missing descendants fallibly
+            // while retaining this ancestor's exclusive subtree lock.
+            PteScalar::Absent => {
+                // Preserve the requested mapping granularity even though an
+                // absent descendant lets us lock an existing higher ancestor.
+                mapping_level_limit = (min_lock_level..=cur_level)
+                    .rev()
+                    .find(|level| {
+                        *level == min_lock_level
+                            || pte_index::<C>(va.start, *level)
+                                != pte_index::<C>(va.end - 1, *level)
+                    })
+                    .unwrap();
+                break;
+            }
             PteScalar::Mapped(_, _) => {
+                mapping_level_limit = cur_level;
                 break;
-            }
-            PteScalar::Absent => {}
-            PteScalar::PageTable(child_pt_addr, _) => {
-                cur_pt_addr = child_pt_addr;
-                cur_node_guard = None;
-                continue;
-            }
-        }
-
-        // In case the child is absent, we should lock and allocate a new page table node.
-        let mut pt_guard = cur_node_guard.take().unwrap_or_else(|| {
-            // SAFETY: The node must be alive for at least `'rcu` since the
-            // address is read from the page table node.
-            let node_ref = unsafe { PageTableNodeRef::<'rcu, C>::borrow_paddr(cur_pt_addr) };
-            node_ref.lock(guard)
-        });
-        if *pt_guard.stray_mut() {
-            return None;
-        }
-
-        let mut cur_entry = pt_guard.entry(start_idx);
-        match cur_entry.to_ref() {
-            PteStateRef::Mapped(_) => {
-                break;
-            }
-            PteStateRef::Absent => {
-                let allocated_guard = cur_entry.alloc_if_none(guard).unwrap();
-                cur_pt_addr = allocated_guard.paddr();
-                cur_node_guard = Some(allocated_guard);
-            }
-            PteStateRef::PageTable(pt) => {
-                cur_pt_addr = pt.paddr();
-                cur_node_guard = None;
             }
         }
     }
-
-    let mut pt_guard = cur_node_guard.unwrap_or_else(|| {
-        // SAFETY: The node must be alive for at least `'rcu` since the
-        // address is read from the page table node.
-        let node_ref = unsafe { PageTableNodeRef::<'rcu, C>::borrow_paddr(cur_pt_addr) };
-        node_ref.lock(guard)
-    });
+    // SAFETY: The root is owned by pt and every traversed child remains
+    // alive in this RCU critical section. Retrying below handles detachment.
+    let node_ref = unsafe { PageTableNodeRef::<'rcu, C>::borrow_paddr(cur_pt_addr) };
+    let mut pt_guard = node_ref.lock(guard);
     if *pt_guard.stray_mut() {
         return None;
     }
 
-    Some(pt_guard)
+    Some((pt_guard, mapping_level_limit))
 }
 
 /// Acquires the locks for the given range in the sub-tree rooted at the node.
@@ -193,7 +170,9 @@ fn dfs_acquire_lock<C: PageTableConfig>(
             PteStateRef::PageTable(pt) => {
                 let mut pt_guard = pt.lock(guard);
                 let child_node_va = cur_node_va + i * page_size::<C>(cur_level);
-                let child_node_va_end = child_node_va + page_size::<C>(cur_level);
+                // The highest canonical node ends at 2^64. Saturate before
+                // intersecting with the cursor's representable barrier.
+                let child_node_va_end = child_node_va.saturating_add(page_size::<C>(cur_level));
                 let va_start = va_range.start.max(child_node_va);
                 let va_end = va_range.end.min(child_node_va_end);
                 dfs_acquire_lock(guard, &mut pt_guard, child_node_va, va_start..va_end);
@@ -229,7 +208,7 @@ unsafe fn dfs_release_lock<'rcu, C: PageTableConfig>(
                 // SAFETY: The caller ensures that the node is locked and the new guard is unique.
                 let child_node = unsafe { pt.make_guard_unchecked(guard) };
                 let child_node_va = cur_node_va + i * page_size::<C>(cur_level);
-                let child_node_va_end = child_node_va + page_size::<C>(cur_level);
+                let child_node_va_end = child_node_va.saturating_add(page_size::<C>(cur_level));
                 let va_start = va_range.start.max(child_node_va);
                 let va_end = va_range.end.min(child_node_va_end);
                 // SAFETY: The caller ensures that all the nodes in the sub-tree are locked and all

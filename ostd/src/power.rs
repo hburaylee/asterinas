@@ -4,6 +4,7 @@
 
 use spin::Once;
 
+#[cfg(not(feature = "kernelet"))]
 use crate::{arch::irq::disable_local_and_halt, cpu::CpuSet};
 
 /// An exit code that denotes the reason for restarting or powering off.
@@ -18,6 +19,38 @@ pub enum ExitCode {
     Success,
     /// The code that indicates a failed exit.
     Failure,
+}
+
+/// Marks a kernelet exit as a restart request to its runtime.
+pub const EXIT_RESTART: u32 = 1 << 31;
+
+#[cfg(feature = "kernelet")]
+fn exit_code_value(code: ExitCode) -> u32 {
+    match code {
+        ExitCode::Success => 0,
+        ExitCode::Failure => 1,
+    }
+}
+
+/// Ends a kernelet with an arbitrary status code.
+///
+/// A native kernel maps zero to a successful power-off and other codes to a
+/// failed power-off, as its firmware interface accepts only these two states.
+pub fn exit_with_code(code: u32) -> ! {
+    #[cfg(feature = "kernelet")]
+    (crate::kernelet::entry::services().stop)(
+        crate::kernelet::abi::STOP_EXIT,
+        code,
+        core::ptr::null(),
+        0,
+    );
+
+    #[cfg(not(feature = "kernelet"))]
+    poweroff(if code == 0 {
+        ExitCode::Success
+    } else {
+        ExitCode::Failure
+    });
 }
 
 static RESTART_HANDLER: Once<fn(ExitCode)> = Once::new();
@@ -55,14 +88,19 @@ pub fn inject_restart_handler(handler: fn(ExitCode)) {
 /// This function will not return. If the restart mechanism fails, this function will halt all CPUs
 /// on the machine.
 pub fn restart(code: ExitCode) -> ! {
-    if let Some(handler) = RESTART_HANDLER.get() {
-        (handler)(code);
-    } else {
-        crate::arch::power::try_restart(code);
-    }
-    crate::error!("Failed to restart the system");
+    #[cfg(feature = "kernelet")]
+    exit_with_code(exit_code_value(code) | EXIT_RESTART);
 
-    machine_halt();
+    #[cfg(not(feature = "kernelet"))]
+    {
+        if let Some(handler) = RESTART_HANDLER.get() {
+            (handler)(code);
+        } else {
+            crate::arch::power::try_restart(code);
+        }
+        crate::error!("Failed to restart the system");
+        machine_halt();
+    }
 }
 
 static POWEROFF_HANDLER: Once<fn(ExitCode)> = Once::new();
@@ -103,16 +141,22 @@ pub fn poweroff(code: ExitCode) -> ! {
     #[cfg(feature = "coverage")]
     crate::coverage::on_system_exit();
 
-    if let Some(handler) = POWEROFF_HANDLER.get() {
-        (handler)(code);
-    } else {
-        crate::arch::power::try_poweroff(code);
-    }
-    crate::error!("Failed to power off the system");
+    #[cfg(feature = "kernelet")]
+    exit_with_code(exit_code_value(code));
 
-    machine_halt();
+    #[cfg(not(feature = "kernelet"))]
+    {
+        if let Some(handler) = POWEROFF_HANDLER.get() {
+            (handler)(code);
+        } else {
+            crate::arch::power::try_poweroff(code);
+        }
+        crate::error!("Failed to power off the system");
+        machine_halt();
+    }
 }
 
+#[cfg(not(feature = "kernelet"))]
 fn machine_halt() -> ! {
     crate::error!("Halting the machine...");
 

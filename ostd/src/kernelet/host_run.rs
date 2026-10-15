@@ -2,14 +2,14 @@
 
 //! Host-private state for one carrier crossing a kernelet image boundary.
 //!
-//! Physical interrupts from image code switch to the carrier's protected Host
-//! stack before entering compiled Host handlers.
+//! Ordinary physical traps and service calls use the current shared Task
+//! stack. Only double fault enters a permanent CPU-local IST stack.
 //!
 //! This module owns the authoritative carrier state and the single
 //! enter/return/stop transaction, including trap containment and virtual
 //! interrupt redirection. Child modules own the shared execution resources
-//! ([`resources`]), the FPU crossing policy ([`fpu`]), and the service
-//! implementation bodies ([`vcpu`], [`roots`], [`mem`], [`hooks`]).
+//! ([`resources`]) and the service implementation bodies
+//! ([`vcpu`], [`roots`], [`mem`], [`hooks`]).
 
 use alloc::{string::ToString, sync::Arc};
 use core::{
@@ -22,35 +22,44 @@ use core::{
 
 use super::{
     abi::{
-        BootArgs, CopyFaultRecord, INVALID, KletUserContext, MAX_OOPS_BYTES, MmioResult, STATE,
-        ServiceTable, VIRQ_TICK, VcpuRecord, copy_fault_records_offset,
+        BootArgs, CopyFaultRecord, INVALID, KSTACK_USABLE_BYTES, KletUserContext, MAX_OOPS_BYTES,
+        MmioResult, STATE, ServiceTable, VIRQ_TICK, VcpuRecord, copy_fault_records_offset,
     },
-    control::{ExitReason, KerneletHooks, KerneletState, KillReason, OperationGuard, RunControl},
+    control::{ExitReason, KerneletHooks, KillReason, RunControl},
     guest_memory::GuestMemory,
     host_grant::Grant,
 };
 use crate::{
     arch::cpu::context::FpuContext,
-    cpu::PinCurrentCpu,
     irq,
     sync::WaitQueue,
     task::{Task, scheduler},
 };
 
-mod fpu;
+mod hook_stack;
 mod hooks;
 mod mem;
+mod record;
 mod resources;
 mod roots;
+#[cfg(kernelet_rq1)]
+mod rq1;
+mod tls;
 mod vcpu;
 
+pub(crate) use record::recover_host_copy_fault;
 pub(crate) use resources::ExecutionResources;
 
+// The carrier alone writes its phase while physical IRQs are masked. The
+// instance's separate active word carries the remotely published sticky stop
+// bit, so phase publication needs only Release stores.
+// host_run.S receives phase operands through global_asm! below. Keep its
+// fixed entry transactions and OSDK byte audits synchronized.
 pub(crate) const PREPARED: u32 = 0;
 const IMAGE: u32 = 1;
 pub(crate) const STARTING: u32 = 8;
 const ENTERING: u32 = 2;
-const SERVICE: u32 = 3;
+pub(crate) const SERVICE: u32 = 3;
 pub(crate) const RETURNING: u32 = 4;
 pub(crate) const STOP_REQUESTED: u32 = 1 << 31;
 pub(crate) const LEAVING: u32 = 5;
@@ -58,6 +67,25 @@ pub(crate) const DETACHED: u32 = 11;
 const USER: u32 = 6;
 const IDLE: u32 = 9;
 const THROTTLED: u32 = 10;
+
+const _: () = {
+    assert!(
+        (PREPARED
+            | IMAGE
+            | STARTING
+            | ENTERING
+            | SERVICE
+            | RETURNING
+            | LEAVING
+            | DETACHED
+            | USER
+            | IDLE
+            | THROTTLED)
+            & STOP_REQUESTED
+            == 0
+    );
+};
+
 const UPCALL_STACK_RESERVE: usize = 64 * 1024;
 
 global_asm!(
@@ -66,6 +94,15 @@ global_asm!(
     phase_image = const IMAGE,
     phase_entering = const ENTERING,
     phase_returning = const RETURNING,
+    stop_requested = const STOP_REQUESTED,
+    stop_state = const offset_of!(CarrierState, stop_state),
+    stack_pool_start = const offset_of!(CarrierState, stack_pool_start),
+    stack_pool_end = const offset_of!(CarrierState, stack_pool_end),
+    stack_pool_live = const offset_of!(CarrierState, stack_pool_live),
+    stack_stride = const resources::STACK_STRIDE,
+    stack_bytes = const resources::STACK_BYTES,
+    stack_reserve = const UPCALL_STACK_RESERVE,
+    rq1_bench = const cfg!(kernelet_rq1) as usize,
     options(att_syntax)
 );
 
@@ -77,17 +114,18 @@ struct CarrierState<'a> {
     image_end: usize,
     run_state: &'a AtomicU32,
     carrier_task: usize,
-    host_root: Cell<usize>,
+    // The permanent kernel root, never a borrowed outgoing Task's user root.
+    host_root: usize,
     active_root: Cell<usize>,
-    host_idtr: x86_64::structures::DescriptorTablePointer,
-    image_idtr: x86_64::structures::DescriptorTablePointer,
+    stack_pool_start: usize,
+    stack_pool_end: usize,
+    stack_pool_live: usize,
     execution: &'a ExecutionResources,
     vcpu: u16,
     vcpu_record: usize,
     copy_fault_record: usize,
     boot_args: usize,
     fpu_stage: RefCell<FpuContext>,
-    fpu_restore: fpu::FpuRestorePolicy,
     guest_memory: GuestMemory,
     idle_wait: Arc<WaitQueue>,
     hooks: Arc<dyn KerneletHooks>,
@@ -95,6 +133,9 @@ struct CarrierState<'a> {
     deferred_ticks: Cell<u32>,
     text: Range<usize>,
     virq_entry: usize,
+    yield_entry: usize,
+    exit_entry: usize,
+    stub_range: Range<usize>,
     control: &'a RunControl,
     grant: &'a Grant,
     hook_active: Cell<bool>,
@@ -102,25 +143,16 @@ struct CarrierState<'a> {
     parked: Cell<bool>,
     throttled: Cell<bool>,
     last_spin: Cell<u64>,
-    service_redirected: Cell<bool>,
-    landing_start: usize,
-    landing_end: usize,
-    // A forced-yield IRET borrows this carrier's pinned IST frame. The first
-    // IRET enters the fixed stub with safe flags; the second restores these
-    // original flags and RIP together with the frame's unmodified GPRs/RSP.
-    yield_rip: Cell<usize>,
-    yield_rflags: Cell<usize>,
-    yield_pending: Cell<bool>,
-    trap_active: Cell<bool>,
-    // Host-private native guard baseline; shared fields never authorize subtraction.
-    host_preempt_base: Cell<u32>,
-    mirror_suspended: Cell<bool>,
-    // True from active-set reservation until the hardware root is left.
-    root_installed: Cell<bool>,
-    // Once a guest user context has been loaded, preserve its hardware state
-    // across native carrier switches, including switches inside a service.
-    fpu_active: Cell<bool>,
+    // Preserve hardware FPU state across every carrier switch, including
+    // image-side FPU restores that do not cross a Host service.
     fpu_paused: Cell<bool>,
+    vm_space: Arc<crate::mm::VmSpace>,
+    tls: Cell<tls::TlsState>,
+    // The instance owns this word until all carriers have detached. Remote
+    // stop changes this word without writing the current carrier's phase.
+    stop_state: &'a AtomicU32,
+    // Keep new Rust-only state after every assembly-visible field.
+    cpu_access_range: Range<usize>,
 }
 
 const _: () = {
@@ -130,16 +162,19 @@ const _: () = {
     assert!(offset_of!(CarrierState, carrier_task) == 40);
     assert!(offset_of!(CarrierState, host_root) == 48);
     assert!(offset_of!(CarrierState, active_root) == 56);
-    assert!(offset_of!(CarrierState, host_idtr) == 64);
-    assert!(offset_of!(CarrierState, image_idtr) == 74);
-    assert!(offset_of!(CarrierState, landing_start) == 304);
-    assert!(offset_of!(CarrierState, landing_end) == 312);
+    assert!(offset_of!(CarrierState, stack_pool_start) == 64);
+    assert!(offset_of!(CarrierState, stack_pool_end) == 72);
+    assert!(offset_of!(CarrierState, stack_pool_live) == 80);
+    assert!(offset_of!(CarrierState, stop_state) == 344);
 };
 
 crate::cpu_local_cell! {
     #[unsafe(no_mangle)]
     static KERNELET_HOST_STATE_PTR: usize = 0;
 }
+
+#[cfg(kernelet_getpid_profile)]
+use super::getpid_profile as profile;
 
 /// Reinstalls a native Task's protected carrier pointer after a Host switch.
 /// The Task owns this address until it clears the slot at fixed exit.
@@ -150,31 +185,30 @@ crate::cpu_local_cell! {
 pub(crate) unsafe fn restore_carrier_context(address: usize) {
     KERNELET_HOST_STATE_PTR.store(address);
     if address == 0 {
-        // SAFETY: The native IDT does not reference the reserved image slots.
-        unsafe { crate::arch::trap::set_carrier_stacks([0; 5]) };
+        super::vcpu_slot::restore(None);
         return;
     }
     // SAFETY: The native Task owns this pinned carrier context until fixed exit.
     let state = unsafe { &*(address as *const CarrierState) };
+    #[cfg(kernelet_rq1_diagnostics)]
+    super::fpu_profile::carrier_event(super::fpu_profile::CarrierEvent::Resume);
+    #[cfg(kernelet_getpid_profile)]
+    let _resume_span = profile::span(profile::stage::HOST_CARRIER_RESUME);
+    super::vcpu_slot::restore(Some(state.control.cpu_slot(state.vcpu)));
+    #[cfg(kernelet_getpid_profile)]
+    let tls_span = profile::span(profile::stage::HOST_FS_GS_ENTER);
+    state.tls.get().restore();
+    #[cfg(kernelet_getpid_profile)]
+    let _ = profile::end(tls_span);
     if state.fpu_paused.replace(false) {
         state.fpu_stage.borrow().load();
+        #[cfg(kernelet_rq1_diagnostics)]
+        super::fpu_profile::carrier_event(super::fpu_profile::CarrierEvent::LoadCompleted);
     }
-    // SAFETY: The fixed carrier owns these mapped landing stacks until detach.
-    unsafe {
-        crate::arch::trap::set_carrier_stacks(state.execution.landings[state.vcpu as usize].tops())
-    };
-    // A native IRQ can preempt the Host user-entry prefix while USER is
-    // published. Its continuation must regain the tenant root before it can
-    // enter ring 3. SERVICE/trap continuations resume under the Host root.
-    state
-        .host_root
-        .set(crate::arch::mm::current_page_table_paddr());
-    if state.run_state.load(Ordering::Acquire) & !STOP_REQUESTED == USER
-        && state.prepare_active_root()
-    {
-        // SAFETY: IRQs are masked and the active-set reservation pins this
-        // registered root through user entry or a subsequent Host handoff.
-        unsafe { crate::arch::mm::activate_page_table(state.active_root.get()) };
+    // The kernel's post-schedule handler restores the carrier's VMAR after
+    // this protected pointer and its hardware state have been installed.
+    if state.sample_stop() {
+        state.vm_space.set_root_restore(false);
     }
     let paused_at = state.paused_at.replace(0);
     if paused_at == 0 {
@@ -199,17 +233,32 @@ pub(crate) unsafe fn restore_carrier_context(address: usize) {
 /// physical IRQs must remain masked through the context switch.
 pub(crate) unsafe fn pause_carrier_context(address: usize) {
     if address != 0 {
+        #[cfg(kernelet_getpid_profile)]
+        let _pause_span = profile::span(profile::stage::HOST_CARRIER_PAUSE);
         // SAFETY: Called only for the outgoing Task while IRQs are masked.
         let state = unsafe { &*(address as *const CarrierState) };
-        if state.fpu_active.get() {
-            state.fpu_stage.borrow_mut().save();
-            state.fpu_paused.set(true);
-        }
+        #[cfg(kernelet_rq1_diagnostics)]
+        super::fpu_profile::carrier_event(super::fpu_profile::CarrierEvent::Pause);
+        #[cfg(kernelet_getpid_profile)]
+        let tls_span = profile::span(profile::stage::HOST_FS_GS_LEAVE);
+        state.tls.set(tls::TlsState::capture());
+        #[cfg(kernelet_getpid_profile)]
+        let _ = profile::end(tls_span);
+        state.fpu_stage.borrow_mut().save();
+        #[cfg(kernelet_rq1_diagnostics)]
+        super::fpu_profile::carrier_event(super::fpu_profile::CarrierEvent::SaveCompleted);
+        state.fpu_paused.set(true);
         state.install_host_root();
+        // A native IRQ may suspend an image Task stack directly. Restore its
+        // tenant root before returning to image text or tenant user mode.
+        state.vm_space.set_root_restore(
+            matches!(state.run_state.load(Ordering::Acquire), IMAGE | USER) && !state.sample_stop(),
+        );
         state.paused_at.set(crate::arch::read_tsc());
         // A real native context switch restarts the cooperative grace period.
         state.deferred_ticks.set(0);
     }
+    super::vcpu_slot::restore(None);
 }
 
 unsafe extern "C" {
@@ -219,7 +268,6 @@ unsafe extern "C" {
         services: &'static ServiceTable,
         boot: *const BootArgs,
     ) -> u32;
-    fn kernelet_host_forced_yield();
 }
 
 // The service table is entered through indirect calls from the image. Every
@@ -265,16 +313,8 @@ extern "C" fn vcpu_on_spin() {
     core::arch::naked_asm!("endbr64", "jmp kernelet_service_vcpu_on_spin");
 }
 #[unsafe(naked)]
-extern "C" fn user_run(_: *mut KletUserContext) -> i64 {
+extern "C" fn user_run(_: *mut KletUserContext) -> i32 {
     core::arch::naked_asm!("endbr64", "jmp kernelet_service_user_run");
-}
-#[unsafe(naked)]
-extern "C" fn fpu_save(_: *mut u8, _: u32) -> i64 {
-    core::arch::naked_asm!("endbr64", "jmp kernelet_service_fpu_save");
-}
-#[unsafe(naked)]
-extern "C" fn fpu_load(_: *const u8, _: u32) -> i64 {
-    core::arch::naked_asm!("endbr64", "jmp kernelet_service_fpu_load");
 }
 #[unsafe(naked)]
 extern "C" fn mmio_read(_: u32, _: u32, _: u32) -> MmioResult {
@@ -310,6 +350,12 @@ extern "C" fn stop(_: u32, _: u32, _: *const u8, _: u32) -> ! {
     core::arch::naked_asm!("endbr64", "jmp kernelet_service_stop");
 }
 
+#[cfg(kernelet_rq1)]
+#[unsafe(naked)]
+extern "C" fn rq1_echo(_: u64) -> i64 {
+    core::arch::naked_asm!("endbr64", "jmp kernelet_service_rq1_echo");
+}
+
 #[unsafe(export_name = "__ostd_kernelet_service_table")]
 static SERVICES: ServiceTable = ServiceTable {
     size: size_of::<ServiceTable>() as u64,
@@ -326,13 +372,13 @@ static SERVICES: ServiceTable = ServiceTable {
     vcpu_yield,
     vcpu_on_spin,
     user_run,
-    fpu_save,
-    fpu_load,
     mmio_read,
     mmio_write,
     log_write,
     oops,
     stop,
+    #[cfg(kernelet_rq1)]
+    rq1_echo,
 };
 
 /// Enters an image through an already validated entry address.
@@ -347,6 +393,10 @@ pub(crate) unsafe fn enter(
     image: Range<usize>,
     text: Range<usize>,
     virq_entry: usize,
+    yield_entry: usize,
+    exit_entry: usize,
+    stub_range: Range<usize>,
+    cpu_access_range: Range<usize>,
     ex_table: Range<usize>,
     boot: *const BootArgs,
     vcpu_record: *const VcpuRecord,
@@ -359,7 +409,7 @@ pub(crate) unsafe fn enter(
     vcpu: u16,
 ) -> crate::Result<u32> {
     let boot_stack = execution.stacks.lock().slots[vcpu as usize].base() as u64;
-    let landing_range = execution.landings[vcpu as usize].area.range();
+    let (stack_pool_start, stack_pool_end, stack_pool_live) = execution.stack_pool_layout();
     // The Host-built boot page indexes two pinned arrays: all vCPU records
     // first, followed by all recoverable copy-fault records.
     // SAFETY: `enter` receives the live, Host-built boot page retained by
@@ -370,9 +420,8 @@ pub(crate) unsafe fn enter(
         + copy_fault_records_offset(boot_args.num_vcpus as usize)
         + vcpu as usize * size_of::<CopyFaultRecord>();
     let copy_fault_record = (boot as *const u8).wrapping_add(copy_fault_offset);
-    let mut fpu_stage = FpuContext::new();
-    let fpu_restore = fpu::FpuRestorePolicy::from_host(&mut fpu_stage);
-    control.account.attach(false)?;
+    let fpu_stage = FpuContext::new();
+    control.account.attach_carrier()?;
     assert!(crate::arch::irq::is_local_enabled());
     let irq_guard = irq::disable_local();
     // SAFETY: The caller passes the live, writable record mapped by the
@@ -384,8 +433,7 @@ pub(crate) unsafe fn enter(
         (*vcpu_record).irq_off.store(1, Ordering::Release);
     }
     let current = Task::current().expect("a kernelet carrier must be a native Task");
-    let host_root = crate::arch::mm::current_page_table_paddr();
-    let (host_idtr, image_idtr) = crate::arch::trap::carrier_idtrs();
+    let host_root = crate::mm::VmSpace::kernel_root_paddr();
     let mut state = CarrierState {
         host_rsp: 0,
         image_rsp: 0,
@@ -394,18 +442,14 @@ pub(crate) unsafe fn enter(
         ex_table,
         run_state: &control.carriers[vcpu as usize].run_state,
         carrier_task: &*current as *const Task as usize,
-        host_root: Cell::new(host_root),
+        host_root,
         active_root: Cell::new(0),
-        host_idtr,
-        image_idtr,
         execution,
         vcpu,
         vcpu_record: vcpu_record as usize,
         copy_fault_record: copy_fault_record as usize,
         boot_args: boot as usize,
         fpu_stage: RefCell::new(fpu_stage),
-        fpu_restore,
-        fpu_active: Cell::new(false),
         fpu_paused: Cell::new(false),
         guest_memory,
         idle_wait,
@@ -413,6 +457,10 @@ pub(crate) unsafe fn enter(
         deferred_ticks: Cell::new(0),
         text,
         virq_entry,
+        yield_entry,
+        exit_entry,
+        stub_range,
+        cpu_access_range,
         control,
         grant,
         hook_active: Cell::new(false),
@@ -420,22 +468,22 @@ pub(crate) unsafe fn enter(
         parked: Cell::new(false),
         throttled: Cell::new(false),
         last_spin: Cell::new(u64::MAX),
-        service_redirected: Cell::new(false),
-        landing_start: landing_range.start,
-        landing_end: landing_range.end,
-        yield_rip: Cell::new(0),
-        yield_rflags: Cell::new(0),
-        yield_pending: Cell::new(false),
-        trap_active: Cell::new(false),
-        host_preempt_base: Cell::new(crate::task::carrier_preempt::guard_count()),
-        mirror_suspended: Cell::new(true),
-        root_installed: Cell::new(false),
+        vm_space: execution.carrier_vm_space(vcpu)?,
+        tls: Cell::new(tls::TlsState::capture()),
+        stop_state: control.stop_state(),
+        stack_pool_start,
+        stack_pool_end,
+        stack_pool_live,
     };
     assert_eq!(KERNELET_HOST_STATE_PTR.load(), 0);
+    // Guest XSAVE/XRSTOR use hardware directly, without an activation service.
+    // Install neutral state before publishing this carrier: even the initial
+    // budget wait can switch it out and save the now-live hardware state.
+    // The borrow ends before a scheduler hook can borrow the staging context.
+    state.fpu_stage.borrow().load();
     // SAFETY: The carrier is pinned on this current Task until fixed exit.
     unsafe { current.set_carrier_context(&mut state as *mut CarrierState as usize) };
     state.wait_for_budget(STARTING);
-    state.resume_mirror();
 
     // SAFETY: The caller supplies a live image entry, this function owns the
     // guarded image stack, and the carrier state is pinned. The assembly
@@ -445,7 +493,7 @@ pub(crate) unsafe fn enter(
     let code = unsafe {
         kernelet_host_enter(
             entry,
-            boot_stack as usize + resources::STACK_BYTES,
+            boot_stack as usize + KSTACK_USABLE_BYTES,
             &SERVICES,
             boot,
         )
@@ -454,10 +502,9 @@ pub(crate) unsafe fn enter(
     // The assembly has restored the Host root with IRQs masked. In particular,
     // a stop racing the final trap commit may have left a conservative CPU bit
     // in the root's active set; remove it before releasing this carrier.
-    state.suspend_mirror();
     state.clear_active_root();
     // A stop may make service entry or the final image-return commit fail.
-    // Fixed exits cannot call Rust on the image stack or IST, so publish
+    // Fixed exits restore the protected Host stack before publishing
     // LEAVING here, once the Host root and stack have been restored and before
     // the native carrier can detach.
     state.set_phase(LEAVING);
@@ -469,6 +516,20 @@ pub(crate) unsafe fn enter(
 }
 
 impl CarrierState<'_> {
+    /// Retains a physical sample with its interrupted stack, independently of
+    /// the Guest's current-Task publication during a context switch.
+    fn sample_stack_tick(&self, rsp: usize, user: bool) -> bool {
+        let result = self.execution.stacks.lock().record_tick(rsp, user);
+        let reason = match result {
+            Ok(()) => return true,
+            Err(resources::TickSampleError::InvalidStack) => KillReason::StackReserve,
+            // Opaque Host-policy code "TICK": stop rather than wrap or drop.
+            Err(resources::TickSampleError::Overflow) => KillReason::HostPolicy(0x5449_434b),
+        };
+        self.control.stop(ExitReason::Killed(reason));
+        false
+    }
+
     fn copy_fault_record(&self) -> &CopyFaultRecord {
         // SAFETY: The Host pins both shared arrays for this instance. Entry
         // calculates this address from its validated boot page and vCPU index.
@@ -477,19 +538,8 @@ impl CarrierState<'_> {
     /// Removes this physical CPU after the protected Host root is installed.
     /// The desired image root remains recorded across a Host deschedule.
     fn leave_active_root(&self) {
-        if !self.root_installed.replace(false) {
-            return;
-        }
-        let root = self.active_root.get();
-        if root == 0 {
-            return;
-        }
-        let guard = irq::disable_local();
-        let cpu = guard.current_cpu();
-        let mut roots = self.execution.roots.lock();
-        if let Ok(index) = roots.binary_search_by_key(&(root as u64), |entry| entry.paddr) {
-            roots[index].active.remove(cpu);
-        }
+        crate::mm::VmSpace::deactivate();
+        self.vm_space.set_root_restore(false);
     }
 
     /// Reserves this CPU for the desired root before the fixed CR3 write.
@@ -498,32 +548,20 @@ impl CarrierState<'_> {
     /// with shootdown. IRQs remain masked until assembly installs the root;
     /// a concurrent shootdown must then target this CPU and await its IPI.
     fn prepare_active_root(&self) -> bool {
-        if self.root_installed.get() {
-            return true;
+        if self.sample_stop() {
+            return false;
         }
         let root = self.active_root.get();
         if root == 0 {
             return true;
         }
-        let guard = irq::disable_local();
-        let cpu = guard.current_cpu();
-        let mut roots = self.execution.roots.lock();
-        let Ok(index) = roots.binary_search_by_key(&(root as u64), |entry| entry.paddr) else {
-            drop(roots);
+        let irq_guard = irq::disable_local();
+        if !self.vm_space.prepare_registered_root(root, &irq_guard) {
             self.control
                 .stop(ExitReason::Killed(KillReason::EntryFailed));
+            self.sample_stop();
             return false;
-        };
-        let registration = &mut roots[index];
-        let seen = &mut registration.seen_generation[u32::from(cpu) as usize];
-        if *seen != registration.generation {
-            // The CPU used this root before an inactive-period invalidation.
-            // The mandatory CR3 write on resume also flushes non-global TLBs.
-            crate::arch::mm::tlb_flush_all_excluding_global();
-            *seen = registration.generation;
         }
-        registration.active.add(cpu);
-        self.root_installed.set(true);
         true
     }
 
@@ -531,53 +569,48 @@ impl CarrierState<'_> {
     /// Both roots share the validated Host kernel half, including this stack.
     fn install_host_root(&self) {
         debug_assert!(!crate::arch::irq::is_local_enabled());
-        if self.root_installed.get() {
-            // SAFETY: The saved native root and Host stack remain live while
-            // this carrier runs. IRQ masking excludes a partial root handoff.
-            if crate::arch::mm::current_page_table_paddr() != self.host_root.get() {
-                unsafe { crate::arch::mm::activate_page_table(self.host_root.get()) };
-            }
-            self.leave_active_root();
-        }
-        self.host_root
-            .set(crate::arch::mm::current_page_table_paddr());
+        self.leave_active_root();
     }
 
-    fn admit_service(&self) -> Option<OperationGuard<'_>> {
-        if self.run_state.load(Ordering::Acquire) != ENTERING {
+    fn admit_service(&self) -> Option<()> {
+        debug_assert!(!crate::arch::irq::is_local_enabled());
+        if self.sample_stop() || self.run_state.load(Ordering::Acquire) != ENTERING {
             return None;
         }
-        let admission = self
-            .control
-            .admit_operation(&[KerneletState::Running])
-            .ok()?;
+        // enter_vcpu retains the image/grant and execution resources through
+        // fixed exit. Its native Task and active reservation prevent Exited
+        // and reclamation until all service frames have returned. Only
+        // operations outside this carrier need a separate operation guard.
         self.set_phase(SERVICE);
-        Some(admission)
+        Some(())
     }
 
     /// Releases the desired root after fixed exit or stop. Call only after
     /// the Host root has been installed, with physical IRQs masked.
     fn clear_active_root(&self) {
-        let guard = irq::disable_local();
-        let cpu = guard.current_cpu();
-        let mut roots = self.execution.roots.lock();
-        if let Ok(index) =
-            roots.binary_search_by_key(&(self.active_root.get() as u64), |entry| entry.paddr)
-        {
-            roots[index].active.remove(cpu);
-        }
+        let _guard = irq::disable_local();
+        self.leave_active_root();
+        self.vm_space.set_registered_root(None);
         self.active_root.set(0);
-        self.root_installed.set(false);
         self.control.carriers[self.vcpu as usize]
             .active_root
             .store(0, Ordering::Release);
     }
 
-    /// Host hook unwind completes on the native stack before requesting stop.
+    /// Observes the instance's sticky mark without modifying the carrier phase.
+    fn sample_stop(&self) -> bool {
+        self.stop_state.load(Ordering::Acquire) & STOP_REQUESTED != 0
+    }
+
+    /// Host hook unwind completes on this CPU's private hook stack.
     fn call_hook<R>(&self, hook: impl FnOnce() -> R) -> Option<R> {
+        let guard = crate::task::disable_preempt();
         self.hook_active.set(true);
-        let result = crate::panic::catch_unwind(hook);
+        // SAFETY: The guard pins and excludes another task on this CPU's
+        // hook stack. The catch runs there, so no unwind crosses the switch.
+        let result = unsafe { hook_stack::call(&guard, || crate::panic::catch_unwind(hook)) };
         self.hook_active.set(false);
+        drop(guard);
         match result {
             Ok(value) => Some(value),
             Err(_) => {
@@ -588,92 +621,70 @@ impl CarrierState<'_> {
         }
     }
 
-    /// Removes image-owned guard state before a native wait or fixed exit.
-    /// This is called with physical IRQs masked and no temporary Host guard.
-    fn suspend_mirror(&self) {
-        debug_assert!(!crate::arch::irq::is_local_enabled());
-        // SAFETY: The carrier pins the shared record through fixed exit.
-        let record = unsafe { &*(self.vcpu_record as *const VcpuRecord) };
-        record.mirrored.store(0, Ordering::Relaxed);
-        crate::task::carrier_preempt::restore_guards(self.host_preempt_base.get());
-        self.mirror_suspended.set(true);
-    }
-
-    /// Reestablishes the mirror immediately before the final image commit.
-    fn resume_mirror(&self) {
-        debug_assert!(!crate::arch::irq::is_local_enabled());
-        if self.mirror_suspended.replace(false) {
-            self.host_preempt_base
-                .set(crate::task::carrier_preempt::guard_count());
-        }
-        // SAFETY: The carrier pins the shared record through fixed exit.
-        let record = unsafe { &*(self.vcpu_record as *const VcpuRecord) };
-        let critical = record.guards.load(Ordering::Acquire) != 0
-            || record.irq_off.load(Ordering::Acquire) != 0;
-        crate::task::carrier_preempt::restore_guards(
-            self.host_preempt_base.get() + u32::from(critical),
-        );
-        record
-            .mirrored
-            .store(u32::from(critical), Ordering::Release);
-    }
-
     /// Services that can wait or yield execute with native Host guard ownership.
     fn enter_schedulable_service(&self) {
         self.install_host_root();
-        self.suspend_mirror();
         self.set_phase(SERVICE);
     }
 
-    /// Changes only the phase; a concurrent stop request is never overwritten.
+    /// Publishes a phase from its sole writer with physical IRQs masked.
+    /// Remote stop has its own word and cannot be overwritten by this store.
     fn set_phase(&self, phase: u32) {
-        if phase == SERVICE
-            && self.run_state.load(Ordering::Acquire) == ENTERING
-            && !self.yield_pending.get()
-            && !self.trap_active.get()
-        {
+        debug_assert!(!crate::arch::irq::is_local_enabled());
+        if phase == SERVICE && self.run_state.load(Ordering::Acquire) == ENTERING {
             self.control
                 .account
                 .service_calls
                 .fetch_add(1, Ordering::Relaxed);
         }
-        let _ = self
-            .run_state
-            .try_update(Ordering::AcqRel, Ordering::Acquire, |old| {
-                Some((old & STOP_REQUESTED) | phase)
-            });
+        self.run_state.store(phase, Ordering::Release);
     }
 
-    /// Throttling runs only after the Rust service frame has unwound, or at a
-    /// Host-stack entry point. `STARTING` has no image continuation yet; every
-    /// other caller temporarily publishes the depth-one `THROTTLED` phase.
+    /// Parks an authenticated carrier in Native Task context with no Host
+    /// guard held. Physical IRQs are masked on entry and return. A synchronous
+    /// service frame may remain live on the pinned shared Task stack; Guest
+    /// guards do not prevent the Host from parking the entire carrier.
+    /// `STARTING` has no image continuation yet; every other caller temporarily
+    /// publishes the depth-one `THROTTLED` phase.
     fn wait_for_budget(&self, resume_phase: u32) {
-        // Native scheduling may have changed CR3. The current root owns the
-        // CPU's page-table reference; a previously captured root may retire.
-        if !self.root_installed.get() {
-            self.host_root
-                .set(crate::arch::mm::current_page_table_paddr());
+        if self.sample_stop() {
+            return;
         }
+        #[cfg(kernelet_getpid_profile)]
+        profile::event(profile::event_id::BUDGET_CHECK);
+        #[cfg(kernelet_getpid_profile)]
+        let account_span = profile::span(profile::stage::HOST_ACCOUNT);
         scheduler::runtime_ticks();
+        #[cfg(kernelet_getpid_profile)]
+        let _ = profile::end(account_span);
         if !self.control.account.exhausted() {
             return;
         }
+        #[cfg(kernelet_getpid_profile)]
+        profile::event(profile::event_id::THROTTLE);
         self.install_host_root();
         if resume_phase != STARTING {
             self.set_phase(THROTTLED);
         }
         self.throttled.set(true);
         crate::arch::irq::enable_local();
-        self.control
-            .account
-            .wait_for_budget(|| self.run_state.load(Ordering::Acquire) & STOP_REQUESTED != 0);
+        self.control.account.wait_for_budget(|| self.sample_stop());
         crate::arch::irq::disable_local();
         self.throttled.set(false);
-        self.host_root
-            .set(crate::arch::mm::current_page_table_paddr());
         if resume_phase != STARTING {
             self.set_phase(resume_phase);
         }
+    }
+}
+
+/// Records the quota decision made by the physical Host tick.
+///
+/// The timer has already charged the current Task. Parking waits until a
+/// user IRQ continuation or the fixed yield continuation can sleep.
+pub(crate) fn on_host_tick() {
+    // SAFETY: The timer callback runs with physical IRQs masked on this CPU.
+    if let Some(state) = unsafe { current_carrier_state() } {
+        let _ = state.control.account.exhausted();
     }
 }
 
@@ -692,6 +703,18 @@ unsafe fn current_carrier_state<'a>() -> Option<&'a CarrierState<'a>> {
     if state.carrier_task != &*current as *const Task as usize {
         return None;
     }
+    #[cfg(kernelet_getpid_profile)]
+    let _identity_span = {
+        profile::event(profile::event_id::IDENTITY_LOOKUP);
+        profile::span(profile::stage::HOST_IDENTITY)
+    };
+    let identity = super::vcpu_slot::current();
+    if identity.vcpu != state.vcpu {
+        return None;
+    }
+    // The current Task pins state.control. Authenticate its borrowed address
+    // against the Host registry without acquiring a lock or cloning an Arc.
+    RunControl::lookup_cpu_slot(identity, state.control)?;
     Some(state)
 }
 
@@ -709,10 +732,7 @@ pub(crate) fn in_host_hook() -> bool {
 pub(crate) fn image_copy_recovery(instruction: usize) -> Option<usize> {
     // SAFETY: The carrier pins the image and its immutable table until exit.
     let state = unsafe { current_carrier_state()? };
-    if (state.run_state.load(Ordering::Acquire) & !STOP_REQUESTED) != SERVICE
-        || !state.trap_active.get()
-        || !(state.image_start..state.image_end).contains(&instruction)
-    {
+    if state.run_state.load(Ordering::Acquire) != IMAGE || !state.text.contains(&instruction) {
         return None;
     }
     let table = &state.ex_table;
@@ -739,24 +759,39 @@ pub(crate) fn image_copy_recovery(instruction: usize) -> Option<usize> {
     None
 }
 
-/// Contains a depth-zero image exception after its trap switched to Host state.
+fn containable_image_exception(vector: usize) -> bool {
+    vector < 32 && !matches!(vector, 2 | 18)
+}
+
+/// Contains an image exception on the native trap path at service depth zero.
 /// A validated user-copy fault publishes its hardware details before the fixup.
 pub(crate) fn contain_image_exception(frame: &mut crate::arch::trap::TrapFrame) -> bool {
-    if frame.trap_num >= 32 {
+    if !containable_image_exception(frame.trap_num) {
         return false;
     }
-    // SAFETY: The trap adapter retains the pinned current carrier.
+    // SAFETY: The native trap retains this current carrier with IRQs masked.
     let Some(state) = (unsafe { current_carrier_state() }) else {
         return false;
     };
-    if !state.text.contains(&frame.rip) {
+    if !state.text.contains(&frame.rip) || state.run_state.load(Ordering::Acquire) != IMAGE {
         return false;
     }
-    if frame.trap_num == 14 {
+    if frame.trap_num == 8 {
+        // Double fault may have interrupted an exhausted stack while it held
+        // Guest locks. Detection must neither inspect that stack nor take locks.
+        state
+            .control
+            .stop(ExitReason::Killed(KillReason::StackOverflow));
+        redirect_fatal_image_exception(state, frame);
+        return true;
+    }
+    if frame.trap_num == 14
+        && x86_64::registers::control::Cr2::read_raw() < crate::mm::MAX_USERSPACE_VADDR as u64
+    {
         if let Some(recovery) = image_copy_recovery(frame.rip) {
             // The trap epilogue checks this again after the handler returns.
             // Do not resume at a fixup after stop has already been published.
-            if state.run_state.load(Ordering::Acquire) & STOP_REQUESTED != 0 {
+            if state.sample_stop() {
                 return true;
             }
             // Only this carrier publishes its recoverable copy-fault slot.
@@ -778,10 +813,10 @@ pub(crate) fn contain_image_exception(frame: &mut crate::arch::trap::TrapFrame) 
     } else {
         0
     };
-    let reason = if frame.trap_num == 14
-        && state.execution.stacks.lock().slots.iter().any(|slot| {
-            slot.area.range().contains(&(addr as usize)) && !slot.contains(addr as usize)
-        }) {
+    let in_pool_guard = (state.stack_pool_start..state.stack_pool_end).contains(&(addr as usize))
+        && (addr as usize - state.stack_pool_start) % resources::STACK_STRIDE
+            < resources::STACK_BYTES;
+    let reason = if frame.trap_num == 14 && in_pool_guard {
         KillReason::StackOverflow
     } else {
         KillReason::KernelFault {
@@ -790,161 +825,133 @@ pub(crate) fn contain_image_exception(frame: &mut crate::arch::trap::TrapFrame) 
         }
     };
     state.control.stop(ExitReason::Killed(reason));
+    redirect_fatal_image_exception(state, frame);
     true
 }
 
-/// The trap assembly has installed the Host root before calling its handler.
-pub(crate) fn begin_image_trap() {
-    // SAFETY: The trap adapter runs on the authenticated, pinned carrier.
-    if let Some(state) = unsafe { current_carrier_state() } {
-        // The assembly published IMAGE -> ENTERING before switching the
-        // protected root and stack. This is a physical trap, not a Guest
-        // service-table call, so it does not increment service_calls.
-        state.trap_active.set(true);
-        state.leave_active_root();
-        state.set_phase(SERVICE);
-    }
+/// A synchronous fatal exception discards the failed continuation, including
+/// exceptions inside a redirect stub. Never IRET through its untrusted RSP or
+/// selectors before the fixed exit installs the protected Host stack/root.
+fn redirect_fatal_image_exception(state: &CarrierState, frame: &mut crate::arch::trap::TrapFrame) {
+    frame.rip = state.exit_entry;
+    frame.rsp = state.host_rsp;
+    frame.cs = crate::arch::trap::KERNEL_CS_VALUE;
+    frame.ss = crate::arch::trap::KERNEL_SS_VALUE;
+    frame.rflags = 2;
 }
 
-/// Prepares the root before the trap assembly's final IMAGE commit.
-/// A stop racing that commit is cleaned up by `enter` after fixed exit.
-pub(crate) fn end_image_trap() {
-    // Leave IRQs masked until trap.S has committed IMAGE and written CR3.
-    // Restoring IF here would permit a native preemption to migrate the
-    // carrier after we recorded this physical CPU in the active set.
-    crate::arch::irq::disable_local();
-    // SAFETY: The native trap adapter retains this carrier across Host work.
-    let Some(state) = (unsafe { current_carrier_state() }) else {
-        return;
-    };
-    state
-        .host_root
-        .set(crate::arch::mm::current_page_table_paddr());
-    state.trap_active.set(false);
-    state.set_phase(RETURNING);
-    if state.run_state.load(Ordering::Acquire) == RETURNING && !state.yield_pending.get() {
-        let _ = state.prepare_active_root();
-        state.resume_mirror();
-    }
-}
-
-/// Accounts for a physical image IRQ and selects a safe interrupt return.
-///
-/// The trap adapter holds the Host root and Host stack until this returns.
+/// Runs at native kernel trap return, after Host callback levels unwind.
+/// Ordinary traps retain the shared Task stack and the currently active root.
 pub(crate) fn finish_image_trap(frame: &mut crate::arch::trap::TrapFrame) {
-    if frame.trap_num < 32 || frame.rflags & (1 << 9) == 0 {
+    if frame.cs & 3 != 0 || !irq::InterruptLevel::current().is_task_context() {
         return;
     }
-    // SAFETY: The assembly adapter authenticated the current carrier before
-    // calling the trap handler and keeps its state pinned across scheduling.
+    // SAFETY: Physical IRQs are masked by the native trap path. The current
+    // carrier and its immutable image entry table are pinned until fixed exit.
     let Some(state) = (unsafe { current_carrier_state() }) else {
         return;
     };
-    if (state.run_state.load(Ordering::Acquire) & !STOP_REQUESTED) != SERVICE
-        || !state.trap_active.get()
+    if state.run_state.load(Ordering::Acquire) != IMAGE
+        || !state.text.contains(&frame.rip)
+        || state.stub_range.contains(&frame.rip)
     {
         return;
     }
-    if state.run_state.load(Ordering::Acquire) & STOP_REQUESTED != 0 {
+    let cpu_access = state.cpu_access_range.contains(&frame.rip);
+    // An ordinary CPU-local sequence must finish on this internal Task even
+    // after stop or quota exhaustion. Unlike fixed entry stubs, it still owes
+    // the interrupted Task and virtual timer their physical tick samples.
+    if !cpu_access && state.sample_stop() {
+        frame.rip = state.exit_entry;
+        frame.rflags &= !(1 << 9);
         return;
     }
-    // SAFETY: The authenticated carrier pins this shared record until exit.
+    if frame.trap_num < 32 || frame.rflags & (1 << 9) == 0 {
+        return;
+    }
+    // SAFETY: The authenticated carrier pins its cooperation record.
     let record = unsafe { &*(state.vcpu_record as *const VcpuRecord) };
     let is_timer = crate::arch::is_timer_irq(frame.trap_num);
     if is_timer {
-        let counter = if record.irq_level.load(Ordering::Acquire) == 2 {
-            &record.tick_l2
-        } else {
-            &record.tick_kernel
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
-        record.pending.fetch_or(VIRQ_TICK, Ordering::Release);
+        match sample_tick_before_redirect(record, frame.rsp, cpu_access, |rsp| {
+            state.sample_stack_tick(rsp, false)
+        }) {
+            Ok(false) => return,
+            Ok(true) => (),
+            Err(()) => {
+                redirect_fatal_image_exception(state, frame);
+                return;
+            }
+        }
+    } else if cpu_access {
+        return;
     }
-    let is_critical =
+    let critical =
         record.guards.load(Ordering::Acquire) != 0 || record.irq_off.load(Ordering::Acquire) != 0;
-    let forced_yield = if is_critical && is_timer {
+    let at_bound = if critical && is_timer {
         let ticks = state.deferred_ticks.get().saturating_add(1);
         state.deferred_ticks.set(ticks);
         ticks >= 2
     } else {
-        if !is_critical {
-            state.deferred_ticks.set(0);
-        }
         false
     };
-    // Tick accounting charges every carrier to the same aggregate budget.
-    // This sampling closes the current Task's interval before consulting the
-    // Host-private quota, even when the virtual guard suppresses preemption.
-    scheduler::runtime_ticks();
-    if (forced_yield || state.control.account.exhausted()) && redirect_forced_yield(state, frame) {
+    if at_bound || state.control.account.is_throttled() {
+        let redirected = redirect_image_return(state, record, frame, state.yield_entry);
+        #[cfg(kernelet_rq1_diagnostics)]
+        if redirected {
+            state
+                .control
+                .account
+                .forced_yields
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        #[cfg(not(kernelet_rq1_diagnostics))]
+        let _ = redirected;
         state.deferred_ticks.set(0);
-        return;
-    }
-    if !is_critical {
-        state.deferred_ticks.set(0);
-        crate::arch::irq::enable_local();
-        scheduler::might_preempt();
-        crate::arch::irq::disable_local();
-    }
-    redirect_virtual_interrupt(state, record, frame);
-}
-
-/// Borrows the pinned landing frame as a complete continuation. The image
-/// stack is authenticated but is not touched by the redirect stub before it
-/// switches to the protected Host stack. The saved RFLAGS are restored only
-/// for the second IRET; the first IRET masks IF/TF for the transition.
-fn redirect_forced_yield(state: &CarrierState, frame: &mut crate::arch::trap::TrapFrame) -> bool {
-    if !state.text.contains(&frame.rip)
-        || state.run_state.load(Ordering::Acquire) != SERVICE
-        || !state.trap_active.get()
-        || state.yield_pending.get()
+    } else if !critical
+        && has_deliverable_virtual_interrupt(record)
+        && state.copy_fault_record().pending.load(Ordering::Acquire) == 0
     {
-        return false;
+        state.deferred_ticks.set(0);
+        let _ = redirect_image_return(state, record, frame, state.virq_entry);
     }
-    // The fixed yield stub switches to the Host stack before touching memory.
-    // Authenticate the interrupted stack pointer, but do not require upcall
-    // headroom here: a valid deep stack must still give up the CPU.
-    let valid_stack = frame.rsp.checked_sub(1).is_some_and(|last_byte| {
-        state
-            .execution
-            .stacks
-            .lock()
-            .contains_current_range(last_byte, frame.rsp, last_byte)
-    });
-    if !valid_stack {
-        state
-            .control
-            .stop(ExitReason::Killed(KillReason::StackReserve));
-        return false;
-    }
-    state.yield_rip.set(frame.rip);
-    state.yield_rflags.set(frame.rflags);
-    state.yield_pending.set(true);
-    frame.rip = kernelet_host_forced_yield as *const () as usize;
-    frame.rflags = 2;
-    true
 }
 
-/// Commits the fixed image upcall only after validating the saved continuation.
-fn redirect_virtual_interrupt(
+/// Records a physical timer before deciding whether this instruction can be
+/// redirected. The stack sampler authenticates the interrupted Task's slot.
+fn sample_tick_before_redirect(
+    record: &VcpuRecord,
+    rsp: usize,
+    cpu_access: bool,
+    sample_stack: impl FnOnce(usize) -> bool,
+) -> Result<bool, ()> {
+    let counter = if record.irq_level.load(Ordering::Acquire) != 0 {
+        &record.tick_l2
+    } else {
+        if !sample_stack(rsp) {
+            return Err(());
+        }
+        &record.tick_kernel
+    };
+    counter.fetch_add(1, Ordering::Relaxed);
+    record.pending.fetch_or(VIRQ_TICK, Ordering::Release);
+    Ok(!cpu_access)
+}
+
+/// Uses the two retired trap words below the live IRET frame as a handoff.
+/// The image stub saves registers before rebuilding its final IRET frame.
+fn redirect_image_return(
     state: &CarrierState,
     record: &VcpuRecord,
     frame: &mut crate::arch::trap::TrapFrame,
-) {
-    if !has_deliverable_virtual_interrupt(record)
-        || record.irq_off.load(Ordering::Acquire) != 0
-        // A fixup has returned to the image, but the copy has not yet read
-        // the Host's fault details. An upcall here could run another copy.
-        || state.copy_fault_record().pending.load(Ordering::Acquire) != 0
-        || !state.text.contains(&frame.rip)
-    {
-        return;
-    }
+    entry: usize,
+) -> bool {
     let Some(reserve_start) = frame.rsp.checked_sub(UPCALL_STACK_RESERVE) else {
         state
             .control
             .stop(ExitReason::Killed(KillReason::StackReserve));
-        return;
+        redirect_fatal_image_exception(state, frame);
+        return false;
     };
     if !state
         .execution
@@ -955,203 +962,69 @@ fn redirect_virtual_interrupt(
         state
             .control
             .stop(ExitReason::Killed(KillReason::StackReserve));
-        return;
+        redirect_fatal_image_exception(state, frame);
+        return false;
     }
-    // Trap number and error code are skipped by the assembly return. Their
-    // exact address, unlike an offset from the interrupted RSP, also accounts
-    // for any alignment padding in the hardware interrupt frame.
-    let rip = frame.rip;
-    frame.trap_num = rip;
-    frame.error_code = frame.rax;
-    frame.rax = core::ptr::addr_of!(frame.error_code) as usize;
-    frame.rip = state.virq_entry;
+    // &trap_num == align_down(interrupted RSP, 16) - 56. Only trap_num and
+    // error_code are retired before the first IRET; writing beyond them would
+    // corrupt that IRET's still-live RIP/CS/RFLAGS/RSP/SS.
+    frame.trap_num = frame.rip;
+    frame.error_code = frame.rsp;
+    frame.rsp = core::ptr::addr_of!(frame.trap_num) as usize;
+    frame.rip = entry;
     frame.rflags &= !(1 << 9);
-    record.irq_off.store(1, Ordering::Release);
+    if entry == state.virq_entry {
+        record.irq_off.store(1, Ordering::Release);
+    }
+    true
 }
 
 fn has_deliverable_virtual_interrupt(record: &VcpuRecord) -> bool {
     let pending = record.pending.load(Ordering::Acquire);
-    let level = record.irq_level.load(Ordering::Acquire);
-    pending != 0 && level < 2 && (level == 0 || pending & !VIRQ_TICK != 0)
+    pending != 0 && record.irq_level.load(Ordering::Acquire) == 0
 }
 
-/// Completes a service while still on the native Host stack and root.
-///
-/// The assembly return uses the nonzero result as its image upcall target.
-/// It stores the original return RIP and service RAX in two retired slots
-/// below the checked image RSP, exactly as `virq_entry` expects from the trap
-/// redirect. The pending bit belongs to vOSTD and remains set until handled.
-// SAFETY: Only the fixed service stubs call this with physical IRQs masked,
-// after every Rust service frame and its Host guards have returned.
+// SAFETY: The rejecting assembly stub has installed the native stack/root
+// before this function runs; it never dereferences the rejected RSP.
 #[unsafe(no_mangle)]
-extern "C" fn kernelet_host_prepare_service_return_impl() -> usize {
-    let Some(state) = (unsafe { current_carrier_state() }) else {
-        return 0;
-    };
-    debug_assert!(!crate::arch::irq::is_local_enabled());
-    if !state.root_installed.get() {
+extern "C" fn kernelet_host_stack_invalid_impl() {
+    if let Some(state) = unsafe { current_carrier_state() } {
         state
-            .host_root
-            .set(crate::arch::mm::current_page_table_paddr());
+            .control
+            .stop(ExitReason::Killed(KillReason::StackReserve));
     }
-    state.service_redirected.set(false);
-    // No Rust service frame remains. Quota parking can now publish THROTTLED
-    // with neither an image stack nor a Host service object active.
-    if state.run_state.load(Ordering::Acquire) == RETURNING {
-        state.suspend_mirror();
-        state.wait_for_budget(RETURNING);
+}
+
+/// Completes a service after every Rust service frame and guard has unwound.
+/// Virtual interrupts are delivered only by the native trap-return hook.
+// SAFETY: The fixed service stubs call with physical IRQs masked. Entry has
+// authenticated the pinned carrier, and native switches restore its pointer.
+#[unsafe(no_mangle)]
+extern "C" fn kernelet_host_prepare_service_return_impl() {
+    #[cfg(kernelet_getpid_profile)]
+    let _return_span = profile::span(profile::stage::HOST_RETURN_PREPARE);
+    let ptr = KERNELET_HOST_STATE_PTR.load() as *const CarrierState;
+    if ptr.is_null() {
+        return;
     }
-    if state.run_state.load(Ordering::Acquire) != RETURNING {
-        return 0;
-    }
-    // SAFETY: The authenticated carrier retains this shared record.
-    let record = unsafe { &*(state.vcpu_record as *const VcpuRecord) };
-    let mut redirect = false;
-    if state.run_state.load(Ordering::Acquire) == RETURNING
-        && has_deliverable_virtual_interrupt(record)
-        && record.irq_off.load(Ordering::Acquire) == 0
-        && state.copy_fault_record().pending.load(Ordering::Acquire) == 0
-    {
-        let image_rsp = state.image_rsp;
-        if let Some(post_call_rsp) = image_rsp.checked_add(size_of::<usize>())
-            && let Some(reserve_start) = post_call_rsp.checked_sub(UPCALL_STACK_RESERVE)
-            && state.execution.stacks.lock().contains_current_range(
-                reserve_start,
-                post_call_rsp,
-                image_rsp,
-            )
-        {
-            // SAFETY: The private stack pool validated the entire mapped
-            // range. The saved stack pointer need not be aligned here.
-            let return_ip = unsafe { (image_rsp as *const usize).read_unaligned() };
-            redirect = state.text.contains(&return_ip);
-        }
-    }
-    if redirect {
-        record.irq_off.store(1, Ordering::Release);
-        state.service_redirected.set(true);
+    // SAFETY: This is the same Host-private carrier authenticated on entry;
+    // a synchronous service continuation cannot migrate to another Task.
+    let state = unsafe { &*ptr };
+    if state.sample_stop() {
+        return;
     }
     if state.run_state.load(Ordering::Acquire) == RETURNING {
         let _ = state.prepare_active_root();
     }
-    if state.run_state.load(Ordering::Acquire) == RETURNING {
-        state.resume_mirror();
-    }
-    if redirect { state.virq_entry } else { 0 }
 }
 
-/// Undoes a prepared upcall if the final no-stop image commit loses a race.
-// SAFETY: Only the fixed service stubs call this on the protected Host stack
-// after a failed RETURNING -> IMAGE compare-and-exchange with IRQs masked.
+// SAFETY: A failed final commit calls with IRQs masked on the validated shared
+// Task stack. The fixed exit restores the protected Host stack afterward.
 #[unsafe(no_mangle)]
 extern "C" fn kernelet_host_cancel_service_return_impl() {
-    let Some(state) = (unsafe { current_carrier_state() }) else {
-        return;
-    };
-    // SAFETY: The authenticated carrier retains this shared record.
-    let record = unsafe { &*(state.vcpu_record as *const VcpuRecord) };
-    if state.service_redirected.replace(false) {
-        record.irq_off.store(0, Ordering::Release);
+    if let Some(state) = unsafe { current_carrier_state() } {
+        state.set_phase(LEAVING);
     }
-    state.set_phase(LEAVING);
-}
-
-// SAFETY: The trap or fixed-yield return calls this only on the protected
-// Host stack/root after a failed final no-stop image commit. It never adjusts
-// service-upcall state, which may belong to a prior completed service.
-#[unsafe(no_mangle)]
-extern "C" fn kernelet_host_cancel_trap_return_impl() {
-    let Some(state) = (unsafe { current_carrier_state() }) else {
-        return;
-    };
-    state.set_phase(LEAVING);
-}
-
-// SAFETY: The fixed yield stub has switched to the native Host stack under
-// the Host root. The complete interrupted image frame remains pinned on this
-// carrier's private IST landing stack until its final IRET or fixed exit.
-#[unsafe(no_mangle)]
-extern "C" fn kernelet_host_forced_yield_impl() {
-    let Some(state) = (unsafe { current_carrier_state() }) else {
-        return;
-    };
-    if state.run_state.load(Ordering::Acquire) != ENTERING || !state.yield_pending.get() {
-        return;
-    }
-    state.enter_schedulable_service();
-    crate::arch::irq::enable_local();
-    Task::yield_now();
-    crate::arch::irq::disable_local();
-    state.set_phase(RETURNING);
-}
-
-// SAFETY: Only the fixed yield return calls this after its Rust service frame
-// has unwound, with physical IRQs masked on the protected Host stack/root.
-#[unsafe(no_mangle)]
-extern "C" fn kernelet_host_prepare_yield_return_impl() {
-    let Some(state) = (unsafe { current_carrier_state() }) else {
-        return;
-    };
-    if state.run_state.load(Ordering::Acquire) != RETURNING || !state.yield_pending.get() {
-        return;
-    }
-    state.wait_for_budget(RETURNING);
-    if state.run_state.load(Ordering::Acquire) != RETURNING {
-        return;
-    }
-    let frame_start = state.image_rsp;
-    if frame_start < state.landing_start
-        || frame_start
-            .checked_add(size_of::<crate::arch::trap::TrapFrame>())
-            .is_none_or(|end| end > state.landing_end)
-    {
-        state
-            .control
-            .stop(ExitReason::Killed(KillReason::EntryFailed));
-        return;
-    }
-    // SAFETY: The trap adapter retained this private landing frame and no
-    // other handler can use its per-carrier IST while the native IDT is live.
-    let frame = unsafe { &mut *(frame_start as *mut crate::arch::trap::TrapFrame) };
-    frame.rip = state.yield_rip.get();
-    frame.rflags = state.yield_rflags.get();
-    state.yield_pending.set(false);
-    let _ = state.prepare_active_root();
-    state.resume_mirror();
-}
-
-/// # Safety
-///
-/// The current carrier must retain the mapped image through lifetime `'a`.
-unsafe fn image_bytes<'a>(ptr: *const u8, len: u32, limit: u32) -> Result<&'a [u8], i64> {
-    if len > limit {
-        return Err(-INVALID);
-    }
-    if len == 0 {
-        return Ok(&[]);
-    }
-    let state_ptr = KERNELET_HOST_STATE_PTR.load() as *const CarrierState;
-    if state_ptr.is_null() {
-        return Err(-STATE);
-    }
-    // SAFETY: The carrier installs its state before entry and interrupts are
-    // disabled, so no other thread can remove the pointer during a crossing.
-    let state = unsafe { &*state_ptr };
-    let start = ptr as usize;
-    let Some(end) = start.checked_add(len as usize) else {
-        return Err(-INVALID);
-    };
-    let in_image = start >= state.image_start && end <= state.image_end;
-    let in_stack = state.execution.stacks.lock().contains_range(start, end);
-    let in_grant = start
-        .checked_sub(crate::mm::kspace::LINEAR_MAPPING_BASE_VADDR)
-        .is_some_and(|paddr| state.guest_memory.contains(paddr as u64, len as usize));
-    if !in_image && !in_stack && !in_grant {
-        return Err(-INVALID);
-    }
-    // SAFETY: The range lies in the pinned image, stack pool or owned linear
-    // grant. Grants are append-only until every carrier has detached.
-    Ok(unsafe { core::slice::from_raw_parts(ptr, len as usize) })
 }
 
 // SAFETY: Only the assembly stop stub calls this on the native Host stack.
@@ -1168,9 +1041,11 @@ extern "C" fn kernelet_host_stop_impl(kind: u32, code: u32, msg: *const u8, len:
     };
     state.leave_active_root();
     state.set_phase(LEAVING);
-    // Copy the bounded panic text before abandoning the image continuation.
-    // SAFETY: This carrier still pins the image and its current stack.
-    let message = unsafe { image_bytes(msg, len, MAX_OOPS_BYTES) }
+    // Copy once into Host storage before publishing the stop.
+    let mut buffer = [0; MAX_OOPS_BYTES as usize];
+    // SAFETY: The carrier pins the Image; mapped source bytes are supplied
+    // under the synchronous shared-byte borrow of the stop ABI.
+    let message = unsafe { record::read(state, msg, len, &mut buffer) }
         .ok()
         .and_then(|bytes| core::str::from_utf8(bytes).ok());
     let reason = match kind {
@@ -1184,13 +1059,56 @@ extern "C" fn kernelet_host_stop_impl(kind: u32, code: u32, msg: *const u8, len:
     state.control.stop(reason);
     // The stop assembly stub already installed the native root. Keep the
     // desired root until fixed-exit cleanup clears its shared registration.
-    // SAFETY: The carrier retains the image until the fixed exit continuation.
-    if let Ok(message) = unsafe { image_bytes(msg, len, MAX_OOPS_BYTES) }
-        && let Ok(message) = core::str::from_utf8(message)
-    {
+    if let Some(message) = message {
         crate::info!("kernelet stopped: kind={kind}, code={code}, {message}");
     } else {
         crate::info!("kernelet stopped: kind={kind}, code={code}");
     }
     code
+}
+
+#[cfg(ktest)]
+#[crate::prelude::ktest]
+fn machine_events_do_not_enter_tenant_fault_containment() {
+    assert!(!containable_image_exception(2));
+    assert!(!containable_image_exception(18));
+    assert!(!containable_image_exception(32));
+    assert!(containable_image_exception(8));
+    assert!(containable_image_exception(14));
+}
+
+#[cfg(ktest)]
+#[crate::prelude::ktest]
+fn cpu_local_access_defers_redirect_without_losing_physical_ticks() {
+    use super::abi::StackTickRecord;
+
+    let record = VcpuRecord::default();
+    let stack_ticks = StackTickRecord::default();
+    let rsp = 0x1000;
+    let may_redirect = sample_tick_before_redirect(&record, rsp, true, |observed| {
+        assert_eq!(observed, rsp);
+        stack_ticks.record(false)
+    })
+    .unwrap();
+    assert!(!may_redirect);
+    assert_eq!(record.tick_kernel.load(Ordering::Acquire), 1);
+    assert_eq!(record.pending.load(Ordering::Acquire), VIRQ_TICK);
+    assert_eq!(stack_ticks.take(), (0, 1));
+
+    // A nested virtual IRQ keeps its L2 classification without attributing
+    // its tick to the interrupted Task, including in a protected CPU access.
+    record.irq_level.store(1, Ordering::Release);
+    assert!(
+        !sample_tick_before_redirect(&record, rsp, true, |_| {
+            panic!("L2 must not sample the Task stack")
+        })
+        .unwrap()
+    );
+    assert_eq!(record.tick_l2.load(Ordering::Acquire), 1);
+    record.irq_level.store(0, Ordering::Release);
+    assert!(
+        sample_tick_before_redirect(&record, rsp, false, |_| stack_ticks.record(false)).unwrap()
+    );
+    assert_eq!(record.tick_kernel.load(Ordering::Acquire), 2);
+    assert_eq!(stack_ticks.take(), (0, 1));
 }

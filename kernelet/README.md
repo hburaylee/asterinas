@@ -12,6 +12,35 @@ the ELF image format, its build contract,
 and where the loader and audit code live —
 is documented in [`ABI.md`](ABI.md).
 
+## Kernel build modes
+
+`kernelet-host` enables Host support and is disabled by default.
+The separate `kernelet` feature builds the Image; the two features are mutually
+exclusive and currently support only x86-64.
+Run these commands from `kernel/` inside the development container:
+
+| Command | Result |
+|---|---|
+| `cargo osdk build --release` | Native kernel without Kernelets Host support. |
+| `cargo osdk build --release --features kernelet-host` | Host support without an embedded Image. |
+| `cargo osdk build --release --kernelet` | Audited Image followed by a Host with `kernelet-host`, embedding that Image. |
+
+The paired build enables `kernelet` only for its separate Image invocation.
+Host builds with support enabled use panic unwinding for protected service
+continuations.
+An explicitly enabled Host without an embedded Image does not register
+`/dev/kernelet`.
+
+Without Host support, production builds exclude carrier accounting and switch
+hooks, Host timer services, NAT charge fields, carrier page-table ownership,
+and synchronous mapping-reclamation extensions.
+Explicit RQ1 fixture and diagnostic builds retain their measurement code;
+they are separate from production Native builds.
+Enabling Host support still changes shared paths even before creating an
+instance. This configuration needs its own performance measurements.
+
+## Userspace build
+
 Build all three statically linked programs with:
 
 ```sh
@@ -19,7 +48,7 @@ cargo build --manifest-path kernelet/Cargo.toml --release --target x86_64-unknow
 ```
 
 For the Asterinas initramfs,
-pass the built runtime and agent as explicit inputs to `make initramfs`
+pass the built runtime, agent, and shim as explicit inputs to `make initramfs`
 as described in
 [`test/initramfs/README.md`](../test/initramfs/README.md#kernelet-userspace).
 That image includes an OCI Bash bundle with SQLite
@@ -48,8 +77,52 @@ transferring the Host PTY master with `SCM_RIGHTS`.
 `stats <id>` reports JSON with
 CPU execution, throttling, completion and receive-copy CPU time,
 granted memory, memory limit, Host charges, and stacks.
-Completion and receive-copy counters describe portions of total CPU time;
-they are not added to the aggregate quota again.
+Total CPU time includes carrier execution and adopted Host completion and
+receive-copy work.
+The completion and receive-copy counters describe portions of that total.
+They are collected only in diagnostic kernel builds. Ordinary builds report
+these two JSON fields as `null`; total CPU time and resource accounting remain
+available. The raw `STATS` ioctl uses `STATS_UNAVAILABLE` (`UINT64_MAX`) for
+uncollected diagnostic fields, preserving the structure's layout.
+The CPU quota currently limits carrier execution time;
+adopted Host work contributes to statistics without consuming that quota.
+Throttle time is the sum of the wall-clock time each carrier spends waiting
+for its CPU budget.
+
+The runtime applies these OCI resource fields at creation:
+
+| Field | Current behavior |
+|---|---|
+| `linux.resources.memory.limit` | A nonnegative limit is rounded down to a whole 2 MiB grain, with creation failing below one grain; a negative or omitted limit uses `--max-grains`. |
+| `linux.resources.cpu.cpus` | The number of distinct CPU numbers selects the vCPU count; the Host's placement policy selects Host CPUs independently of those numbers. |
+| `linux.resources.cpu.shares` | A positive value maps to the rounded nice value `10 - log2(shares)`, clamped to `[-20, 19]`; its fair weight is divided among the configured carriers. |
+| `linux.resources.cpu.quota` and `period` | A positive quota sets carrier CPU time in microseconds per period, with an omitted period defaulting to `100000` microseconds; a nonpositive or omitted quota leaves this limit disabled. |
+| `linux.resources.pids.limit` | A nonnegative limit is rejected; a negative limit does not install a finite OCI PID limit. |
+
+For `N` configured vCPUs, each carrier receives `W/N` of the fair weight
+selected by the sandbox's nice value.
+The scheduler retains fractional precision instead of rounding to another nice value.
+Later CPU budget updates preserve this divisor.
+This normalizes the carriers' total weight;
+it does not implement a sandbox group scheduler.
+Sleeping carriers do not transfer their weight to the remaining runnable carriers,
+and CPU placement still affects the time each carrier receives.
+Adopted device workers remain separate Host scheduling entities outside this split.
+
+`--max-grains` defaults to 256 grains (512 MiB) of Guest memory.
+The Host's default per-user admission budget is 512 grains (1 GiB) in total,
+including Guest memory ceilings and reserved Host execution storage.
+The runtime default leaves room for Host Task stacks and carrier resources.
+An explicit OCI memory limit or `--max-grains` value still sets the Guest
+ceiling; creation fails if that ceiling plus Host reservations exceeds
+the remaining per-user budget.
+
+Other resource fields,
+including memory reservation and swap limits,
+block I/O limits,
+huge-page limits,
+and CPU memory-node selection,
+are currently accepted without being applied.
 
 The runtime builds content-addressed ext2 images,
 including the agent in the root image.
@@ -59,6 +132,12 @@ before processing the configuration.
 Bind files are sent separately through the agent protocol
 and preserve ownership and mode;
 read-only directory binds become separate cached block images.
+The runtime and agent require protocol version `4` in `Hello`;
+build and deploy them together.
+This version carries acknowledged `SignalAll` requests for every Guest process
+except the PID 1 agent, including descendants that changed session or process group.
+Per-process signals still address the selected launcher's process group.
+Signal `0` probes existence without terminating a created process or sandbox.
 A rootfs or agent that changes during image assembly
 fails creation
 instead of publishing a cache entry under an incorrect content key.
@@ -77,6 +156,26 @@ The shim persists the observed main-process exit
 for its crash cleanup command.
 If no exit was observed,
 crash cleanup reports forced termination (137).
+During normal deletion, `poststop` hooks can call `State` and `Wait`;
+the task remains registered until cleanup finishes.
+
+The agent gives stdout and stderr up to one second to finish after obtaining
+the process's exit status.
+The shim forwards each output stream through its own worker,
+with a queue of at most eight 16 KiB chunks,
+and uses nonblocking writes to avoid waiting indefinitely for a FIFO consumer.
+It also bounds queue handoff and output draining after exit to one second.
+Once it receives the exit status, it stops attachment input forwarding
+before waiting for output workers.
+A stream that cannot drain reports a local output failure and may be truncated;
+the process keeps its actual exit code.
+If an attachment disconnects,
+the shim queries the holder's exit cache through a separate control connection.
+An unavailable exit status makes `Wait` return an error.
+Descendants that leave their launcher's process group can remain alive after
+that process exits;
+`kill(all=true)` signals these descendants as well.
+Sandbox destruction terminates the remaining Guest execution.
 
 Shim `Stats` exposes
 the Host's CPU time, throttle time, and granted/capped memory
@@ -145,9 +244,10 @@ KERNELET_TEST_MKE2FS=/path/to/mke2fs cargo test --manifest-path kernelet/Cargo.t
 
 Native tests cover
 message bounds, descriptor transfer, and actual ext2 image creation and reuse.
+They also exercise shim RPC deletion races
+and hook callbacks through `State` and `Wait`,
+plus local forwarding with real FIFOs and sockets under input backpressure.
 They do not prove that the full guest boot, overlay, OCI lifecycle,
 containerd integration, or Host network forwarding paths work.
 Those require the integrated QEMU tests
-and a Host kernel implementing the resource and lifecycle ABI;
-the runtime does not silently replace unsupported resource settings
-with different values.
+and a Host kernel implementing the resource and lifecycle ABI.

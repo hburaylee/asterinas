@@ -54,11 +54,23 @@ SECTIONS
 #SOURCE_HASH_QUADS#
         QUAD(__ex_table - __kernelet_image_base);             /* ex_table_start_offset */
         QUAD(__ex_table_end - __kernelet_image_base);         /* ex_table_end_offset */
+        QUAD(yield_entry - __kernelet_image_base);            /* yield_entry_offset */
+        QUAD(exit_entry - __kernelet_image_base);             /* exit_entry_offset */
+        QUAD(__kernelet_stubs_start - __kernelet_image_base);  /* stub_range_start_offset */
+        QUAD(__kernelet_stubs_end - __kernelet_image_base);    /* stub_range_end_offset */
+        QUAD(__kernelet_cpu_access_start - __kernelet_image_base); /* cpu_access_start_offset */
+        QUAD(__kernelet_cpu_access_end - __kernelet_image_base);   /* cpu_access_end_offset */
     } : text
 
     . = ALIGN(HUGE_PAGE);
 
     .text : {
+        __kernelet_stubs_start = .;
+        KEEP(*(.text.kernelet_stubs))
+        __kernelet_stubs_end = .;
+        __kernelet_cpu_access_start = .;
+        KEEP(*(.text.kernelet_cpu_access))
+        __kernelet_cpu_access_end = .;
         *(.text .text.*)
         PROVIDE(__etext = .);
     } : text

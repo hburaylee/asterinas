@@ -365,6 +365,11 @@ mod iter {
     impl<M: AnyFrameMeta + ?Sized> Iterator for IntoIter<M> {
         type Item = Frame<M>;
 
+        fn size_hint(&self) -> (usize, Option<usize>) {
+            let remaining = (self.range.end - self.range.start) / PAGE_SIZE;
+            (remaining, Some(remaining))
+        }
+
         fn next(&mut self) -> Option<Self::Item> {
             if self.range.start < self.range.end {
                 // SAFETY: Each frame in the range would be a handle forgotten
@@ -379,6 +384,8 @@ mod iter {
             }
         }
     }
+
+    impl<M: AnyFrameMeta + ?Sized> ExactSizeIterator for IntoIter<M> {}
 
     impl<M: AnyFrameMeta + ?Sized> Drop for IntoIter<M> {
         fn drop(&mut self) {

@@ -25,15 +25,22 @@ unsafe extern "C" {
 #[unsafe(no_mangle)]
 static KERNELET_SERVICES: AtomicPtr<ServiceTable> = AtomicPtr::new(core::ptr::null_mut());
 #[unsafe(no_mangle)]
-static KERNELET_BOOT_ARGS: AtomicPtr<BootArgs> = AtomicPtr::new(core::ptr::null_mut());
+pub(crate) static KERNELET_BOOT_ARGS: AtomicPtr<BootArgs> = AtomicPtr::new(core::ptr::null_mut());
 
 /// Starts virtual CPU zero on its boot stack.
 ///
 /// The Host validates the entry target and both argument mappings before the
 /// call. The boot page remains mapped for the instance lifetime.
+///
+/// # Safety
+///
+/// OSDK's validated Host must call this once on vCPU zero's initialized boot
+/// stack. `boot` must back the complete immutable boot mapping and every
+/// referenced shared page for the instance lifetime; `services` must be the
+/// matching Host table. The current carrier and CPU-local replica must agree.
 // SAFETY: OSDK links this symbol into the kernelet image only.
 #[unsafe(no_mangle)]
-pub extern "C" fn _kernelet_entry(services: &'static ServiceTable, boot: &BootArgs) -> ! {
+pub unsafe extern "C" fn _kernelet_entry(services: &'static ServiceTable, boot: &BootArgs) -> ! {
     KERNELET_SERVICES.store(core::ptr::from_ref(services).cast_mut(), Ordering::Release);
     KERNELET_BOOT_ARGS.store(core::ptr::from_ref(boot).cast_mut(), Ordering::Release);
 
@@ -49,6 +56,15 @@ pub extern "C" fn _kernelet_entry(services: &'static ServiceTable, boot: &BootAr
     // Host validates its size and mapping before entering the image.
     let entry_table = unsafe { &*entry_table_ptr };
     let record_pages = vcpu_shared_bytes(boot.num_vcpus as usize).div_ceil(PAGE_SIZE);
+    let run_bytes = u64::from(boot.max_meta_sections)
+        * (super::abi::META_SECTION_BYTES / super::abi::GRAIN_SIZE) as u64
+        * size_of::<super::abi::RunDesc>() as u64;
+    let run_end =
+        u64::from(boot.grant_table) + run_bytes.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
+    let reverse_bytes = u64::from(boot.max_meta_sections) * size_of::<u32>() as u64;
+    let bitmap_offset = u64::from(boot.meta_block_sections)
+        + reverse_bytes.div_ceil(PAGE_SIZE as u64) * PAGE_SIZE as u64;
+    let bitmap_end = bitmap_offset + u64::from(boot.max_meta_sections) * size_of::<u64>() as u64;
     if boot.size != size_of::<BootArgs>() as u32
         || entry_table.size != size_of::<EntryTable>() as u64
         || boot.source_hash != entry_table.source_hash
@@ -56,6 +72,14 @@ pub extern "C" fn _kernelet_entry(services: &'static ServiceTable, boot: &BootAr
         || boot.vcpu_records != PAGE_SIZE as u32
         || boot.clock_page != ((1 + record_pages) * PAGE_SIZE) as u32
         || boot.info_page != boot.clock_page + PAGE_SIZE as u32
+        || boot.max_meta_sections == 0
+        || boot.grant_table != boot.info_page + PAGE_SIZE as u32
+        || u64::from(boot.meta_section_index) < run_end
+        || !boot.meta_section_index.is_multiple_of(PAGE_SIZE as u32)
+        || boot.meta_block_sections <= boot.meta_section_index
+        || !boot.meta_block_sections.is_multiple_of(PAGE_SIZE as u32)
+        || u64::from(boot.meta_grain_bitmap) != bitmap_offset
+        || bitmap_end > u64::from(u32::MAX)
         || (boot.cmdline_offset as usize) < size_of::<BootArgs>()
         || (boot.cmdline_offset as usize)
             .checked_add(boot.cmdline_len as usize)
@@ -72,11 +96,6 @@ pub extern "C" fn _kernelet_entry(services: &'static ServiceTable, boot: &BootAr
         (services.stop)(STOP_PANIC, 0, MESSAGE.as_ptr(), MESSAGE.len() as u32);
     }
 
-    crate::console::init_kernelet_logging();
-    crate::arch::init_kernelet_cpu_features();
-    crate::cpu::init_kernelet_bsp();
-    let regions = crate::kernelet::image_grant::init_initial_grant();
-    crate::sync::init();
     let boot = boot_args();
     let cmdline_start =
         (boot as *const BootArgs as *const u8).wrapping_add(boot.cmdline_offset as usize);
@@ -90,7 +109,15 @@ pub extern "C" fn _kernelet_entry(services: &'static ServiceTable, boot: &BootAr
             (services.stop)(STOP_PANIC, 0, MESSAGE.as_ptr(), MESSAGE.len() as u32)
         }
     };
+    let early_cmdline = crate::boot::parse_early_cmdline_from(cmdline);
+    crate::log::init(&early_cmdline);
+    crate::console::init_kernelet_logging();
+    crate::arch::init_kernelet_cpu_features();
+    crate::cpu::init_kernelet_bsp();
+    let regions = crate::kernelet::image_grant::init_initial_grant();
+    crate::sync::init();
     crate::boot::init_kernelet(cmdline, regions);
+    crate::task::adopt_boot_task();
     crate::arch::irq::enable_local();
     crate::invoke_ffi_init_funcs();
     crate::boot::smp::boot_all_aps();
@@ -143,19 +170,18 @@ pub fn devices() -> &'static [DeviceEntry] {
 }
 
 /// Returns the shared cooperation record for the current virtual CPU.
-pub fn vcpu_record() -> &'static VcpuRecord {
-    let boot = boot_args();
-    let host_cpu: u32;
-    // SAFETY: Host publishes its immutable CPU-slot offset and keeps GS native
-    // across all image execution. Each carrier is pinned to its assigned CPU.
+pub(crate) fn vcpu_record() -> &'static VcpuRecord {
+    let record: *const VcpuRecord;
+    // SAFETY: The complete lookup is nonredirectable and the Host pins the
+    // validated records for the image lifetime. This accessor stays inside
+    // OSTD: exposing writable cooperation fields would invalidate IRQ guards.
     unsafe {
-        asm!("mov {id:e}, gs:[{offset}]", id = out(reg) host_cpu, offset = in(reg) boot.cpu_slot_gs_offset as usize, options(nostack, readonly, preserves_flags))
-    };
-    let vcpu = boot.vcpu_host_cpu[..boot.num_vcpus as usize]
-        .iter()
-        .position(|cpu| *cpu as u32 == host_cpu)
-        .expect("carrier CPU absent from boot map");
-    record_for_vcpu(vcpu)
+        crate::arch::cpu::local::record_asm!("mov {record}, {record_base}";
+            record = out(reg) record,
+            options(nostack, readonly),
+        );
+        &*record
+    }
 }
 
 pub(crate) fn record_for_vcpu(vcpu: usize) -> &'static VcpuRecord {
@@ -185,80 +211,28 @@ pub(crate) fn copy_fault_record() -> &'static CopyFaultRecord {
 /// Publishes one nested internal preemption guard to the virtual CPU record.
 pub(crate) fn enter_preempt_guard() {
     let record = vcpu_record();
-    let previous = record.guards.fetch_add(1, Ordering::Relaxed);
-    assert_ne!(
-        previous,
-        u32::MAX,
-        "kernelet preemption guard count overflow"
-    );
+    debug_assert_ne!(record.irq_off.load(Ordering::Relaxed), 0);
+    // The caller masks virtual IRQs across both count updates. This vCPU is
+    // the only writer; native carrier preemption cannot introduce another one.
+    let next = record
+        .guards
+        .load(Ordering::Relaxed)
+        .checked_add(1)
+        .expect("kernelet preemption guard count overflow");
+    record.guards.store(next, Ordering::Release);
 }
 
 /// Releases one internal preemption guard after the image's own count drops.
 pub(crate) fn leave_preempt_guard() {
-    let previous = vcpu_record().guards.fetch_sub(1, Ordering::Relaxed);
-    assert_ne!(previous, 0, "kernelet preemption guard count underflow");
-}
-
-/// Masks physical IRQs only for the shared/native preemption handshake.
-/// Internal critical sections continue to use virtual IRQ masking.
-fn with_physical_irqs_masked<R>(f: impl FnOnce() -> R) -> R {
-    let flags: usize;
-    // SAFETY: The image runs at CPL 0 on its pinned carrier. Saving IF and
-    // masking physical IRQs prevents a Host trap from observing half a mirror.
-    unsafe { asm!("pushfq", "pop {}", "cli", out(reg) flags) };
-    let result = f();
-    if flags & (1 << 9) != 0 {
-        // SAFETY: Restore exactly the physical IRQ state saved above.
-        unsafe { asm!("sti", options(nostack)) };
-    }
-    result
-}
-
-/// Establishes the outer Host guard before publishing virtual IRQ masking.
-pub(crate) fn disable_virtual_irqs() {
-    with_physical_irqs_masked(|| {
-        let record = vcpu_record();
-        if record.mirrored.load(Ordering::Relaxed) == 0 {
-            let offset = boot_args().host_preempt_gs_offset as usize;
-            // SAFETY: The Host publishes its native u32 preemption cell's GS
-            // offset. The pinned carrier owns this CPU with physical IRQs off.
-            unsafe { asm!("add dword ptr gs:[{}], 1", in(reg) offset, options(nostack)) };
-            record.mirrored.store(1, Ordering::Relaxed);
-        }
-        record.irq_off.store(1, Ordering::Release);
-    });
-}
-
-/// Releases the outer guard after pending IRQ delivery and hands a pending
-/// native reschedule to the protected Host-stack yield service.
-pub(crate) fn release_host_preemption() {
-    let should_yield = with_physical_irqs_masked(|| {
-        let record = vcpu_record();
-        if record.guards.load(Ordering::Relaxed) != 0
-            || record.irq_off.load(Ordering::Relaxed) != 0
-            || record.mirrored.swap(0, Ordering::Relaxed) == 0
-        {
-            return false;
-        }
-        let offset = boot_args().host_preempt_gs_offset as usize;
-        let word: u32;
-        // SAFETY: This vCPU owns exactly one native guard. Physical IRQs are
-        // masked, so the decrement and pending-reschedule test cannot race a
-        // Host trap. The Host repairs the count at service and exit boundaries.
-        unsafe {
-            asm!(
-                "sub dword ptr gs:[{offset}], 1",
-                "mov {word:e}, gs:[{offset}]",
-                offset = in(reg) offset,
-                word = out(reg) word,
-                options(nostack),
-            )
-        };
-        word == 0
-    });
-    if should_yield {
-        (services().vcpu_yield)();
-    }
+    let record = vcpu_record();
+    debug_assert_ne!(record.irq_off.load(Ordering::Relaxed), 0);
+    // As on entry, virtual IRQ masking excludes another image-side writer.
+    let next = record
+        .guards
+        .load(Ordering::Relaxed)
+        .checked_sub(1)
+        .expect("kernelet preemption guard count underflow");
+    record.guards.store(next, Ordering::Release);
 }
 
 /// Whether a virtual interrupt was deferred by the current Task.
@@ -285,8 +259,9 @@ pub(crate) fn deliver_pending() -> PendingDelivery {
     if record.pending.load(Ordering::Acquire) == 0 {
         return PendingDelivery::Handled;
     }
-    // Claim this pending batch with virtual IRQs masked. A callback may enable
-    // virtual IRQs and admit one nested device interrupt, but not a third level.
+    // Claim this pending batch with virtual IRQs masked. Host physical IRQs
+    // may still arrive while callbacks run; their virtual events stay queued
+    // until this upcall returns to task context.
     let was_off = record.irq_off.swap(1, Ordering::AcqRel);
     // An upcall's scheduler check, or a scheduler decision before its context
     // switch, may disable and re-enable virtual IRQs. Leave the pending batch
@@ -296,28 +271,56 @@ pub(crate) fn deliver_pending() -> PendingDelivery {
         record.irq_off.store(was_off, Ordering::Release);
         return PendingDelivery::DeferredByCurrentTask;
     }
-    // A device callback may re-enable virtual IRQs at L1. It can then nest a
-    // second device callback, but OSTD has no third interrupt level.
+    // Upcalls enter only from task context. Pending events arriving during
+    // a handler remain queued until its task-context continuation resumes.
     let level = InterruptLevel::current();
-    if level == InterruptLevel::L2
-        || (!level.is_task_context() && record.pending.load(Ordering::Acquire) & !VIRQ_TICK == 0)
-    {
-        // An L1 delivery consisting only of ticks must wait for L0, where
-        // the saved L1-user/L1-kernel/L2 classes can be replayed faithfully.
+    if !level.is_task_context() {
         record.irq_off.store(was_off, Ordering::Release);
         return PendingDelivery::Handled;
     }
+    // Retain the interrupted Task's identity without an extra Arc count.
+    // Advance its progress before the epilogue is allowed to switch Tasks.
+    let batch_task = crate::task::Task::current();
     let pending = record.pending.swap(0, Ordering::AcqRel);
+    #[cfg(kernelet_getpid_profile)]
+    if pending != 0 {
+        super::getpid_profile::event(super::getpid_profile::event_id::VIRTUAL_IRQ);
+    }
     if pending & super::abi::VIRQ_KICK != 0 {
-        crate::task::scheduler::mark_need_preempt_on_current_cpu();
         super::image_grant::rescan_grants();
         crate::smp::do_virtual_inter_processor_call();
+        crate::task::scheduler::check_preempt_after_virtual_kick();
     }
-    let mut remaining = 64;
+    // Replay the tick snapshot before device callbacks. A shared callback
+    // limit would let continuously raised device lines starve the timer.
+    // New ticks and lines remain queued for the next upcall.
+    if pending & VIRQ_TICK != 0 {
+        if let Some(task) = batch_task.as_ref() {
+            task.flush_sampled_ticks();
+        }
+        let user = record.tick_user.swap(0, Ordering::AcqRel);
+        for _ in 0..user {
+            crate::irq::call_virtual_timer_callback_functions(
+                &TrapFrame::default(),
+                PrivilegeLevel::User,
+            );
+        }
+        let kernel = record.tick_kernel.swap(0, Ordering::AcqRel);
+        for _ in 0..kernel {
+            crate::irq::call_virtual_timer_callback_functions(
+                &TrapFrame::default(),
+                PrivilegeLevel::Kernel,
+            );
+        }
+        let l2 = record.tick_l2.swap(0, Ordering::AcqRel);
+        for _ in 0..l2 {
+            crate::irq::call_virtual_l2_timer_callback_functions(&TrapFrame::default());
+        }
+    }
     if pending & VIRQ_LINES != 0 {
         for (word, lines) in record.pending_lines.iter().enumerate() {
             let mut lines = lines.swap(0, Ordering::AcqRel);
-            while lines != 0 && remaining != 0 {
+            while lines != 0 {
                 let bit = lines.trailing_zeros() as usize;
                 lines &= lines - 1;
                 let line = word * 64 + bit;
@@ -327,66 +330,13 @@ pub(crate) fn deliver_pending() -> PendingDelivery {
                         &HwIrqLine::new(line as u8),
                         PrivilegeLevel::Kernel,
                     );
-                    remaining -= 1;
                 }
-            }
-            if lines != 0 {
-                record.pending_lines[word].fetch_or(lines, Ordering::Release);
-            }
-            if remaining == 0 {
-                record.pending.fetch_or(VIRQ_LINES, Ordering::Release);
-                break;
             }
         }
     }
-    if pending & VIRQ_TICK != 0 && !level.is_task_context() {
-        // The counters describe the interrupted level, not the level at which
-        // this delivery happens. Replay them from L0 so L1 and L2 callbacks
-        // keep their original accounting class.
-        record.pending.fetch_or(VIRQ_TICK, Ordering::Release);
-    } else if pending & VIRQ_TICK != 0 {
-        let user = record.tick_user.swap(0, Ordering::AcqRel);
-        let user_count = user.min(remaining);
-        for _ in 0..user_count {
-            crate::irq::with_virtual_interrupt_level(
-                || crate::timer::call_timer_callback_functions(&TrapFrame::default()),
-                PrivilegeLevel::User,
-            );
-        }
-        remaining -= user_count;
-        if user > user_count {
-            record
-                .tick_user
-                .fetch_add(user - user_count, Ordering::Release);
-            record.pending.fetch_or(VIRQ_TICK, Ordering::Release);
-        }
-
-        let kernel = record.tick_kernel.swap(0, Ordering::AcqRel);
-        let kernel_count = kernel.min(remaining);
-        for _ in 0..kernel_count {
-            crate::irq::with_virtual_interrupt_level(
-                || crate::timer::call_timer_callback_functions(&TrapFrame::default()),
-                PrivilegeLevel::Kernel,
-            );
-        }
-        remaining -= kernel_count;
-        if kernel > kernel_count {
-            record
-                .tick_kernel
-                .fetch_add(kernel - kernel_count, Ordering::Release);
-            record.pending.fetch_or(VIRQ_TICK, Ordering::Release);
-        }
-
-        let l2 = record.tick_l2.swap(0, Ordering::AcqRel);
-        let l2_count = l2.min(remaining);
-        for _ in 0..l2_count {
-            crate::irq::with_virtual_l2_level(|| {
-                crate::timer::call_timer_callback_functions(&TrapFrame::default())
-            });
-        }
-        if l2 > l2_count {
-            record.tick_l2.fetch_add(l2 - l2_count, Ordering::Release);
-            record.pending.fetch_or(VIRQ_TICK, Ordering::Release);
+    if pending != 0 {
+        if let Some(task) = batch_task {
+            task.complete_virq_batch();
         }
     }
     finish_virtual_interrupt();
@@ -415,6 +365,9 @@ fn finish_virtual_interrupt() {
     if task_context
         && vcpu_record().guards.load(Ordering::Acquire) == 0
         && crate::arch::irq::is_local_enabled()
+        // The one-shot boot Task cannot run callbacks that sleep or yield.
+        // The first ordinary Task will report quiescence and dispatch them.
+        && !crate::task::in_boot_task()
     {
         // SAFETY: The virtual IRQ has completed in ordinary Task context,
         // with no guard or RCU reader carried across this boundary.
@@ -423,12 +376,36 @@ fn finish_virtual_interrupt() {
 }
 
 /// Returns the Host service table installed at image entry.
-pub fn services() -> &'static ServiceTable {
+pub(crate) fn services() -> &'static ServiceTable {
     let ptr = KERNELET_SERVICES.load(Ordering::Acquire);
     assert!(!ptr.is_null(), "kernelet services used before image entry");
     // SAFETY: `_kernelet_entry` stores a Host-owned static table that remains
     // mapped for the image lifetime before any kernel-proper entry is called.
     unsafe { &*ptr }
+}
+
+/// Reports a kernel oops, retaining the Host's service result.
+///
+/// The Host accepts at most 1024 bytes of the message.
+pub fn report_oops(message: &str) -> i64 {
+    let mut len = message.len().min(1024);
+    while !message.is_char_boundary(len) {
+        len -= 1;
+    }
+    (services().oops)(message.as_ptr(), len as u32)
+}
+
+/// Returns the safe virtual-CPU kick service for boundary measurements.
+///
+/// The Host validates the target virtual CPU before publishing a kick.
+pub fn vcpu_kick_service() -> extern "C" fn(u32) -> i64 {
+    services().vcpu_kick
+}
+
+/// Returns the successful diagnostic service through its normal Host gate.
+#[cfg(kernelet_rq1)]
+pub fn rq1_echo_service() -> extern "C" fn(u64) -> i64 {
+    services().rq1_echo
 }
 
 /// Reports an unrecoverable image panic to the Host without allocating.
@@ -462,9 +439,14 @@ pub fn stop_panic(message: fmt::Arguments<'_>) -> ! {
 }
 
 /// Starts a secondary virtual CPU with the same boot protocol.
+///
+/// # Safety
+///
+/// The Host must enter this once on the dedicated carrier's initialized boot
+/// stack and CPU-local replica, after vCPU zero publishes the shared boot state.
 // SAFETY: OSDK links this fixed symbol into the entry table.
 #[unsafe(no_mangle)]
-pub extern "C" fn vcpu_entry() -> ! {
+pub unsafe extern "C" fn vcpu_entry() -> ! {
     let vcpu = vcpu_record().vcpu;
     // SAFETY: This dedicated carrier enters its initialized replica only once.
     unsafe { crate::cpu::init_on_ap(vcpu) };
@@ -472,63 +454,116 @@ pub extern "C" fn vcpu_entry() -> ! {
     crate::boot::smp::kernelet_ap_entry()
 }
 
-/// The fixed virtual-interrupt redirection target.
+// Both returning stubs enter with IF clear and RSP pointing at the two retired
+// trap words: the original RIP and RSP. The remaining five words still hold
+// the first IRET frame. Save flags before changing them, then save all GPRs.
+// The original IF was set, which the Host's redirect gate requires.
+macro_rules! returning_stub {
+    ($name:ident, $dispatch:ident) => {
+        // SAFETY: Only the checked Host trap-return hook enters these symbols.
+        // The linker publishes their complete executable range to the Host.
+        #[unsafe(naked)]
+        #[unsafe(no_mangle)]
+        #[unsafe(link_section = ".text.kernelet_stubs")]
+        #[doc = concat!("The fixed trap-return target `", stringify!($name), "`.")]
+        ///
+        /// # Safety
+        ///
+        /// Only the validated Host trap-return gate may enter this symbol,
+        /// with physical IRQs masked and the documented saved trap frame.
+        pub unsafe extern "C" fn $name() -> ! {
+            core::arch::naked_asm!(
+                "endbr64",
+                "pushfq",
+                "push rax",
+                "push rbx",
+                "push rcx",
+                "push rdx",
+                "push rsi",
+                "push rdi",
+                "push rbp",
+                "push r8",
+                "push r9",
+                "push r10",
+                "push r11",
+                "push r12",
+                "push r13",
+                "push r14",
+                "push r15",
+                "mov rbx, rsp",
+                "and rsp, -16",
+                "cld",
+                "sti",
+                "call {dispatch}",
+                "cli",
+                "mov rsp, rbx",
+                // Read every source before writing the overlapping IRET frame.
+                // Fifteen saved GPRs and saved RFLAGS precede the hand-off.
+                "mov rax, [rsp + 128]",
+                "mov rcx, [rsp + 152]",
+                // PUSHFQ clears RF in its saved image. The first IRET's saved
+                // RFLAGS word retains it, along with all the other flags.
+                "mov rdx, [rsp + 160]",
+                "or rdx, 512",
+                "mov rsi, [rsp + 136]",
+                "mov rdi, [rsp + 176]",
+                "mov [rsp + 128], rax",
+                "mov [rsp + 136], rcx",
+                "mov [rsp + 144], rdx",
+                "mov [rsp + 152], rsi",
+                "mov [rsp + 160], rdi",
+                "pop r15",
+                "pop r14",
+                "pop r13",
+                "pop r12",
+                "pop r11",
+                "pop r10",
+                "pop r9",
+                "pop r8",
+                "pop rbp",
+                "pop rdi",
+                "pop rsi",
+                "pop rdx",
+                "pop rcx",
+                "pop rbx",
+                "pop rax",
+                "add rsp, 8",
+                "iretq",
+                dispatch = sym $dispatch,
+            )
+        }
+    };
+}
+
+returning_stub!(virq_entry, virq_dispatch);
+returning_stub!(yield_entry, yield_dispatch);
+
+extern "C" fn yield_dispatch() {
+    (services().vcpu_yield)();
+}
+
+/// Terminates a carrier without touching its possibly exhausted Task stack.
 ///
-/// The Host places a pointer to two retired trap slots in RAX: the original
-/// RIP immediately before the pointer and the original RAX at the pointer.
-/// It returns with physical IRQs masked. This prologue restores RAX before
-/// enabling physical IRQs,
-/// then preserves the complete interrupted register image for the callback.
-// SAFETY: OSDK links this fixed symbol into the validated entry table. Only
-// the Host's checked interrupt-return redirection enters it.
+/// # Safety
+///
+/// Only the checked Host trap-return gate may enter with the documented
+/// saved frame and the matching pinned Host service table.
+// SAFETY: Only a checked Host redirect enters this symbol. The Host's fixed
+// stop prologue installs its protected stack before invoking Rust code.
 #[unsafe(naked)]
 #[unsafe(no_mangle)]
-pub extern "C" fn virq_entry() -> ! {
+#[unsafe(link_section = ".text.kernelet_stubs")]
+pub unsafe extern "C" fn exit_entry() -> ! {
     core::arch::naked_asm!(
         "endbr64",
-        "push qword ptr [rax - 8]",
-        "mov rax, [rax]",
-        "sti",
-        "nop",
-        "pushfq",
-        "push rax",
-        "push rbx",
-        "push rcx",
-        "push rdx",
-        "push rsi",
-        "push rdi",
-        "push rbp",
-        "push r8",
-        "push r9",
-        "push r10",
-        "push r11",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "mov rbx, rsp",
-        "and rsp, -16",
-        "cld",
-        "call {dispatch}",
-        "mov rsp, rbx",
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop r11",
-        "pop r10",
-        "pop r9",
-        "pop r8",
-        "pop rbp",
-        "pop rdi",
-        "pop rsi",
-        "pop rdx",
-        "pop rcx",
-        "pop rbx",
-        "pop rax",
-        "popfq",
-        "ret",
-        dispatch = sym virq_dispatch,
+        "xor edi, edi",
+        "xor esi, esi",
+        "xor edx, edx",
+        "xor ecx, ecx",
+        "mov rax, [rip + {services}]",
+        "jmp qword ptr [rax + {stop_offset}]",
+        services = sym KERNELET_SERVICES,
+        stop_offset = const core::mem::offset_of!(ServiceTable, stop),
     )
 }
 

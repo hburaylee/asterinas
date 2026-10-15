@@ -35,7 +35,7 @@ pub(crate) use cursor::{Cursor, CursorMut, PageTableFrag};
 use node::*; // FIXME: Remove glob imports.
 
 #[cfg(ktest)]
-mod test;
+pub(in crate::mm) mod test;
 
 pub(crate) mod boot_pt;
 
@@ -359,6 +359,12 @@ impl PageTable<UserPtConfig> {
 }
 
 impl PageTable<KernelPtConfig> {
+    #[cfg(not(feature = "kernelet"))]
+    pub(in crate::mm) fn activate(&self) {
+        // SAFETY: The permanent kernel root owns all shared Host mappings.
+        unsafe { self.root.activate() };
+    }
+
     /// Creates a new kernel page table.
     pub(in crate::mm) fn new_kernel_page_table() -> Self {
         let kpt = Self::empty();
@@ -449,6 +455,11 @@ impl<C: PageTableConfig> PageTable<C> {
         self.root.paddr()
     }
 
+    #[cfg(ktest)]
+    pub(in crate::mm) fn root_reference_count(&self) -> u64 {
+        self.root.reference_count()
+    }
+
     /// Queries about the mapping of a single byte at the given virtual address.
     ///
     /// Note that this function may fail reflect an accurate result if there are
@@ -489,7 +500,25 @@ impl<C: PageTableConfig> PageTable<C> {
         CursorMut::new(self, guard.as_atomic_mode_guard(), va, min_level)
     }
 
-    /// Creates a new cursor exclusively accessing the virtual address range for querying.
+    /// Creates a mapping cursor whose locked root can contain the requested leaves.
+    ///
+    /// Unlike [`Self::cursor_mut`], this keeps the lock root at or above
+    /// `max_map_level`, even when the range fits inside one huge-page entry.
+    /// It does not enlarge the accessible range or remove existing entries.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `max_map_level` is not a supported translation level.
+    pub(crate) fn cursor_mut_for_mapping<'rcu, G: AsAtomicModeGuard>(
+        &'rcu self,
+        guard: &'rcu G,
+        va: &Range<Vaddr>,
+        max_map_level: PagingLevel,
+    ) -> Result<CursorMut<'rcu, C>, PageTableError> {
+        CursorMut::new_for_mapping(self, guard.as_atomic_mode_guard(), va, max_map_level)
+    }
+
+    /// Create a new cursor exclusively accessing the virtual address range for querying.
     ///
     /// If another cursor is already accessing the range, the new cursor may wait until the
     /// previous cursor is dropped. The modification to the mapping by the cursor may also

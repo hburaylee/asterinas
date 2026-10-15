@@ -27,7 +27,7 @@ use crate::{
 ///
 /// If the current thread is not a POSIX thread, this method will panic.
 pub(crate) fn do_exit(term_status: TermStatus, ctx: &Context, user_ctx: &mut UserContext) {
-    exit_internal(term_status, false, ctx, user_ctx);
+    exit_internal(term_status, false, ctx, Some(user_ctx));
 }
 
 /// Kills all threads and exits the current POSIX process.
@@ -36,23 +36,33 @@ pub(crate) fn do_exit(term_status: TermStatus, ctx: &Context, user_ctx: &mut Use
 ///
 /// If the current thread is not a POSIX thread, this method will panic.
 pub(crate) fn do_exit_group(term_status: TermStatus, ctx: &Context, user_ctx: &mut UserContext) {
-    exit_internal(term_status, true, ctx, user_ctx);
+    exit_internal(term_status, true, ctx, Some(user_ctx));
+}
+
+/// Completes POSIX process teardown after its user Task has unwound.
+///
+/// There is no resumable user register context after an oops. Skip ptrace's
+/// exit stop rather than fabricate registers or wait for a tracer to resume
+/// this failed Task; normal signal/exit paths retain their ptrace handling.
+pub(crate) fn exit_after_oops(ctx: &Context) {
+    exit_internal(TermStatus::Killed(SIGKILL), true, ctx, None);
 }
 
 /// Exits the current POSIX thread or process.
 //
-// A mutable reference to `user_ctx` is needed because exiting a traced thread
-// may trigger a "exit" ptrace-event-stop, which snapshots the current user
-// register state and may later restore tracer-updated registers.
+// Normal exit carries registers for ptrace's exit stop. Oops teardown has
+// no resumable user context and must complete without entering that stop.
 fn exit_internal(
     term_status: TermStatus,
     is_exiting_group: bool,
     ctx: &Context,
-    user_ctx: &mut UserContext,
+    user_ctx: Option<&mut UserContext>,
 ) {
     let exit_code = term_status.as_u32();
-    ctx.posix_thread
-        .ptrace_may_stop_on(PtraceEvent::Exit(exit_code), ctx, user_ctx);
+    if let Some(user_ctx) = user_ctx {
+        ctx.posix_thread
+            .ptrace_may_stop_on(PtraceEvent::Exit(exit_code), ctx, user_ctx);
+    }
 
     let current_task = Task::current().unwrap();
     let current_thread = current_task.as_thread().unwrap();

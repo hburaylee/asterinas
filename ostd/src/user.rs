@@ -87,6 +87,15 @@ impl UserMode {
     /// cause the method to return
     /// and updating the user-mode CPU context,
     /// this method can be invoked again to go back to the user space.
+    ///
+    /// In a kernelet, this `UserMode` must reside on the calling task's kernel
+    /// stack. The Host borrows its register file in place for the ring transition;
+    /// a heap allocation cannot be used because the image can unmap that memory.
+    ///
+    /// # Panics
+    ///
+    /// This method panics if called in atomic mode, or if a kernelet's context
+    /// is outside the calling task's kernel stack.
     #[track_caller]
     pub fn execute<T: UserModeHooks>(&mut self, hooks: &T) -> ReturnReason {
         crate::task::atomic_mode::might_sleep();

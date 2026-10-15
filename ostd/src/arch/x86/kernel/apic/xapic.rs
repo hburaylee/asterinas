@@ -58,8 +58,8 @@ impl XApic {
                 self.io_mem.paddr() as u64 | XAPIC_ENABLE_BITS,
             );
 
-            // Set SVR. Enable APIC and set Spurious Vector to 15 (reserved IRQ number).
-            let svr: u32 = (1 << 8) | 15;
+            // Use a reserved external vector with the legacy low bits set.
+            let svr: u32 = (1 << 8) | crate::arch::irq::SPURIOUS_VECTOR as u32;
             self.io_mem.write_once(xapic::XAPIC_SVR as usize, &svr);
         }
     }

@@ -16,7 +16,7 @@ use crate::{
         bin::{AsterBin, AsterBinType, AsterBzImageMeta},
         file::BundleFile,
     },
-    util::{get_current_crates, hard_link_or_copy, new_command_checked_exists},
+    util::{get_current_crates, new_command_checked_exists},
 };
 
 pub fn make_install_bzimage(
@@ -96,6 +96,13 @@ pub fn make_stripped_boot_elf(
         install_dir.as_ref().join(elf_name + ".elf")
     };
 
+    // An older boot copy may still share its inode with Cargo's ELF. Remove
+    // that directory entry before either copying or stripping into this path.
+    match std::fs::remove_file(&result_elf_path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("Cannot replace boot ELF: {error}"),
+    }
     if strip {
         // We use rust-strip to reduce the kernel image size.
         let status = new_command_checked_exists("rust-strip")
@@ -119,8 +126,8 @@ pub fn make_stripped_boot_elf(
             },
         }
     } else {
-        // Copy the ELF file.
-        hard_link_or_copy(elf.path(), &result_elf_path).unwrap();
+        // QEMU's ELF header patch must never modify Cargo's original inode.
+        std::fs::copy(elf.path(), &result_elf_path).unwrap();
     }
 
     AsterBin::new(
@@ -281,4 +288,105 @@ fn encode_kernel_to_file(aster_elf: &AsterBin, encoding: PayloadEncoding) -> Pat
         .unwrap();
 
     encoded_path
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::fs::MetadataExt;
+
+    use super::*;
+    use crate::bundle::bin::AsterElfMeta;
+
+    #[test]
+    fn repeated_unstripped_qemu_copies_preserve_the_cargo_elf() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kernel");
+        let mut bytes = vec![0; 64];
+        bytes[..4].copy_from_slice(b"\x7fELF");
+        bytes[18..20].copy_from_slice(&62u16.to_le_bytes());
+        std::fs::write(&path, &bytes).unwrap();
+        let elf = AsterBin::new(
+            &path,
+            Arch::X86_64,
+            AsterBinType::Elf(AsterElfMeta {
+                has_linux_header: false,
+                has_pvh_header: false,
+                has_multiboot_header: true,
+                has_multiboot2_header: false,
+            }),
+            "test".into(),
+            false,
+        );
+        // Also cover replacing a stale hard link produced by the old code.
+        std::fs::hard_link(&path, directory.path().join("kernel.qemu_elf")).unwrap();
+        for _ in 0..2 {
+            let boot = make_stripped_boot_elf(directory.path(), &elf, false);
+            assert_ne!(
+                path.metadata().unwrap().ino(),
+                boot.path().metadata().unwrap().ino()
+            );
+            let boot = make_elf_for_qemu(boot);
+            assert_eq!(
+                &std::fs::read(boot.path()).unwrap()[18..20],
+                &3u16.to_le_bytes()
+            );
+            assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        }
+    }
+
+    #[test]
+    fn selected_action_encodings_produce_distinct_linux_payloads() {
+        use crate::config::{
+            Config,
+            scheme::{Action, Build},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("kernel");
+        std::fs::write(&path, b"kernel payload").unwrap();
+        let elf = AsterBin::new(
+            &path,
+            Arch::X86_64,
+            AsterBinType::Elf(AsterElfMeta {
+                has_linux_header: false,
+                has_pvh_header: false,
+                has_multiboot_header: false,
+                has_multiboot2_header: false,
+            }),
+            "test".into(),
+            false,
+        );
+        let config = Config {
+            work_dir: directory.path().into(),
+            target_arch: Arch::X86_64,
+            build: Build::default(),
+            run: Action {
+                build: Build {
+                    encoding: PayloadEncoding::Gzip,
+                    ..Build::default()
+                },
+                ..Action::default()
+            },
+            test: Action {
+                build: Build {
+                    encoding: PayloadEncoding::Zlib,
+                    ..Build::default()
+                },
+                ..Action::default()
+            },
+        };
+        assert_eq!(config.build.encoding, PayloadEncoding::Raw);
+        let gzip = std::fs::read(encode_kernel_to_file(
+            &elf,
+            config.run.build.encoding.clone(),
+        ))
+        .unwrap();
+        let zlib = std::fs::read(encode_kernel_to_file(
+            &elf,
+            config.test.build.encoding.clone(),
+        ))
+        .unwrap();
+        assert_eq!(&gzip[..3], &[0x1f, 0x8b, 8]);
+        assert_eq!(zlib[0], 0x78);
+        assert_ne!(gzip, zlib);
+    }
 }

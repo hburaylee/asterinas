@@ -15,6 +15,8 @@ OVMF ?= on
 # Pass RELEASE=0 to use the development profile for debugging.
 RELEASE ?= $(if $(filter run_kernelet,$(MAKECMDGOALS)),1,0)
 RELEASE_LTO ?= 0
+# Isolate generated OSDK images without creating another Cargo cache.
+OSDK_OUTPUT ?=
 LOG_LEVEL ?= error
 SCHEME ?= ""
 # `run_kernelet` boots with four CPUs by default:
@@ -138,6 +140,10 @@ CARGO_OSDK := ~/.cargo/bin/cargo-osdk
 
 # Common arguments for `cargo osdk` `build`, `run` and `test` commands.
 CARGO_OSDK_COMMON_ARGS :=
+CARGO_OSDK_OUTPUT_ARGS :=
+ifneq ($(strip $(OSDK_OUTPUT)),)
+CARGO_OSDK_OUTPUT_ARGS += --output="$(abspath $(OSDK_OUTPUT))"
+endif
 # The build arguments also apply to the `cargo osdk run` command.
 CARGO_OSDK_BUILD_ARGS := --kcmd-args="loglevel=$(LOG_LEVEL)"
 CARGO_OSDK_BUILD_ARGS += --kcmd-args="earlycon"
@@ -299,7 +305,7 @@ install_osdk:
 	@# The `OSDK_LOCAL_DEV` environment variable is used for local development
 	@# without the need to publish the changes of OSDK's self-hosted
 	@# dependencies to `crates.io`.
-	@OSDK_LOCAL_DEV=1 cargo install cargo-osdk --path osdk
+	@OSDK_LOCAL_DEV=1 cargo install cargo-osdk --path osdk --locked --target-dir "$(abspath osdk/target)"
 
 # This will install and update OSDK automatically
 $(CARGO_OSDK): $(OSDK_SRC_FILES)
@@ -343,7 +349,7 @@ else
 kernel: rootfs
 endif
 kernel:
-	@cd kernel && cargo osdk build $(CARGO_OSDK_BUILD_ARGS)
+	@cd kernel && cargo osdk build $(CARGO_OSDK_BUILD_ARGS) $(CARGO_OSDK_OUTPUT_ARGS)
 
 # Build the kernel with an initramfs and then run it
 .PHONY: run_kernel
@@ -354,7 +360,7 @@ else
 run_kernel: rootfs
 endif
 run_kernel:
-	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS)
+	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) $(CARGO_OSDK_OUTPUT_ARGS)
 # Check the running status of auto tests from the QEMU log
 ifeq ($(AUTO_TEST), conformance)
 	@tail --lines 100 qemu.log | grep -q "^All conformance tests passed." \
@@ -391,7 +397,7 @@ run_kernelet:
 		KERNELET_RUNTIME="$(KERNELET_USERSPACE_DIR)/kernelet-runtime" \
 		KERNELET_AGENT="$(KERNELET_USERSPACE_DIR)/kernelet-agent" \
 		KERNELET_SHIM="$(KERNELET_USERSPACE_DIR)/containerd-shim-kernelet-v2"
-	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) --kernelet
+	@cd kernel && cargo osdk run $(CARGO_OSDK_BUILD_ARGS) $(CARGO_OSDK_OUTPUT_ARGS) --kernelet
 
 # Build the Asterinas NixOS ISO installer image
 iso: BOOT_PROTOCOL = linux-efi-handover64
@@ -478,7 +484,7 @@ ktest: initramfs $(CARGO_OSDK)
 	@# cargo-osdk tests default workspace members.
 	@# `linux-bzimage-setup` is left out of `default-members`
 	@# because it is hard to unit test.
-	@cargo osdk test $(CARGO_OSDK_TEST_ARGS)
+	@cargo osdk test $(CARGO_OSDK_TEST_ARGS) $(CARGO_OSDK_OUTPUT_ARGS)
 
 .PHONY: docs
 docs: private DEFAULT_PACKAGE_NAMES = \
@@ -555,6 +561,11 @@ check: $(CARGO_OSDK)
 	@
 	@# Check typos
 	@typos
+
+# Preview Cargo cache cleanup; pass CACHE_CLEAN_ARGS=--apply to remove caches.
+.PHONY: clean_build_cache
+clean_build_cache:
+	@python3 tools/clean_build_cache.py $(CACHE_CLEAN_ARGS)
 
 .PHONY: clean
 clean:

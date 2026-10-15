@@ -5,10 +5,13 @@
 use std::{
     collections::BTreeMap,
     fs::{self, File, OpenOptions},
-    io::Read,
-    os::unix::{
-        ffi::OsStrExt,
-        fs::{FileTypeExt, MetadataExt, PermissionsExt},
+    io::{Read, Seek},
+    os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::{
+            ffi::OsStrExt,
+            fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
+        },
     },
     path::{Path, PathBuf},
     process::Command,
@@ -80,7 +83,7 @@ fn build_image(root: &Path, cache: &Path, agent: Option<&Path>, mke2fs: &Path) -
         return Ok(image);
     }
     let work = cache.join(format!(".{key}.{}", std::process::id()));
-    fs::create_dir(&work)?;
+    fs::DirBuilder::new().mode(0o700).create(&work)?;
     let result = (|| {
         let staging = work.join("root");
         copy_tree(root, &staging)?;
@@ -102,14 +105,48 @@ fn build_image(root: &Path, cache: &Path, agent: Option<&Path>, mke2fs: &Path) -
                     "rootfs directory escapes staging: {directory}"
                 );
             }
-            let destination = staging.join("sbin/kernelet-agent");
-            if fs::symlink_metadata(&destination).is_ok() {
-                fs::remove_file(&destination)?;
+            let sbin = staging.join("sbin").canonicalize()?;
+            ensure!(
+                sbin.starts_with(staging.canonicalize()?),
+                "agent directory escapes staging"
+            );
+            let directory = OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+                .open(sbin)?;
+            let name = c"kernelet-agent";
+            // SAFETY: the directory FD and literal C string remain live for both
+            // relative operations. The private work parent excludes image UIDs.
+            let removed = unsafe { libc::unlinkat(directory.as_raw_fd(), name.as_ptr(), 0) };
+            if removed < 0 && std::io::Error::last_os_error().raw_os_error() != Some(libc::ENOENT) {
+                return Err(std::io::Error::last_os_error().into());
             }
-            fs::copy(agent, &destination)?;
-            fs::set_permissions(&destination, fs::Permissions::from_mode(0o755))?;
+            // SAFETY: the borrowed directory FD and C name remain live; flags
+            // require a fresh regular file and reject a substituted symlink.
+            let raw = unsafe {
+                libc::openat(
+                    directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDWR
+                        | libc::O_CREAT
+                        | libc::O_EXCL
+                        | libc::O_NOFOLLOW
+                        | libc::O_CLOEXEC,
+                    0o755,
+                )
+            };
+            ensure!(
+                raw >= 0,
+                "create agent relative to staging directory: {}",
+                std::io::Error::last_os_error()
+            );
+            // SAFETY: openat returned a new owned descriptor exactly once here.
+            let mut destination = unsafe { File::from_raw_fd(raw) };
+            std::io::copy(&mut File::open(agent)?, &mut destination)?;
+            destination.set_permissions(fs::Permissions::from_mode(0o755))?;
+            destination.rewind()?;
             copied_digest.update(b"agent\0");
-            hash_file(&destination, &mut copied_digest)?;
+            hash_reader(&mut destination, &mut copied_digest)?;
             ensure!(
                 format!("{:x}", copied_digest.finalize()) == key,
                 "agent changed while building rootfs"
@@ -228,7 +265,10 @@ fn hash_tree_inner(
 }
 
 fn hash_file(path: &Path, digest: &mut Sha256) -> Result<()> {
-    let mut file = File::open(path)?;
+    hash_reader(&mut File::open(path)?, digest)
+}
+
+fn hash_reader(file: &mut File, digest: &mut Sha256) -> Result<()> {
     let mut buffer = [0; 64 * 1024];
     loop {
         let count = file.read(&mut buffer)?;
@@ -327,6 +367,32 @@ mod tests {
             build_image(&root, &cache, None, Path::new(&tool)).unwrap(),
             image
         );
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    #[ignore = "requires mke2fs; validates private staging and no-follow agent injection"]
+    fn agent_injection_does_not_follow_an_existing_destination_symlink() {
+        let actual = std::env::var_os("KERNELET_TEST_MKE2FS").expect("set KERNELET_TEST_MKE2FS");
+        let directory =
+            std::env::temp_dir().join(format!("kernelet-agent-injection-{}", std::process::id()));
+        let root = directory.join("root");
+        fs::create_dir_all(root.join("sbin")).unwrap();
+        let outside = directory.join("outside");
+        fs::write(&outside, b"must survive").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("sbin/kernelet-agent")).unwrap();
+        let agent = directory.join("agent");
+        fs::write(&agent, b"replacement agent").unwrap();
+        let wrapper = directory.join("mke2fs");
+        // The real image builder invokes this guard after copying OCI metadata.
+        // It checks the work parent, then delegates to the actual ext2 tool.
+        fs::write(&wrapper, b"#!/bin/sh\nstage=\nprevious=\nfor value do\n  if [ \"$previous\" = -d ]; then stage=$value; fi\n  previous=$value\ndone\n[ \"$(stat -c %a \"$(dirname \"$stage\")\")\" = 700 ] || exit 77\nexec \"$KERNELET_TEST_MKE2FS\" \"$@\"\n").unwrap();
+        fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+        let image = build_image(&root, &directory.join("cache"), Some(&agent), &wrapper).unwrap();
+        assert!(image.is_file());
+        assert_eq!(fs::read(&outside).unwrap(), b"must survive");
+        assert!(fs::metadata(image).unwrap().len() > 0);
+        assert!(Path::new(&actual).is_file());
         fs::remove_dir_all(directory).unwrap();
     }
 

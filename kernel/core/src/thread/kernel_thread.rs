@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
+#[cfg(feature = "kernelet-host")]
+use core::num::NonZeroU16;
+
 use ostd::{
     cpu::CpuSet,
     task::{Task, TaskOptions},
@@ -47,6 +50,8 @@ pub(crate) struct ThreadOptions {
     func: Option<Box<dyn FnOnce() + Send>>,
     cpu_affinity: CpuSet,
     sched_policy: SchedPolicy,
+    #[cfg(feature = "kernelet-host")]
+    fair_weight_divisor: NonZeroU16,
     vmar: Option<Arc<Vmar>>,
 }
 
@@ -62,6 +67,8 @@ impl ThreadOptions {
             func: Some(Box::new(func)),
             cpu_affinity,
             sched_policy,
+            #[cfg(feature = "kernelet-host")]
+            fair_weight_divisor: NonZeroU16::MIN,
             vmar: None,
         }
     }
@@ -92,6 +99,13 @@ impl ThreadOptions {
         self.vmar = Some(vmar);
         self
     }
+
+    /// Divides this Host carrier thread scheduling weight.
+    #[cfg(feature = "kernelet-host")]
+    pub(crate) fn fair_weight_divisor(mut self, divisor: NonZeroU16) -> Self {
+        self.fair_weight_divisor = divisor;
+        self
+    }
 }
 
 impl ThreadOptions {
@@ -109,12 +123,19 @@ impl ThreadOptions {
                 let kernel_thread = KernelThread { vmar: self.vmar };
                 let cpu_affinity = self.cpu_affinity;
                 let sched_policy = self.sched_policy;
-                Arc::new(Thread::new(
-                    weak_task.clone(),
-                    kernel_thread,
-                    cpu_affinity,
-                    sched_policy,
-                ))
+                let thread =
+                    Thread::new(weak_task.clone(), kernel_thread, cpu_affinity, sched_policy);
+                #[cfg(feature = "kernelet-host")]
+                let thread = {
+                    let mut thread = thread;
+                    if self.fair_weight_divisor != NonZeroU16::MIN {
+                        thread.sched_attr = thread
+                            .sched_attr
+                            .with_fair_weight_divisor(self.fair_weight_divisor);
+                    }
+                    thread
+                };
+                Arc::new(thread)
             };
 
             TaskOptions::new(thread_fn).data(thread).build().unwrap()

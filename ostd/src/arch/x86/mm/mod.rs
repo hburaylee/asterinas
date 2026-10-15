@@ -2,6 +2,8 @@
 
 use core::ops::Range;
 
+#[cfg(feature = "kernelet-host")]
+pub(crate) use util::__memcpy_fallible_end;
 pub(crate) use util::{
     __atomic_cmpxchg_fallible, __atomic_load_fallible, __memcpy_fallible, __memset_fallible,
 };

@@ -8,7 +8,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{Config, Process};
 
-pub const VERSION: u32 = 2;
+pub const VERSION: u32 = 4;
 pub const AGENT_PORT: u32 = 1024;
 pub const MAX_MESSAGE_BYTES: usize = 1024 * 1024;
 pub const STREAM_CHUNK_BYTES: usize = 16 * 1024;
@@ -43,8 +43,27 @@ pub enum Message {
         rows: u16,
         columns: u16,
     },
+    /// Acknowledges one stdin chunk from the holder to the agent. Attachments
+    /// also receive an initial credit and must wait for each further credit
+    /// before sending another stdin chunk. Close and cancellation need no credit.
     InputReady {
         id: u64,
+    },
+    /// Allows one output chunk after the previous chunk reached its sinks.
+    OutputReady {
+        id: u64,
+        stream: Stream,
+    },
+    /// Cancels or reports failure of one output stream, without failing the agent.
+    /// The agent follows its report with Close, and still reports the process exit.
+    OutputFailed {
+        id: u64,
+        stream: Stream,
+        detail: String,
+    },
+    SignalAll {
+        request_id: u64,
+        signal: i32,
     },
     Signal {
         request_id: u64,
@@ -88,6 +107,7 @@ pub enum Request {
     Start { id: u64 },
     Resize { request_id: u64, id: u64 },
     Signal { request_id: u64, id: u64 },
+    SignalAll { request_id: u64 },
     CloseInput { request_id: u64, id: u64 },
     Data { id: u64 },
     Close { id: u64 },
@@ -103,6 +123,9 @@ impl Request {
             Message::Resize { request_id, id, .. } => Self::Resize {
                 request_id: *request_id,
                 id: *id,
+            },
+            Message::SignalAll { request_id, .. } => Self::SignalAll {
+                request_id: *request_id,
             },
             Message::Signal { request_id, id, .. } => Self::Signal {
                 request_id: *request_id,
@@ -130,6 +153,7 @@ impl Request {
             Self::ListProcesses { request_id }
             | Self::Resize { request_id, .. }
             | Self::Signal { request_id, .. }
+            | Self::SignalAll { request_id }
             | Self::CloseInput { request_id, .. } => Some(request_id),
             Self::Start { .. } | Self::Data { .. } | Self::Close { .. } => None,
         }

@@ -121,6 +121,12 @@ impl PendingIpis {
             // will also wait for them. This is fine because there usually
             // aren't too many IPIs in common cases.
             while HAS_PENDING_IPIS.get_on_cpu(cpu_id).load(Ordering::Acquire) {
+                #[cfg(feature = "kernelet")]
+                // A preemption guard defers ordinary virtual IRQ delivery.
+                // Native IPIs can interrupt such guards, and a reciprocal
+                // wait must provide the same progress without scheduling or
+                // dispatching unrelated virtual device/timer callbacks.
+                crate::irq::call_virtual_ipi_callback_functions();
                 core::hint::spin_loop();
             }
         }
@@ -139,6 +145,19 @@ pub(crate) struct IpiSender {
 pub(crate) static IPI_SENDER: Once<IpiSender> = Once::new();
 
 impl IpiSender {
+    /// Notifies a remote CPU without queuing a callback; does nothing for self.
+    /// Callers must publish work and wake its waiters before notifying.
+    #[cfg(feature = "kernelet-host")]
+    pub(crate) fn notify_remote_cpu(&self, cpu_id: crate::cpu::CpuId) {
+        let irq_guard = irq::disable_local();
+        if cpu_id == irq_guard.current_cpu() {
+            return;
+        }
+        let hw_cpu_id = self.hw_cpu_ids[cpu_id.as_usize()];
+        crate::arch::irq::send_ipi(hw_cpu_id, &irq_guard)
+            .expect("failed to send inter-processor interrupt");
+    }
+
     /// Executes a function on other processors.
     ///
     /// See [`inter_processor_call`] for details. The purpose of exporting this
@@ -230,6 +249,29 @@ mod test {
 
     fn count_ipi_call() {
         IPI_CALL_COUNT.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(feature = "kernelet")]
+    #[ktest]
+    fn guarded_wait_services_inbound_virtual_ipis() {
+        let guard = task::disable_preempt();
+        let current = guard.current_cpu();
+        let before = IPI_CALL_COUNT.load(Ordering::Relaxed);
+        // This is the exact queue state published by a remote caller. The
+        // guard blocks ordinary VIRQ delivery, so wait must drain the IPI
+        // without scheduling or dropping the caller's preemption guard.
+        super::CALL_QUEUES
+            .get_on_cpu(current)
+            .lock()
+            .push_back(count_ipi_call);
+        super::HAS_PENDING_IPIS
+            .get_on_cpu(current)
+            .store(true, Ordering::Release);
+        let mut pending = super::PendingIpis::new_empty();
+        pending.add(current);
+        pending.wait();
+        assert_eq!(IPI_CALL_COUNT.load(Ordering::Relaxed) - before, 1);
+        assert!(crate::task::preempt_guard_count() > 0);
     }
 
     #[ktest]

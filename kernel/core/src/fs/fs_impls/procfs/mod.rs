@@ -43,12 +43,24 @@ use crate::{
 mod cmdline;
 mod cpuinfo;
 mod filesystems;
+#[cfg(all(kernelet_rq3, feature = "kernelet"))]
+mod kernelet_fault;
+#[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
+mod kernelet_io_copy;
 #[cfg(kernelet_rq1)]
 mod kernelet_rq1;
+#[cfg(all(kernelet_rq1_crossing_diag, feature = "kernelet-host"))]
+mod kernelet_rq1_crossing;
+#[cfg(all(kernelet_rq1, target_arch = "x86_64"))]
+mod kernelet_rq1_echo;
+#[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
+mod kernelet_rq1_tlb;
 mod loadavg;
 mod meminfo;
 mod mounts;
 mod pid;
+#[cfg(kernelet_rq1)]
+mod rq1_io;
 mod self_;
 mod stat;
 mod sys;
@@ -56,6 +68,21 @@ mod template;
 mod thread_self;
 mod uptime;
 mod version;
+
+/// Shared fallible formatter for the two crossing diagnostic roles.
+#[cfg(all(kernelet_rq1, target_arch = "x86_64"))]
+struct CrossingJsonBuffer(String);
+
+#[cfg(all(kernelet_rq1, target_arch = "x86_64"))]
+impl core::fmt::Write for CrossingJsonBuffer {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        self.0
+            .try_reserve(value.len())
+            .map_err(|_| core::fmt::Error)?;
+        self.0.push_str(value);
+        Ok(())
+    }
+}
 
 pub(super) fn init() {
     crate::fs::vfs::registry::register(&ProcFsType).unwrap();
@@ -160,13 +187,61 @@ impl RootDirOps {
             InodeType::File,
             FileSystemsFileOps::new_inode,
         ),
+        #[cfg(all(kernelet_rq3, feature = "kernelet"))]
+        (
+            "kernelet_fault",
+            InodeType::File,
+            kernelet_fault::KerneletFaultFileOps::new_inode,
+        ),
         #[cfg(kernelet_rq1)]
         (
             "kernelet_rq1",
             InodeType::File,
             kernelet_rq1::KerneletRq1FileOps::new_inode,
         ),
+        #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
+        (
+            "kernelet_rq1_tlb",
+            InodeType::File,
+            kernelet_rq1_tlb::KerneletRq1TlbFileOps::new_inode,
+        ),
+        #[cfg(all(kernelet_rq1_crossing_diag, feature = "kernelet-host"))]
+        (
+            "kernelet_rq1_crossing",
+            InodeType::File,
+            kernelet_rq1_crossing::KerneletRq1CrossingFileOps::new_inode,
+        ),
+        #[cfg(all(kernelet_rq1, target_arch = "x86_64"))]
+        (
+            "kernelet_rq1_echo",
+            InodeType::File,
+            kernelet_rq1_echo::KerneletRq1EchoFileOps::new_inode,
+        ),
         ("loadavg", InodeType::File, LoadAvgFileOps::new_inode),
+        #[cfg(kernelet_rq1)]
+        (
+            "kernelet_rq1_io",
+            InodeType::File,
+            rq1_io::Rq1IoFileOps::new_inode,
+        ),
+        #[cfg(kernelet_rq1)]
+        (
+            "kernelet_rq1_io_contiguous",
+            InodeType::File,
+            rq1_io::Rq1IoFileOps::new_contiguous_inode,
+        ),
+        #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
+        (
+            "kernelet_io_copy",
+            InodeType::File,
+            kernelet_io_copy::KerneletIoCopyFileOps::new_inode,
+        ),
+        #[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
+        (
+            "kernelet_rq1_io_stats",
+            InodeType::File,
+            rq1_io::Rq1IoStatsFileOps::new_inode,
+        ),
         ("meminfo", InodeType::File, MemInfoFileOps::new_inode),
         ("mounts", InodeType::SymLink, MountsSymOps::new_inode),
         ("self", InodeType::SymLink, SelfSymOps::new_inode),

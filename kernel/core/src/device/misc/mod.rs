@@ -20,7 +20,7 @@ pub(super) fn init_in_first_kthread() {
 
     hwrng::init_in_first_kthread();
 
-    #[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+    #[cfg(feature = "kernelet-host")]
     crate::endovisor::init(MISC_MAJOR.get().unwrap().get()).unwrap();
 
     #[cfg(target_arch = "x86_64")]

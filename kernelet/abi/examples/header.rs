@@ -141,6 +141,7 @@ fn main() {
         KILL,
         GRANT,
         BUDGET,
+        STATS_UNAVAILABLE,
         STATS,
         STATUS,
         DESTROY,

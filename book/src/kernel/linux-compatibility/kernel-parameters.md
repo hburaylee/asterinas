@@ -208,7 +208,9 @@ loglevel=error
 
 Notes:
 - Level names are case-sensitive; use lowercase names.
-- If omitted, the default is `8` (`debug`). Invalid values are ignored.
+- If omitted, the default is `8` (`debug`) for a native Host and `7` (`info`)
+  for a Kernelet Image. A valid explicit value overrides that default; invalid
+  values are ignored.
 - Use `warn` for normal operation, `info`/`debug` when troubleshooting,
   and `error` or lower for a quieter console.
 

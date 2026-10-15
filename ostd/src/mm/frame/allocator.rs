@@ -118,21 +118,38 @@ impl FrameAllocOptions {
         if nframes == 0 {
             return Err(Error::InvalidArgs);
         }
-        let layout = Layout::from_size_align(nframes * PAGE_SIZE, PAGE_SIZE).unwrap();
+        let bytes = nframes.checked_mul(PAGE_SIZE).ok_or(Error::Overflow)?;
+        let layout = Layout::from_size_align(bytes, PAGE_SIZE).map_err(|_| Error::InvalidArgs)?;
         let segment = allocate_layout(layout)
-            .map(|start| {
-                Segment::from_unused(start..start + nframes * PAGE_SIZE, metadata_fn).unwrap()
-            })
+            .map(|start| Segment::from_unused(start..start + bytes, metadata_fn).unwrap())
             .ok_or(Error::NoMemory)?;
 
         if self.zeroed {
             let addr = paddr_to_vaddr(segment.paddr()) as *mut u8;
             // SAFETY: The newly allocated segment is guaranteed to be valid.
-            unsafe { core::ptr::write_bytes(addr, 0, nframes * PAGE_SIZE) }
+            unsafe { core::ptr::write_bytes(addr, 0, bytes) }
         }
 
         Ok(segment)
     }
+}
+
+#[cfg(ktest)]
+#[ktest]
+fn oversized_frame_counts_return_errors() {
+    let options = FrameAllocOptions::new();
+    assert!(matches!(
+        options.alloc_segment_with(usize::MAX / PAGE_SIZE + 1, |_| ()),
+        Err(Error::Overflow)
+    ));
+    assert!(matches!(
+        options.alloc_segment_with(isize::MAX as usize / PAGE_SIZE + 1, |_| ()),
+        Err(Error::InvalidArgs)
+    ));
+    assert!(matches!(
+        options.alloc_segment_with(0, |_| ()),
+        Err(Error::InvalidArgs)
+    ));
 }
 
 #[cfg(ktest)]

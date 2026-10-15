@@ -271,7 +271,7 @@ impl From<u32> for ApicId {
 #[repr(u64)]
 pub(in crate::arch) enum DestinationShorthand {
     NoShorthand = 0b00,
-    #[expect(dead_code)]
+    #[cfg_attr(not(feature = "kernelet-host"), expect(dead_code))]
     MySelf = 0b01,
     AllIncludingSelf = 0b10,
     AllExcludingSelf = 0b11,

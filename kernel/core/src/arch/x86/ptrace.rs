@@ -6,12 +6,11 @@ use core::ops::Range;
 
 use ostd::{
     arch::{
-        cpu::context::{FsBase, GeneralRegs, GsBase, UserContext},
+        cpu::context::{FsBase, GeneralRegs, GsBase, RFlags, UserContext},
         trap::{USER_CS_VALUE, USER_SS_VALUE},
     },
     mm::MAX_USERSPACE_VADDR,
 };
-use x86_64::registers::rflags::RFlags;
 
 use crate::prelude::*;
 

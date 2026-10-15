@@ -16,9 +16,10 @@ pub mod serial;
 pub(crate) mod task;
 #[cfg(not(feature = "kernelet"))]
 mod timer;
-#[cfg(not(feature = "kernelet"))]
+#[cfg(feature = "kernelet-host")]
 pub(crate) use timer::is_timer_irq;
 pub mod trap;
+#[cfg(not(feature = "kernelet"))]
 pub mod vm;
 
 #[cfg(feature = "cvm_guest")]
@@ -142,7 +143,8 @@ pub(crate) unsafe fn init_on_ap() {
     timer::init_on_ap();
 }
 
-/// Returns the frequency of TSC. The unit is Hz.
+/// Returns the frequency of TSC.
+/// The unit is Hz.
 pub fn tsc_freq() -> u64 {
     #[cfg(feature = "kernelet")]
     return crate::kernelet::entry::boot_args().tsc_freq_hz;
@@ -156,30 +158,20 @@ pub fn tsc_freq() -> u64 {
 }
 
 /// Reads the current value of the processor's time-stamp counter (TSC).
-#[cfg(not(feature = "kernelet"))]
 pub fn read_tsc() -> u64 {
-    use core::arch::x86_64::_rdtsc;
+    use core::arch::x86_64;
 
     // SAFETY: It is safe to read a time-related counter.
-    unsafe { _rdtsc() }
+    unsafe { x86_64::_rdtsc() }
 }
 
-/// Reads the current value of the virtual time-stamp counter.
-#[cfg(feature = "kernelet")]
-pub fn read_tsc() -> u64 {
-    let nanos = crate::kernelet::entry::clock_now_ns();
-    // Keep the Host's cycle unit: runtime_ticks() still samples the raw TSC
-    // and uses the same frequency for execution-time accounting.
-    let cycles = (u128::from(nanos) * u128::from(tsc_freq())) / 1_000_000_000;
-    cycles.min(u128::from(u64::MAX)) as u64
-}
-
-/// Reads the TSC between load-ordering fences.
+/// Reads the physical TSC between load-ordering fences.
 ///
-/// The kernelet scheduler samples a Host-published offset around this read.
-/// Both fences keep the TSC observation between those two atomic loads.
-#[cfg(feature = "kernelet")]
-pub(crate) fn read_tsc_ordered() -> u64 {
+/// The compiler memory barrier and fences order memory accesses around the
+/// observation.
+/// Ticks measure elapsed time, including descheduling and IRQs;
+/// they are not CPU execution cycles or the Image's virtual monotonic clock.
+pub fn read_tsc_ordered() -> u64 {
     let low: u32;
     let high: u32;
     // SAFETY: Reading the TSC is safe, and LFENCE only orders local execution.
@@ -231,6 +223,7 @@ pub(crate) fn enable_cpu_features() {
     };
 
     cpu::extension::init();
+    #[cfg(not(feature = "kernelet"))]
     vm::init();
 
     let mut cr0 = x86_64::registers::control::Cr0::read();

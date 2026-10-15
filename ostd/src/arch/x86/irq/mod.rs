@@ -17,6 +17,8 @@ mod remapping;
 
 #[cfg(not(feature = "kernelet"))]
 pub use chip::{IRQ_CHIP, IrqChip, MappedIrqLine};
+#[cfg(feature = "kernelet-host")]
+pub(crate) use ipi::send_self_ipi;
 pub(crate) use ipi::{HwCpuId, send_ipi};
 #[cfg(not(feature = "kernelet"))]
 pub(crate) use ops::enable_local_and_halt;
@@ -33,7 +35,17 @@ pub use crate::irq::IrqLine as MappedIrqLine;
 // are designated as user-defined interrupts and are not reserved by
 // the Intel 64 and IA-32 architecture."
 pub(crate) const IRQ_NUM_MIN: u8 = 32;
-pub(crate) const IRQ_NUM_MAX: u8 = 255;
+pub(crate) const IRQ_NUM_MAX: u8 = 254;
+/// Reserved local-APIC spurious vector, never allocated to a real IRQ.
+pub(crate) const SPURIOUS_VECTOR: u8 = 255;
+
+#[cfg(ktest)]
+#[crate::prelude::ktest]
+fn spurious_vector_is_not_an_allocatable_irq() {
+    assert!(SPURIOUS_VECTOR > IRQ_NUM_MAX);
+    assert_eq!(SPURIOUS_VECTOR & 15, 15);
+    assert!(crate::irq::IrqLine::alloc_specific(SPURIOUS_VECTOR).is_err());
+}
 
 /// An IRQ line with additional information that helps acknowledge the interrupt
 /// on hardware.
@@ -55,6 +67,10 @@ impl HwIrqLine {
     }
 
     pub(crate) fn ack(&self) {
+        if self.irq_num == SPURIOUS_VECTOR {
+            // Spurious delivery does not set an ISR bit and requires no EOI.
+            return;
+        }
         #[cfg(feature = "kernelet")]
         return;
 

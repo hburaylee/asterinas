@@ -19,6 +19,8 @@ use super::{
     SandboxFile, SandboxState,
     devices::{DeviceSlot, MMIO_CMDLINE_PREFIX},
 };
+#[cfg(kernelet_nat_failure_diag_host)]
+use crate::endovisor::policy::{QuotaClass, QuotaTag};
 use crate::{
     endovisor::{
         log_endpoint::LogEndpoint,
@@ -92,6 +94,10 @@ pub(super) struct BlockAttachment {
 
 impl SandboxFile {
     pub(super) fn create(mut args: CreateArgs) -> Result<(Arc<Self>, CreateArgs)> {
+        let budget = CpuBudget {
+            nice: args.nice,
+            quota: (args.cpu_quota_us != 0).then_some((args.cpu_quota_us, args.cpu_period_us)),
+        };
         if args.image != 0
             || args.num_vcpus == 0
             || args.num_vcpus as usize > ostd::cpu::num_cpus()
@@ -100,14 +106,16 @@ impl SandboxFile {
             || args.max_grains < args.initial_grains
             || args.max_meta_sections == 0
             || args.max_tasks < u32::from(args.num_vcpus)
-            || !(-20..=19).contains(&args.nice)
-            || (args.cpu_quota_us != 0 && args.cpu_period_us <= 1_000)
+            || args.max_tasks > ostd::kernelet::control::MAX_TASKS
             || args.reserved0 != [0; 3]
             || args.out_cid != 0
             || args.cmdline_len as usize > MAX_CMDLINE_BYTES
         {
             return_errno_with_message!(Errno::EINVAL, "unsupported kernelet configuration");
         }
+        budget
+            .validate()
+            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid kernelet budget"))?;
         let mut bytes = vec![0u8; args.cmdline_len as usize];
         {
             let task = Task::current().unwrap();
@@ -142,10 +150,7 @@ impl SandboxFile {
             max_meta_sections: args.max_meta_sections,
             max_tasks: args.max_tasks,
             num_vcpus: args.num_vcpus,
-            budget: CpuBudget {
-                nice: args.nice,
-                quota: (args.cpu_quota_us != 0).then_some((args.cpu_quota_us, args.cpu_period_us)),
-            },
+            budget,
             policy: KerneletPolicy {
                 oops_budget: args.oops_budget,
                 log_bytes_per_sec: args.log_bytes_per_sec,
@@ -191,7 +196,13 @@ impl SandboxFile {
             return_errno_with_message!(Errno::EINVAL, "unsupported kernelet endpoint");
         }
         let console = (args.kind == CONSOLE).then(ConsoleEndpoint::new);
-        let net = (args.kind == NET).then(|| NetEndpoint::new(self.owner));
+        let net = (args.kind == NET).then(|| {
+            NetEndpoint::new(
+                self.owner,
+                #[cfg(kernelet_nat_failure_diag_host)]
+                self.cid,
+            )
+        });
         let log = (args.kind == LOG).then(LogEndpoint::new);
         let bytes = console
             .as_ref()
@@ -202,7 +213,20 @@ impl SandboxFile {
             + log
                 .as_ref()
                 .map_or(0, |endpoint| endpoint.reservation_bytes());
-        let reservation = Arc::new(PrestartEndpointReservation::reserve(self.owner, bytes)?);
+        let reservation = Arc::new(PrestartEndpointReservation::reserve(
+            self.owner,
+            bytes,
+            #[cfg(kernelet_nat_failure_diag_host)]
+            QuotaTag::new(
+                match args.kind {
+                    CONSOLE => QuotaClass::ConsoleFixed,
+                    NET => QuotaClass::NetFixed,
+                    LOG => QuotaClass::LogFixed,
+                    _ => unreachable!(),
+                },
+                Some(self.cid),
+            ),
+        )?);
         {
             let mut state = self.state.lock();
             let SandboxState::Configuring(pending) = &mut *state else {
@@ -372,19 +396,7 @@ impl SandboxFile {
     }
 
     pub(super) fn vsock_listen(&self, args: VsockArgs) -> Result<i32> {
-        if args.port == 0 || args.flags != 0 {
-            return_errno_with_message!(Errno::EINVAL, "invalid vsock listener");
-        }
-        {
-            let state = self.state.lock();
-            let SandboxState::Configuring(pending) = &*state else {
-                return_errno_with_message!(Errno::EBUSY, "kernelet already started");
-            };
-            if !pending.vsock_attached {
-                return_errno_with_message!(Errno::ENODEV, "vsock is not attached");
-            }
-        }
-        let file = vsock_switch::listen(self.cid, args.port, self.owner)?;
+        let file = self.create_vsock_listener(args)?;
         let task = Task::current().unwrap();
         let thread_local = task.as_thread_local().unwrap();
         let fd = thread_local
@@ -393,6 +405,26 @@ impl SandboxFile {
             .write()
             .insert(file, FdFlags::CLOEXEC);
         Ok(fd.into())
+    }
+
+    pub(super) fn create_vsock_listener(&self, args: VsockArgs) -> Result<Arc<dyn FileLike>> {
+        if args.port == 0 || args.flags != 0 {
+            return_errno_with_message!(Errno::EINVAL, "invalid vsock listener");
+        }
+        let state = self.state.lock();
+        let SandboxState::Configuring(pending) = &*state else {
+            return_errno_with_message!(Errno::EBUSY, "kernelet already started");
+        };
+        if !pending.vsock_attached {
+            return_errno_with_message!(Errno::ENODEV, "vsock is not attached");
+        }
+        // Keep listener registration inside Configuring admission. KILL and
+        // DESTROY take the same state lock before removing switch entries.
+        #[cfg(ktest)]
+        tests::before_listener_registration(self.cid);
+        let file = vsock_switch::listen(self.cid, args.port, self.owner)?;
+        drop(state);
+        Ok(file)
     }
 
     pub(super) fn vsock_connect(&self, args: VsockArgs) -> Result<i32> {
@@ -441,5 +473,199 @@ impl SandboxFile {
             return_errno_with_message!(Errno::ENODEV, "both sandboxes must be live");
         }
         vsock_switch::set_peer_allowed(self.cid, peer.cid, args.allow != 0)
+    }
+}
+
+#[cfg(ktest)]
+pub(super) mod tests {
+    use core::sync::atomic::AtomicBool;
+
+    use ostd::{prelude::*, task::TaskOptions};
+
+    use super::*;
+
+    struct ListenCheckpoint {
+        cid: u32,
+        entered: AtomicBool,
+        proceed: AtomicBool,
+    }
+
+    static LISTEN_CHECKPOINT: SpinLock<Option<Arc<ListenCheckpoint>>> = SpinLock::new(None);
+
+    struct CheckpointRegistration(Arc<ListenCheckpoint>);
+
+    impl Drop for CheckpointRegistration {
+        fn drop(&mut self) {
+            self.0.proceed.store(true, Ordering::Release);
+            let checkpoint = LISTEN_CHECKPOINT.lock().take();
+            drop(checkpoint);
+        }
+    }
+
+    pub(super) fn before_listener_registration(cid: u32) {
+        let checkpoint = LISTEN_CHECKPOINT.lock().clone();
+        if let Some(checkpoint) = checkpoint.filter(|checkpoint| checkpoint.cid == cid) {
+            checkpoint.entered.store(true, Ordering::Release);
+            wait_for(|| checkpoint.proceed.load(Ordering::Acquire));
+        }
+    }
+
+    pub(in crate::endovisor::sandbox) fn wait_for(mut ready: impl FnMut() -> bool) {
+        for _ in 0..100_000 {
+            if ready() {
+                return;
+            }
+            Task::yield_now();
+        }
+        panic!("sandbox regression checkpoint did not complete");
+    }
+
+    pub(in crate::endovisor::sandbox) fn sandbox() -> Arc<SandboxFile> {
+        crate::time::clocks::init_for_ktest();
+        let cid = NEXT_CID
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                (next != u32::MAX).then(|| next + 1)
+            })
+            .unwrap();
+        Arc::new(SandboxFile {
+            common: FileCommon::new(
+                AnonInodeFs::new_path(|_| "anon_inode:[kernelet-test]".into()),
+                AccessMode::O_RDWR,
+                StatusFlags::empty(),
+            ),
+            state: Arc::new(Mutex::new(SandboxState::Configuring(Pending {
+                cmdline: String::new(),
+                initial_grains: 1,
+                max_grains: 1,
+                max_meta_sections: 1,
+                max_tasks: 1,
+                num_vcpus: 1,
+                budget: CpuBudget {
+                    nice: 0,
+                    quota: None,
+                },
+                policy: KerneletPolicy::default(),
+                blocks: Vec::new(),
+                console: None,
+                log: None,
+                console_attached: false,
+                console_vcpu: 0,
+                vsock_attached: true,
+                vsock_vcpu: 0,
+                rng_attached: false,
+                rng_vcpu: 0,
+                net: None,
+                net_attached: false,
+                net_vcpu: 0,
+                net_mac: [0; 6],
+                endpoint_reservations: Vec::new(),
+            }))),
+            pollee: Pollee::new(),
+            start_waiters: WaitQueue::new(),
+            cid,
+            owner: crate::process::Uid::new(51_000),
+            admission: SpinLock::new(None),
+        })
+    }
+
+    pub(in crate::endovisor::sandbox) fn listener_args() -> VsockArgs {
+        VsockArgs {
+            port: 12_345,
+            flags: 0,
+        }
+    }
+
+    pub(in crate::endovisor::sandbox) fn assert_listener_removed(sandbox: &SandboxFile) {
+        // The real switch rejects a duplicate port while the old entry exists.
+        drop(vsock_switch::listen(sandbox.cid, listener_args().port, sandbox.owner).unwrap());
+    }
+
+    #[ktest]
+    fn destroy_revokes_an_admitted_listener() {
+        // Regression: Configuring could become Gone before LISTEN inserted.
+        let sandbox = sandbox();
+        let checkpoint = Arc::new(ListenCheckpoint {
+            cid: sandbox.cid,
+            entered: AtomicBool::new(false),
+            proceed: AtomicBool::new(false),
+        });
+        *LISTEN_CHECKPOINT.lock() = Some(checkpoint.clone());
+        let registration = CheckpointRegistration(checkpoint.clone());
+        let listener_result = Arc::new(Mutex::new(None));
+        let listener_task = {
+            let sandbox = sandbox.clone();
+            let result = listener_result.clone();
+            TaskOptions::new(move || {
+                *result.lock() = Some(sandbox.create_vsock_listener(listener_args()));
+            })
+            .spawn()
+            .unwrap()
+        };
+        wait_for(|| checkpoint.entered.load(Ordering::Acquire));
+        let destroy_started = Arc::new(AtomicBool::new(false));
+        let destroy_result = Arc::new(Mutex::new(None));
+        let destroy_task = {
+            let sandbox = sandbox.clone();
+            let started = destroy_started.clone();
+            let result = destroy_result.clone();
+            TaskOptions::new(move || {
+                started.store(true, Ordering::Release);
+                *result.lock() = Some(sandbox.destroy());
+            })
+            .spawn()
+            .unwrap()
+        };
+        wait_for(|| destroy_started.load(Ordering::Acquire));
+        let registration_is_admitted = sandbox.state.try_lock().is_none();
+        let destroy_is_pending = destroy_result.lock().is_none();
+        checkpoint.proceed.store(true, Ordering::Release);
+        wait_for(|| listener_result.lock().is_some() && destroy_result.lock().is_some());
+        drop(registration);
+        destroy_result.lock().take().unwrap().unwrap();
+        let listener = listener_result.lock().take().unwrap().unwrap();
+        assert!(registration_is_admitted);
+        assert!(destroy_is_pending);
+        assert!(matches!(&*sandbox.state.lock(), SandboxState::Gone(_)));
+        let mut byte = [0];
+        assert_eq!(
+            listener
+                .read(&mut VmWriter::from(&mut byte[..]).to_fallible())
+                .unwrap_err()
+                .error(),
+            Errno::ECONNRESET
+        );
+        assert_listener_removed(&sandbox);
+        assert_eq!(
+            sandbox
+                .create_vsock_listener(listener_args())
+                .err()
+                .unwrap()
+                .error(),
+            Errno::EBUSY
+        );
+        drop(listener);
+        drop((listener_task, destroy_task));
+    }
+
+    #[ktest]
+    fn failed_start_preserves_listener_for_retry() {
+        let sandbox = sandbox();
+        let listener = sandbox.create_vsock_listener(listener_args()).unwrap();
+        assert_eq!(sandbox.start().unwrap_err().error(), Errno::ENODEV);
+        assert!(matches!(
+            &*sandbox.state.lock(),
+            SandboxState::Configuring(_)
+        ));
+        assert_eq!(
+            sandbox
+                .create_vsock_listener(listener_args())
+                .err()
+                .unwrap()
+                .error(),
+            Errno::EADDRINUSE
+        );
+        sandbox.destroy().unwrap();
+        assert_listener_removed(&sandbox);
+        drop(listener);
     }
 }

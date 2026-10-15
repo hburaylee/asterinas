@@ -26,6 +26,8 @@ use super::{
         CONFIG_OFFSET, Queue, ReadyWrite, feature_word, invalid_read, write_driver_feature_word,
     },
 };
+#[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
+use crate::endovisor::io_copy_profile::{self, Category};
 use crate::{prelude::*, thread::kernel_thread::ThreadOptions};
 
 mod endpoint;
@@ -68,22 +70,34 @@ impl Frame {
     }
 }
 
-#[derive(Clone, Copy, Default)]
-struct Buffer {
-    paddr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
-}
+type Buffer = super::virtio_mmio::Descriptor;
 
-impl Buffer {
-    fn writable(self) -> bool {
-        self.flags & 2 != 0
+/// Visits the header and payload separately without assembling another packet.
+fn visit_packet<E>(
+    buffers: &[Buffer],
+    payload_len: usize,
+    mut visit_fn: impl FnMut(u64, core::ops::Range<usize>) -> core::result::Result<(), E>,
+) -> core::result::Result<(), E> {
+    let packet_len = NET_HEADER_BYTES + payload_len;
+    let mut offset = 0;
+    for buffer in buffers {
+        if offset == packet_len {
+            break;
+        }
+        let count = (buffer.len as usize).min(packet_len - offset);
+        let header_count = count.min(NET_HEADER_BYTES.saturating_sub(offset));
+        if header_count != 0 {
+            visit_fn(buffer.paddr, offset..offset + header_count)?;
+        }
+        if count > header_count {
+            visit_fn(
+                buffer.paddr + header_count as u64,
+                offset + header_count..offset + count,
+            )?;
+        }
+        offset += count;
     }
-
-    fn has_next(self) -> bool {
-        self.flags & 1 != 0
-    }
+    Ok(())
 }
 
 struct Request {
@@ -321,17 +335,14 @@ impl VirtioNet {
         let Some(queue) = r.queues.get(r.queue_select as usize) else {
             return false;
         };
-        queue.num > 0
-            && queue.num as usize <= QUEUE_SIZE
-            && queue.num.is_power_of_two()
-            && queue.desc.is_multiple_of(16)
-            && queue.avail.is_multiple_of(2)
-            && queue.used.is_multiple_of(4)
-            && self.memory.contains(queue.desc, queue.num as usize * 16)
-            && self
-                .memory
-                .contains(queue.avail, 6 + queue.num as usize * 2)
-            && self.memory.contains(queue.used, 6 + queue.num as usize * 8)
+        super::virtio_mmio::layout_valid(
+            &self.memory,
+            queue.num,
+            QUEUE_SIZE,
+            queue.desc,
+            queue.avail,
+            queue.used,
+        )
     }
 
     fn collect_requests(&self, r: &mut Registers, index: usize) {
@@ -393,13 +404,8 @@ impl VirtioNet {
             self.memory
                 .read(queue.desc.checked_add(index as u64 * 16)?, &mut bytes)
                 .ok()?;
-            let buffer = Buffer {
-                paddr: u64::from_le_bytes(bytes[0..8].try_into().ok()?),
-                len: u32::from_le_bytes(bytes[8..12].try_into().ok()?),
-                flags: u16::from_le_bytes(bytes[12..14].try_into().ok()?),
-                next: u16::from_le_bytes(bytes[14..16].try_into().ok()?),
-            };
-            if buffer.flags & 4 != 0
+            let buffer = Buffer::decode(bytes);
+            if !buffer.supported()
                 || buffer.writable() != (queue_index == QUEUE_RX)
                 || !self.memory.contains(buffer.paddr, buffer.len as usize)
             {
@@ -430,29 +436,90 @@ impl VirtioNet {
         let queue = &mut r.queues[index];
         let slot = queue.next_used as u32 % queue.num;
         let used_entry = queue.used + 4 + slot as u64 * 8;
-        let _ = self.memory.write(used_entry, &(head as u32).to_le_bytes());
-        let _ = self.memory.write(used_entry + 4, &0u32.to_le_bytes());
+        let mut entry = [0u8; 8];
+        entry[..4].copy_from_slice(&(head as u32).to_le_bytes());
+        let _ = self.memory.write(used_entry, &entry);
         queue.next_used = queue.next_used.wrapping_add(1);
+        fence(Ordering::Release);
         let _ = self
             .memory
-            .write(queue.used + 2, &queue.next_used.to_le_bytes());
-        fence(Ordering::Release);
+            .write_u16_once(queue.used + 2, queue.next_used.to_le());
         self.interrupt_status.fetch_or(1, Ordering::Release);
     }
 
+    #[cfg(kernelet_nat_failure_diag_host)]
+    fn diagnostic_cancelled(&self) -> bool {
+        self.registers.lock().cancelled
+    }
+
+    #[cfg(kernelet_nat_failure_diag_host)]
+    fn record_diagnostic(
+        &self,
+        event: endpoint::NatEvent,
+        context: endpoint::NatContext,
+        errno: Option<Errno>,
+    ) {
+        let cancelled = self.diagnostic_cancelled();
+        self.endpoint
+            .record_diagnostic(event, context, errno, None, 0, None, cancelled);
+    }
+
     fn worker(&self) {
-        if self.kernelet.adopt_current_task().is_err() {
+        let adopted = self.kernelet.adopt_current_task();
+        if adopted.is_err() {
+            #[cfg(kernelet_nat_failure_diag_host)]
+            {
+                self.endpoint.record_diagnostic(
+                    endpoint::NatEvent::Adopt,
+                    endpoint::NatContext::new("worker_adopt_failed"),
+                    None,
+                    adopted.err(),
+                    0,
+                    None,
+                    self.diagnostic_cancelled(),
+                );
+                self.endpoint.emit_diagnostic_summary();
+            }
             return;
         }
         if let Some((backend, reservation)) = self.endpoint.take_backend() {
             // Backend resources are released before their UID reservation.
             let result = backend.run(self);
+            #[cfg(kernelet_nat_failure_diag_host)]
+            self.record_diagnostic(
+                endpoint::NatEvent::BackendReturned,
+                endpoint::NatContext::new(if result.is_ok() {
+                    "backend_returned_ok"
+                } else {
+                    "backend_returned_error"
+                }),
+                result.as_ref().err().map(|error| error.error()),
+            );
             drop(reservation);
+            #[cfg(kernelet_nat_failure_diag_host)]
+            {
+                self.record_diagnostic(
+                    endpoint::NatEvent::ReservationReleased,
+                    endpoint::NatContext::new("backend_reservation_drop_returned"),
+                    None,
+                );
+                self.endpoint.emit_diagnostic_summary();
+            }
             if let Err(error) = result {
                 error!("kernelet network backend failed: {:?}", error);
                 let _ = self
                     .kernelet
                     .kill(ostd::kernelet::control::KillReason::HostPolicy(u32::MAX));
+            }
+        } else {
+            #[cfg(kernelet_nat_failure_diag_host)]
+            {
+                self.record_diagnostic(
+                    endpoint::NatEvent::BackendAbsent,
+                    endpoint::NatContext::new("worker_take_backend_none"),
+                    None,
+                );
+                self.endpoint.emit_diagnostic_summary();
             }
         }
         self.kernelet.disown_current_task();
@@ -487,24 +554,30 @@ impl VirtioNet {
             self.complete(request, 0);
             return;
         }
-        let mut bytes = [0u8; NET_HEADER_BYTES + MAX_FRAME_BYTES];
-        let mut offset = 0usize;
-        for buffer in &request.buffers[..request.len] {
-            let count = buffer.len as usize;
-            if self
-                .memory
-                .read(buffer.paddr, &mut bytes[offset..offset + count])
-                .is_err()
-            {
-                self.registers.lock().status |= DEVICE_NEEDS_RESET;
-                self.complete(request, 0);
-                return;
-            }
-            offset += count;
+        let mut header = [0u8; NET_HEADER_BYTES];
+        let mut frame = Frame::empty();
+        frame.len = request.bytes - NET_HEADER_BYTES;
+        if visit_packet(
+            &request.buffers[..request.len],
+            frame.len,
+            |paddr, range| {
+                let bytes = if range.end <= NET_HEADER_BYTES {
+                    return self.memory.read(paddr, &mut header[range]);
+                } else {
+                    &mut frame.bytes[range.start - NET_HEADER_BYTES..range.end - NET_HEADER_BYTES]
+                };
+                self.read_payload(paddr, bytes)
+            },
+        )
+        .is_err()
+        {
+            self.registers.lock().status |= DEVICE_NEEDS_RESET;
+            self.complete(request, 0);
+            return;
         }
         // Offloads are not advertised. An unoffloaded packet has a zeroed
         // virtio-net header; silently drop a driver request that violates it.
-        if bytes[..NET_HEADER_BYTES].iter().any(|byte| *byte != 0) {
+        if header.iter().any(|byte| *byte != 0) {
             self.complete(request, 0);
             return;
         }
@@ -512,9 +585,6 @@ impl VirtioNet {
             self.complete(request, 0);
             return;
         }
-        let mut frame = Frame::empty();
-        frame.len = request.bytes - NET_HEADER_BYTES;
-        frame.bytes[..frame.len].copy_from_slice(&bytes[NET_HEADER_BYTES..request.bytes]);
         if !self.endpoint.push_output(frame) {
             let mut r = self.registers.lock();
             r.active -= 1;
@@ -557,28 +627,23 @@ impl VirtioNet {
             r.status |= DEVICE_NEEDS_RESET;
             self.complete_locked(&mut r, request, 0);
         } else {
-            let mut bytes = [0u8; NET_HEADER_BYTES + MAX_FRAME_BYTES];
-            bytes[NET_HEADER_BYTES..used_len].copy_from_slice(&frame.bytes[..frame.len]);
-            let mut done = 0usize;
-            let mut failed = false;
+            let header = [0u8; NET_HEADER_BYTES];
             // Ingress category: the receiving instance pays for copying
             // the received frame into its guest buffers.
             let span = ChargedSpan::new(&self.kernelet, WorkCategory::Ingress);
-            for buffer in &request.buffers[..request.len] {
-                if done == used_len {
-                    break;
-                }
-                let count = (buffer.len as usize).min(used_len - done);
-                if self
-                    .memory
-                    .write(buffer.paddr, &bytes[done..done + count])
-                    .is_err()
-                {
-                    failed = true;
-                    break;
-                }
-                done += count;
-            }
+            let failed = visit_packet(
+                &request.buffers[..request.len],
+                frame.len,
+                |paddr, range| {
+                    let bytes = if range.end <= NET_HEADER_BYTES {
+                        return self.memory.write(paddr, &header[range]);
+                    } else {
+                        &frame.bytes[range.start - NET_HEADER_BYTES..range.end - NET_HEADER_BYTES]
+                    };
+                    self.write_payload(paddr, bytes)
+                },
+            )
+            .is_err();
             drop(span);
             if failed {
                 r.status |= DEVICE_NEEDS_RESET;
@@ -623,22 +688,62 @@ impl VirtioNet {
         queue.retire(request.head);
         let slot = queue.next_used as u32 % queue.num;
         let used_entry = queue.used + 4 + slot as u64 * 8;
-        let _ = self
-            .memory
-            .write(used_entry, &(request.head as u32).to_le_bytes());
-        let _ = self.memory.write(used_entry + 4, &used_len.to_le_bytes());
+        let mut entry = [0u8; 8];
+        entry[..4].copy_from_slice(&(request.head as u32).to_le_bytes());
+        entry[4..].copy_from_slice(&used_len.to_le_bytes());
+        let _ = self.memory.write(used_entry, &entry);
         queue.next_used = queue.next_used.wrapping_add(1);
+        fence(Ordering::Release);
         let _ = self
             .memory
-            .write(queue.used + 2, &queue.next_used.to_le_bytes());
-        fence(Ordering::Release);
+            .write_u16_once(queue.used + 2, queue.next_used.to_le());
         self.interrupt_status.fetch_or(1, Ordering::Release);
     }
 
     fn read_u16(&self, paddr: u64) -> ostd::Result<u16> {
-        let mut bytes = [0u8; 2];
-        self.memory.read(paddr, &mut bytes)?;
-        Ok(u16::from_le_bytes(bytes))
+        let value = self.memory.read_u16_once(paddr)?;
+        fence(Ordering::Acquire);
+        Ok(u16::from_le(value))
+    }
+
+    fn read_payload(&self, paddr: u64, bytes: &mut [u8]) -> ostd::Result<()> {
+        #[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
+        {
+            let expected = bytes.len();
+            let copied = self.memory.with_reader(paddr, expected, |reader| {
+                let mut writer = VmWriter::from(bytes);
+                io_copy_profile::measure_fallible(Category::NetTx, expected, || {
+                    reader.read_fallible(&mut writer)
+                })
+            })?;
+            match copied {
+                Ok(copied) if copied == expected => Ok(()),
+                Ok(_) => Err(ostd::Error::InvalidArgs),
+                Err((error, _)) => Err(error),
+            }
+        }
+        #[cfg(not(all(kernelet_rq1_diagnostics, not(feature = "kernelet"))))]
+        self.memory.read(paddr, bytes)
+    }
+
+    fn write_payload(&self, paddr: u64, bytes: &[u8]) -> ostd::Result<()> {
+        #[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
+        {
+            let expected = bytes.len();
+            let copied = self.memory.with_writer(paddr, expected, |writer| {
+                let mut reader = VmReader::from(bytes);
+                io_copy_profile::measure_fallible(Category::NetRx, expected, || {
+                    writer.write_fallible(&mut reader)
+                })
+            })?;
+            match copied {
+                Ok(copied) if copied == expected => Ok(()),
+                Ok(_) => Err(ostd::Error::InvalidArgs),
+                Err((error, _)) => Err(error),
+            }
+        }
+        #[cfg(not(all(kernelet_rq1_diagnostics, not(feature = "kernelet"))))]
+        self.memory.write(paddr, bytes)
     }
 }
 

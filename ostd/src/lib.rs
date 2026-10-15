@@ -41,7 +41,17 @@ pub mod cpu;
 mod error;
 pub mod io;
 pub mod irq;
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(
+    target_arch = "x86_64",
+    any(
+        feature = "kernelet",
+        feature = "kernelet-host",
+        kernelet_rq1,
+        kernelet_rq1_diagnostics,
+        kernelet_getpid_profile,
+        ktest
+    )
+))]
 pub mod kernelet;
 pub mod log;
 pub mod mm;
@@ -55,7 +65,7 @@ pub mod timer;
 pub mod user;
 pub mod util;
 
-#[cfg(target_arch = "x86_64")]
+#[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
 pub mod vm;
 
 #[cfg(feature = "coverage")]
@@ -172,11 +182,17 @@ pub(crate) fn invoke_ffi_init_funcs() {
 }
 
 mod feature_validation {
+    #[cfg(all(feature = "kernelet", feature = "kernelet-host"))]
+    compile_error!("features `kernelet` and `kernelet-host` cannot be enabled together");
+
     #[cfg(all(feature = "kernelet", feature = "cvm_guest"))]
     compile_error!("features `kernelet` and `cvm_guest` cannot be enabled together");
 
     #[cfg(all(feature = "kernelet", not(target_arch = "x86_64")))]
     compile_error!("feature `kernelet` currently supports only x86-64");
+
+    #[cfg(all(feature = "kernelet-host", not(target_arch = "x86_64")))]
+    compile_error!("feature `kernelet-host` currently supports only x86-64");
 
     #[cfg(all(not(target_arch = "riscv64"), feature = "riscv_sv39_mode"))]
     compile_error!(

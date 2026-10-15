@@ -155,7 +155,8 @@ fn init() -> Result<(), ComponentInitError> {
 
 #[cfg(ktest)]
 pub fn init_for_ktest() {
-    init().unwrap();
+    static INIT: Once<()> = Once::new();
+    INIT.call_once(|| init().unwrap());
 }
 
 static ENABLED_MASK: AtomicU8 = AtomicU8::new(0);

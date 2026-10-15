@@ -407,6 +407,16 @@ impl Inode for OverlayInode {
         self.set_ctime_impl(self_dentry, time)
     }
 
+    fn set_times(
+        &self,
+        self_dentry: &Dentry,
+        atime: Option<Duration>,
+        mtime: Option<Duration>,
+        ctime: Duration,
+    ) -> Result<()> {
+        self.set_times_impl(self_dentry, atime, mtime, ctime)
+    }
+
     fn get_xattr(&self, name: XattrName, value_writer: &mut VmWriter) -> Result<usize> {
         self.get_xattr_impl(name, value_writer)
     }

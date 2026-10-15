@@ -215,6 +215,20 @@ fn apply_args_after_finalize(action: &mut Action, args: &CommonArgs) {
 }
 
 impl Config {
+    /// Appends invocation flags to every finalized build configuration.
+    ///
+    /// Actions have already inherited manifest defaults. Append only the new
+    /// flags, rather than inheriting the global build again and duplicating
+    /// its flags. Build/run and test consume their respective action fields.
+    pub fn append_rustflags(&mut self, rustflags: &str) {
+        if rustflags.is_empty() {
+            return;
+        }
+        for build in [&mut self.build, &mut self.run.build, &mut self.test.build] {
+            build.append_rustflags(rustflags);
+        }
+    }
+
     pub fn new(scheme: &Scheme, common_args: &CommonArgs) -> Self {
         let check_compatibility = |protocol: BootProtocol, encoding: PayloadEncoding| {
             if protocol != BootProtocol::Linux && encoding != PayloadEncoding::Raw {

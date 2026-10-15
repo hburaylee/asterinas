@@ -47,6 +47,9 @@ impl DmaCoherent {
     /// that the DMA mapping is prepared for can access the main memory in a
     /// CPU cache coherent way or not.
     ///
+    /// Kernelet images require cache-coherent devices and return
+    /// [`Error::InvalidArgs`] when `is_cache_coherent` is false.
+    ///
     /// This method [requires](crate::mm::dma#usage-in-irqs) the caller to
     /// have IRQs enabled.
     pub fn alloc(nframes: usize, is_cache_coherent: bool) -> Result<Self, Error> {
@@ -82,7 +85,7 @@ impl DmaCoherent {
         };
 
         // SAFETY: The physical address range is untyped DMA memory before `drop`.
-        let map_daddr = unsafe { prepare_dma(&paddr_range) };
+        let map_daddr = unsafe { prepare_dma(&paddr_range) }?;
 
         Ok(Self {
             inner,

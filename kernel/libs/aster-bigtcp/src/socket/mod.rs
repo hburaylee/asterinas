@@ -5,6 +5,8 @@ mod event;
 mod option;
 mod unbound;
 
+#[cfg(kernelet_nat_failure_diag_host)]
+pub use bound::TcpResetDiagnostic;
 pub use bound::{
     ConnectState, NeedIfacePoll, RawTcpSocketExt, ReceiveBehavior, TcpConnection, TcpListener,
     UdpSocket,

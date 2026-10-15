@@ -151,7 +151,7 @@ impl<D: DmaDirection> DmaStream<D> {
         };
 
         // SAFETY: The physical address range is untyped DMA memory before `drop`.
-        let map_daddr = unsafe { prepare_dma(&paddr_range) };
+        let map_daddr = unsafe { prepare_dma(&paddr_range) }?;
 
         Ok(Self {
             inner,
@@ -188,7 +188,7 @@ impl<D: DmaDirection> DmaStream<D> {
         let paddr_range = paddr..paddr + size;
 
         // SAFETY: The physical address range is untyped DMA memory before `drop`.
-        let map_daddr = unsafe { prepare_dma(&paddr_range) };
+        let map_daddr = unsafe { prepare_dma(&paddr_range) }?;
 
         Ok(Self {
             inner,

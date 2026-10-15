@@ -54,11 +54,13 @@ where
 
             #[cfg(feature = "kernelet")]
             {
-                let message = info.message.as_bytes();
-                let len = message.len().min(1024);
-                let _ = (ostd::kernelet::entry::services().oops)(message.as_ptr(), len as u32);
+                // Preserve character boundaries within the Host service limit.
+                let mut end = info.message.len().min(1024);
+                while !info.message.is_char_boundary(end) {
+                    end -= 1;
+                }
+                let _ = ostd::kernelet::entry::report_oops(&info.message[..end]);
             }
-
             ostd::error!("Oops! {}", info.message);
 
             let count = OOPS_COUNT.fetch_add(1, Ordering::Relaxed);
@@ -89,7 +91,7 @@ fn panic_handler(info: &core::panic::PanicInfo) -> ! {
         let panic_on_oops = false;
         #[cfg(not(feature = "kernelet"))]
         let panic_on_oops = PANIC_ON_OOPS.load(Ordering::Relaxed);
-        #[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+        #[cfg(feature = "kernelet-host")]
         let panic_on_oops = panic_on_oops && !ostd::kernelet::control::in_host_hook();
         if !panic_on_oops && info.can_unwind() {
             // TODO: eliminate the need for heap allocation.
@@ -132,8 +134,5 @@ fn panic_handler(info: &core::panic::PanicInfo) -> ! {
         ostd::error!("Backtrace is disabled.");
     }
 
-    #[cfg(feature = "kernelet")]
-    ostd::kernelet::entry::stop_panic(format_args!("{info}"));
-    #[cfg(not(feature = "kernelet"))]
     panic::abort();
 }

@@ -19,5 +19,8 @@ ostd-pod.workspace = true
 spin.workspace = true
 zerocopy.workspace = true
 
+[features]
+kernelet-host = ["dma-pool/kernelet-host"]
+
 [lints]
 workspace = true

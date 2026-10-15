@@ -21,8 +21,13 @@ __memcpy_fallible: # (dst: *mut u8, src: *const u8, size: usize) -> usize
     ret
 .size __memcpy_fallible, .-__memcpy_fallible
 
+.global __memcpy_fallible_end
+.type __memcpy_fallible_end, @object
+__memcpy_fallible_end:
+.size __memcpy_fallible_end, 0
+
 .pushsection .ex_table, "a", @progbits
-    .align 8
+    .balign 8
     .quad .move - .
     .quad .memcpy_exit - .
 .popsection

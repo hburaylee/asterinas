@@ -41,12 +41,13 @@ pub(super) fn is_early_param(key: &str) -> bool {
 /// - `--` — stops parsing; all following tokens are for the init process.
 ///
 /// Double quotes (`"`) protect spaces inside one token (Linux-compatible).
-/// Other tokens are ignored. When `loglevel` is absent, the default is `8`
-/// ([`LevelFilter::Debug`]). When `earlycon` is absent, the early console stays disabled.
+/// Other tokens are ignored. When `loglevel` is absent,
+/// [`EarlyCmdline::DEFAULT_LOG_LEVEL`] applies: Debug for a native kernel and
+/// Info for a kernelet image. When `earlycon` is absent, the early console stays disabled.
 #[ostd::early_cmdline_parser]
 const fn early_cmdline_parser(cmdline: &str) -> EarlyCmdline {
     let mut has_early_console = false;
-    let mut log_level = LevelFilter::Debug;
+    let mut log_level = EarlyCmdline::DEFAULT_LOG_LEVEL;
 
     let bytes: &[u8] = cmdline.as_bytes();
     let mut index = 0;
@@ -165,7 +166,7 @@ mod tests {
     #[ktest]
     fn early_cmdline_parser_defaults() {
         let result = early_cmdline_parser("");
-        assert_eq!(result.log_level, LevelFilter::Debug);
+        assert_eq!(result.log_level, EarlyCmdline::DEFAULT_LOG_LEVEL);
         assert!(!result.has_early_console);
     }
 
@@ -197,11 +198,11 @@ mod tests {
         );
         assert_eq!(
             early_cmdline_parser("loglevel=3x").log_level,
-            LevelFilter::Debug
+            EarlyCmdline::DEFAULT_LOG_LEVEL
         );
         assert_eq!(
             early_cmdline_parser("loglevel=9").log_level,
-            LevelFilter::Debug
+            EarlyCmdline::DEFAULT_LOG_LEVEL
         );
         assert_eq!(
             early_cmdline_parser("loglevel=error").log_level,
@@ -221,7 +222,27 @@ mod tests {
         );
         assert_eq!(
             early_cmdline_parser("loglevel=Warn").log_level,
+            EarlyCmdline::DEFAULT_LOG_LEVEL
+        );
+    }
+
+    #[ktest]
+    fn early_cmdline_parser_explicit_debug_overrides_image_default() {
+        assert_eq!(
+            early_cmdline_parser("loglevel=debug").log_level,
             LevelFilter::Debug
+        );
+        assert_eq!(
+            early_cmdline_parser("loglevel=8").log_level,
+            LevelFilter::Debug
+        );
+        assert_eq!(
+            early_cmdline_parser("loglevel=info").log_level,
+            LevelFilter::Info
+        );
+        assert_eq!(
+            early_cmdline_parser("-- loglevel=error").log_level,
+            EarlyCmdline::DEFAULT_LOG_LEVEL
         );
     }
 

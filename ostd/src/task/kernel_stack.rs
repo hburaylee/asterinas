@@ -39,6 +39,9 @@ const DEFAULT_STACK_SIZE_IN_PAGES: u32 = 128;
 
 const KERNEL_STACK_SIZE: usize = STACK_SIZE_IN_PAGES as usize * PAGE_SIZE;
 
+#[cfg(feature = "kernelet-host")]
+pub(super) const RESERVATION_BYTES: usize = KERNEL_STACK_SIZE + 4 * PAGE_SIZE;
+
 #[derive(Debug)]
 pub(crate) struct KernelStack {
     kvirt_area: KVirtArea,
@@ -69,12 +72,8 @@ impl KernelStack {
             cache: CachePolicy::Writeback,
             priv_flags: PrivilegedPageFlags::empty(),
         };
-        let new_kvirt_area = KVirtArea::map_frames(
-            KERNEL_STACK_SIZE + 4 * PAGE_SIZE,
-            2 * PAGE_SIZE,
-            pages.into_iter(),
-            prop,
-        );
+        let new_kvirt_area = KVirtArea::try_reserve(KERNEL_STACK_SIZE + 4 * PAGE_SIZE)?;
+        new_kvirt_area.map_additional_frames(2 * PAGE_SIZE, pages.into_iter(), prop)?;
         let mapped_start = new_kvirt_area.range().start + 2 * PAGE_SIZE;
         let mapped_end = mapped_start + KERNEL_STACK_SIZE;
         Ok(Self {

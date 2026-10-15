@@ -980,6 +980,16 @@ impl Path {
         self.inode().set_ctime(&self.dentry, time)
     }
 
+    /// Updates explicit timestamps and propagates backing-store preparation errors.
+    pub(crate) fn set_times(
+        &self,
+        atime: Option<Duration>,
+        mtime: Option<Duration>,
+        ctime: Duration,
+    ) -> Result<()> {
+        self.inode().set_times(&self.dentry, atime, mtime, ctime)
+    }
+
     /// Resizes the file.
     pub(crate) fn resize(&self, size: usize) -> Result<()> {
         self.inode().check_permission(Permission::MAY_WRITE)?;

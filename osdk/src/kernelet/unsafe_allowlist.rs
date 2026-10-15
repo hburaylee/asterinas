@@ -9,6 +9,7 @@
 pub(super) enum Origin {
     Toolchain,
     Ostd,
+    VendoredUnwinder,
     GeneratedEntry,
     External,
 }
@@ -74,11 +75,12 @@ pub(super) const EXCEPTIONS: &[Exception] = &[
         origin: Origin::GeneratedEntry,
         reason: "OSDK-generated panic handler crosses the OSTD extern Rust entry",
     },
-    Exception::external(
-        "unwinding",
-        "0.2.10",
-        "unwinder interprets frame metadata and restores machine state",
-    ),
+    Exception {
+        package: "unwinding",
+        version: Some("0.2.10"),
+        origin: Origin::VendoredUnwinder,
+        reason: "reviewed OSTD vendored unwinder interprets frame metadata and restores non-FP kernel state",
+    },
     Exception::external(
         "allocator-api2",
         "0.2.21",
@@ -232,7 +234,7 @@ pub(super) const EXCEPTIONS: &[Exception] = &[
     Exception::external(
         "x86_64",
         "0.15.5",
-        "architecture primitives access registers, page tables, and interrupts",
+        "architecture primitives used only by OSTD; the wrapper rejects imports from all other Image crates",
     ),
     Exception::external(
         "uefi-raw",
@@ -292,7 +294,7 @@ pub(super) const EXCEPTIONS: &[Exception] = &[
     Exception::external(
         "x86",
         "0.52.0",
-        "x86 instruction and register access uses privileged operations",
+        "architecture primitives used only by OSTD; the wrapper rejects imports from all other Image crates",
     ),
     Exception::external(
         "lru",

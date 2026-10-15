@@ -32,8 +32,11 @@ pub trait GuardTransfer {
 }
 
 /// A guardian that disables preemption while holding a lock.
+///
+/// Kernelets also mask virtual IRQs to prevent an upcall from reentering the lock.
 pub enum PreemptDisabled {}
 
+#[cfg(not(feature = "kernelet"))]
 impl SpinGuardian for PreemptDisabled {
     type Guard = DisabledPreemptGuard;
     type ReadGuard = DisabledPreemptGuard;
@@ -43,6 +46,19 @@ impl SpinGuardian for PreemptDisabled {
     }
     fn read_guard() -> Self::Guard {
         disable_preempt()
+    }
+}
+
+#[cfg(feature = "kernelet")]
+impl SpinGuardian for PreemptDisabled {
+    type Guard = DisabledLocalIrqGuard;
+    type ReadGuard = DisabledLocalIrqGuard;
+
+    fn guard() -> Self::Guard {
+        disable_local()
+    }
+    fn read_guard() -> Self::ReadGuard {
+        disable_local()
     }
 }
 
@@ -90,5 +106,29 @@ impl SpinGuardian for WriteIrqDisabled {
     }
     fn read_guard() -> Self::ReadGuard {
         disable_preempt()
+    }
+}
+
+#[cfg(all(ktest, feature = "kernelet"))]
+mod test {
+    use super::super::SpinLock;
+    use crate::{arch::irq, prelude::ktest};
+
+    #[ktest]
+    fn nested_default_spin_locks_keep_virtual_irqs_masked() {
+        let initially_enabled = irq::is_local_enabled();
+        assert!(initially_enabled);
+        let outer: SpinLock<()> = SpinLock::new(());
+        let inner: SpinLock<()> = SpinLock::new(());
+
+        let outer_guard = outer.lock();
+        assert!(!irq::is_local_enabled());
+        {
+            let _inner_guard = inner.lock();
+            assert!(!irq::is_local_enabled());
+        }
+        assert!(!irq::is_local_enabled());
+        drop(outer_guard);
+        assert_eq!(irq::is_local_enabled(), initially_enabled);
     }
 }

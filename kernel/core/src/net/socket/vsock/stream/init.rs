@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
+#[cfg(feature = "kernelet")]
+use crate::net::socket::vsock::addr::VMADDR_CID_ANY;
 use crate::{
     events::IoEvents,
     net::socket::{
@@ -73,9 +75,18 @@ impl InitStream {
         remote_addr: VsockSocketAddr,
         pollee: &Pollee,
     ) -> Result<ConnectingStream, (Error, Self)> {
+        #[cfg(not(feature = "kernelet"))]
         if remote_addr.cid != VMADDR_CID_HOST {
             return Err((
                 Error::with_message(Errno::ENETUNREACH, "only the host vsock CID is supported"),
+                self,
+            ));
+        }
+        // Kernelet peers use this device transport; the Host switch enforces pair policy.
+        #[cfg(feature = "kernelet")]
+        if !(VMADDR_CID_HOST..VMADDR_CID_ANY).contains(&remote_addr.cid) {
+            return Err((
+                Error::with_message(Errno::ENETUNREACH, "the vsock CID is invalid to connect"),
                 self,
             ));
         }
@@ -94,6 +105,14 @@ impl InitStream {
                 Err(error) => return Err((error, self)),
             }
         };
+
+        #[cfg(feature = "kernelet")]
+        if remote_addr.cid == bound_port.local_addr().cid {
+            return Err((
+                Error::with_message(Errno::ENETUNREACH, "vsock loopback is not supported"),
+                Self::new_bound(bound_port),
+            ));
+        }
 
         ConnectingStream::new(bound_port, remote_addr, pollee)
             .map_err(|(error, bound_port)| (error, Self::new_bound(bound_port)))

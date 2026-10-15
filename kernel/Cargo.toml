@@ -23,6 +23,7 @@ coverage = ["aster-core/coverage"]
 cvm_guest = ["aster-core/cvm_guest"]
 pvh_boot = ["aster-core/pvh_boot"]
 kernelet = ["aster-core/kernelet", "ostd/kernelet", "aster-i8042/kernelet", "aster-uart/kernelet"]
+kernelet-host = ["aster-core/kernelet-host", "ostd/kernelet-host"]
 riscv_sv39_mode = ["aster-core/riscv_sv39_mode"]
 
 [lints]

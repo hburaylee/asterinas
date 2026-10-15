@@ -89,7 +89,7 @@ dependencies = [
  "ostd",
  "ostd-pod",
  "smoltcp",
- "spin",
+ "spin 0.9.9",
  "takeable",
  "zerocopy",
 ]
@@ -108,7 +108,7 @@ dependencies = [
  "io-util",
  "ostd",
  "ostd-pod",
- "spin",
+ "spin 0.9.9",
  "zerocopy",
 ]
 
@@ -119,7 +119,7 @@ dependencies = [
  "component",
  "inventory",
  "ostd",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -128,7 +128,7 @@ version = "0.1.0"
 dependencies = [
  "component",
  "ostd",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -189,13 +189,12 @@ dependencies = [
  "smallvec",
  "smoltcp",
  "sparse-id-alloc",
- "spin",
+ "spin 0.9.9",
  "takeable",
  "tdx-guest",
  "time",
  "typeflags",
  "typeflags-util",
- "x86_64",
  "xarray",
  "xmas-elf",
  "zerocopy",
@@ -210,7 +209,7 @@ dependencies = [
  "component",
  "device-id",
  "ostd",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -228,7 +227,7 @@ dependencies = [
  "ostd",
  "ostd-pod",
  "sparse-id-alloc",
- "spin",
+ "spin 0.9.9",
  "zerocopy",
 ]
 
@@ -242,7 +241,7 @@ dependencies = [
  "font8x8",
  "int-to-c-enum",
  "ostd",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -266,7 +265,7 @@ dependencies = [
  "bitflags 2.13.0",
  "component",
  "ostd",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -278,7 +277,7 @@ dependencies = [
  "component",
  "ostd",
  "ostd-pod",
- "spin",
+ "spin 0.9.9",
  "zerocopy",
 ]
 
@@ -321,7 +320,7 @@ dependencies = [
  "aster-softirq",
  "component",
  "ostd",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -336,7 +335,7 @@ dependencies = [
  "io-util",
  "ostd",
  "ostd-pod",
- "spin",
+ "spin 0.9.9",
  "zerocopy",
 ]
 
@@ -351,7 +350,7 @@ dependencies = [
  "fdt-util",
  "int-to-c-enum",
  "ostd",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -391,7 +390,7 @@ dependencies = [
  "component",
  "intrusive-collections",
  "ostd",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -404,7 +403,7 @@ dependencies = [
  "id-alloc",
  "inherit-methods-macro",
  "ostd",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -417,8 +416,7 @@ dependencies = [
  "component",
  "fdt-util",
  "ostd",
- "spin",
- "time",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -432,7 +430,7 @@ dependencies = [
  "fdt-util",
  "inherit-methods-macro",
  "ostd",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -477,7 +475,7 @@ dependencies = [
  "ostd-pod",
  "short-vis-path",
  "smallvec",
- "spin",
+ "spin 0.9.9",
  "tdx-guest",
  "typeflags-util",
  "zerocopy",
@@ -563,9 +561,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "cc"
-version = "1.2.67"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e17dd265a7d0f31ef544e1b20e03add05d3b45b491b633b10d67145d2acc1a38"
+checksum = "50a649af8a827553c29fb0cb4bd4a6f1a0dd695bd3232b9bc98bd9c8a3ffbb8b"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -780,7 +778,7 @@ name = "device-id"
 version = "0.1.0"
 dependencies = [
  "aster-util",
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -856,9 +854,9 @@ dependencies = [
 
 [[package]]
 name = "find-msvc-tools"
-version = "0.1.9"
+version = "0.1.14"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+checksum = "aedcfb3409746eddb02b9e19ebda1c3394f759a152e48ee875a0844d1b955484"
 
 [[package]]
 name = "fnv"
@@ -938,6 +936,10 @@ name = "gimli"
 version = "0.34.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1033caf0b349c518623b5396bfb2cf0bddf44f0306d543a250e5743297aafd10"
+dependencies = [
+ "rustc-std-workspace-alloc",
+ "rustc-std-workspace-core",
+]
 
 [[package]]
 name = "hash32"
@@ -995,7 +997,7 @@ dependencies = [
  "hash32 0.2.1",
  "rustc_version",
  "serde",
- "spin",
+ "spin 0.9.9",
  "stable_deref_trait",
 ]
 
@@ -1145,7 +1147,7 @@ version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "bbd2bcb4c963f2ddae06a2efc7e9f3591312473c50c6685e1f298068316e66fe"
 dependencies = [
- "spin",
+ "spin 0.9.9",
 ]
 
 [[package]]
@@ -1437,7 +1439,7 @@ dependencies = [
  "riscv",
  "sbi-rt",
  "smallvec",
- "spin",
+ "spin 0.9.9",
  "tdx-guest",
  "unwinding",
  "volatile 0.6.1",
@@ -1690,6 +1692,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8188909339ccc0c68cfb5a04648313f09621e8b87dc03095454f1a11f6c5d436"
 
 [[package]]
+name = "rustc-std-workspace-alloc"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f9d441c3b2ebf55cebf796bfdc265d67fa09db17b7bb6bd4be75c509e1e8fec3"
+
+[[package]]
+name = "rustc-std-workspace-core"
+version = "1.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa9c45b374136f52f2d6311062c7146bff20fec063c3f5d46a410bd937746955"
+
+[[package]]
 name = "rustc_version"
 version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1827,6 +1841,12 @@ checksum = "3763264f6b73151db08c50ff20d7d8a0b8796e021cdea7ceedad07b80155fa0e"
 dependencies = [
  "lock_api",
 ]
+
+[[package]]
+name = "spin"
+version = "0.12.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0134f9043ed38b087ac4f7d4af44c79e2c9e5094421fe3164f435ce585953b10"
 
 [[package]]
 name = "stable_deref_trait"
@@ -2087,10 +2107,11 @@ dependencies = [
 [[package]]
 name = "unwinding"
 version = "0.2.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4b134ada16dda9e435abe2a6d76a01d497bc60707357845a15f9b0ed42dc88ce"
 dependencies = [
  "gimli 0.34.0",
+ "libc",
+ "rustc-std-workspace-core",
+ "spin 0.12.3",
 ]
 
 [[package]]

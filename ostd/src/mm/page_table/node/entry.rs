@@ -122,12 +122,20 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
         &mut self,
         guard: &'rcu dyn InAtomicMode,
     ) -> Option<PageTableGuard<'rcu, C>> {
+        self.try_alloc_if_none(guard)
+            .expect("Failed to allocate a page table node")
+    }
+
+    pub(in crate::mm::page_table) fn try_alloc_if_none(
+        &mut self,
+        guard: &'rcu dyn InAtomicMode,
+    ) -> crate::Result<Option<PageTableGuard<'rcu, C>>> {
         if !matches!(self.to_ref(), PteStateRef::Absent) || self.node.level() == 1 {
-            return None;
+            return Ok(None);
         }
 
         let level = self.node.level();
-        let new_page = RcuDrop::new(PageTableNode::<C>::alloc(level - 1));
+        let new_page = RcuDrop::new(PageTableNode::<C>::try_alloc(level - 1)?);
 
         let paddr = new_page.paddr();
         // SAFETY: The page table won't be dropped before the RCU grace period
@@ -147,7 +155,7 @@ impl<'a, 'rcu, C: PageTableConfig> Entry<'a, 'rcu, C> {
 
         *self.node.nr_children_mut() += 1;
 
-        Some(pt_lock_guard)
+        Ok(Some(pt_lock_guard))
     }
 
     /// Splits the entry to smaller pages if it maps to a huge page.

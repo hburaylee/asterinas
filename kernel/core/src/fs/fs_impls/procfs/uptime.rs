@@ -32,7 +32,7 @@ impl UptimeFileOps {
 
     fn print_uptime(printer: &mut VmPrinter) -> Result<()> {
         let (uptime_secs, uptime_centis) =
-            duration_to_seconds_and_centiseconds(aster_time::read_monotonic_time());
+            duration_to_seconds_and_centiseconds(crate::time::read_monotonic_time());
 
         let cpustat = CpuTimeStatsManager::singleton();
         let (idle_secs, idle_centis) = duration_to_seconds_and_centiseconds(

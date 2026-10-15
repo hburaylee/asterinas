@@ -90,9 +90,16 @@ use crate::{
 /// clock. The offset is local to the current vCPU; a scheduler must retain a
 /// starting value only while the Task runs on that vCPU.
 pub fn runtime_ticks() -> u64 {
-    Task::current()
-        .and_then(|task| task.accounting.sample(true))
-        .unwrap_or_else(super::accounting::runtime_ticks)
+    #[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
+    {
+        Task::current()
+            .and_then(|task| task.accounting.sample(true))
+            .unwrap_or_else(super::accounting::runtime_ticks)
+    }
+    #[cfg(not(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest)))]
+    {
+        crate::arch::read_tsc()
+    }
 }
 
 /// Injects a custom implementation of task scheduler into OSTD.
@@ -127,13 +134,14 @@ pub fn inject_scheduler(scheduler: &'static dyn Scheduler<Task>) {
 /// by an OSTD-based kernel during its initialization phase,
 /// after it has injected its scheduler via [`inject_scheduler`].
 pub fn enable_preemption_on_cpu() {
-    timer::register_callback_on_cpu(|| {
-        scheduler_singleton().mut_local_rq_with(&mut |local_rq| {
-            let should_pick_next = local_rq.update_current(UpdateFlags::Tick);
-            if should_pick_next {
-                cpu_local::set_need_preempt();
-            }
-        })
+    timer::register_callback_on_cpu(|| update_current_on_tick(scheduler_singleton()));
+}
+
+fn update_current_on_tick(scheduler: &dyn Scheduler) {
+    scheduler.mut_local_rq_with(&mut |local_rq| {
+        if local_rq.update_current(UpdateFlags::Tick) {
+            cpu_local::set_need_preempt();
+        }
     });
 }
 
@@ -439,10 +447,22 @@ pub enum UpdateFlags {
     Exit,
 }
 
+/// Returns whether the current CPU has an unblocked inner preemption request.
+///
+/// The caller must still check its IRQ and Task-context gates before scheduling.
+#[cfg(feature = "kernelet")]
+#[inline]
+pub(crate) fn should_preempt() -> bool {
+    cpu_local::should_preempt()
+}
+
 /// Preempts the current task.
 #[track_caller]
 pub(crate) fn might_preempt() {
     if !cpu_local::should_preempt() {
+        return;
+    }
+    if super::scheduling_in_progress() {
         return;
     }
     reschedule(|local_rq| {
@@ -464,6 +484,11 @@ pub(crate) fn park_current<F>(has_unparked: F)
 where
     F: Fn() -> bool,
 {
+    #[cfg(feature = "kernelet")]
+    assert!(
+        !Task::current().is_some_and(|task| task.is_boot_task()),
+        "a boot Task cannot park"
+    );
     let mut current = None;
     let mut is_first_try = true;
 
@@ -504,6 +529,8 @@ where
 
 /// Unblocks a target task.
 pub(crate) fn unpark_target(runnable: Arc<Task>) {
+    #[cfg(feature = "kernelet")]
+    assert!(!runnable.is_boot_task(), "a boot Task cannot be woken");
     let preempt_cpu = scheduler_singleton().enqueue(runnable, EnqueueFlags::Wake);
     if let Some(preempt_cpu_id) = preempt_cpu {
         set_need_preempt(preempt_cpu_id);
@@ -515,6 +542,8 @@ pub(crate) fn unpark_target(runnable: Arc<Task>) {
 /// Note that the new task is not guaranteed to run at once.
 #[track_caller]
 pub(super) fn run_new_task(runnable: Arc<Task>) {
+    #[cfg(feature = "kernelet")]
+    assert!(!runnable.is_boot_task(), "a boot Task cannot be enqueued");
     let preempt_cpu = scheduler_singleton().enqueue(runnable, EnqueueFlags::Spawn);
     if let Some(preempt_cpu_id) = preempt_cpu {
         set_need_preempt(preempt_cpu_id);
@@ -545,10 +574,23 @@ fn set_need_preempt(cpu_id: CpuId) {
     }
 }
 
-/// Marks the current vCPU for a scheduler check after a virtual KICK.
+/// Rechecks scheduling policy after a virtual KICK publishes work.
+///
+/// A KICK can also be a pure delivery doorbell. It does not itself authorize
+/// picking another Task. Reuse the timer's policy/runtime update without
+/// replaying a timer or charging a CPU-clock tick, and preserve any existing
+/// preemption request if the policy does not request another one.
 #[cfg(feature = "kernelet")]
-pub(crate) fn mark_need_preempt_on_current_cpu() {
-    cpu_local::set_need_preempt();
+pub(crate) fn check_preempt_after_virtual_kick() {
+    if super::in_boot_task() {
+        return;
+    }
+    // A bootstrap grant notification must not install the default FIFO
+    // scheduler before the kernel injects its own scheduler.
+    let Some(scheduler) = SCHEDULER.get() else {
+        return;
+    };
+    update_current_on_tick(*scheduler);
 }
 
 /// Dequeues the current task from its runqueue.
@@ -558,7 +600,7 @@ pub(crate) fn mark_need_preempt_on_current_cpu() {
 pub(super) fn exit_current() -> ! {
     let mut is_first_try = true;
 
-    reschedule(|local_rq: &mut dyn LocalRunQueue| {
+    let action = |local_rq: &mut dyn LocalRunQueue| {
         let next_task_opt = if is_first_try {
             is_first_try = false;
             let should_pick_next = local_rq.update_current(UpdateFlags::Exit);
@@ -573,7 +615,28 @@ pub(super) fn exit_current() -> ! {
         } else {
             ReschedAction::Retry
         }
-    });
+    };
+
+    #[cfg(feature = "kernelet")]
+    if super::in_boot_task() {
+        super::atomic_mode::might_sleep();
+        // A finite main that spawned nothing has no successor stack. Stop
+        // through the protected Host stack; instance teardown owns its slot.
+        // Do not initialize the default FIFO merely to inspect this case.
+        if SCHEDULER.get().is_none() {
+            crate::power::poweroff(crate::power::ExitCode::Success);
+        }
+        // Boot is not enqueued. Keep scheduling excluded continuously until
+        // its Exit decision: this mark takes over before clearing BOOT.
+        // RCU callbacks may sleep, so leave their dispatch to the next Task.
+        let scheduling_guard = super::SchedulingGuard::new();
+        cpu_local::leave_boot_task();
+        reschedule_with_guard(action, scheduling_guard);
+    } else {
+        reschedule(action);
+    }
+    #[cfg(not(feature = "kernelet"))]
+    reschedule(action);
 
     unreachable!()
 }
@@ -581,6 +644,11 @@ pub(super) fn exit_current() -> ! {
 /// Yields execution.
 #[track_caller]
 pub(super) fn yield_now() {
+    #[cfg(feature = "kernelet")]
+    assert!(
+        !Task::current().is_some_and(|task| task.is_boot_task()),
+        "a boot Task cannot yield"
+    );
     reschedule(|local_rq| {
         let should_pick_next = local_rq.update_current(UpdateFlags::Yield);
         let next_task_opt = should_pick_next.then(|| local_rq.pick_next());
@@ -597,17 +665,30 @@ pub(super) fn yield_now() {
 ///
 /// The closure makes the scheduling decision by taking the local runqueue has its input.
 #[track_caller]
-fn reschedule<F>(mut f: F)
+fn reschedule<F>(f: F)
 where
     F: FnMut(&mut dyn LocalRunQueue) -> ReschedAction,
 {
-    // The runqueue guard enables virtual IRQs after publishing its decision.
-    // Keep this Task from recursively entering the scheduler until its chosen
-    // context switch has installed the next Task. The next Task has its own
-    // deferral state and can receive the pending notice.
-    #[cfg(feature = "kernelet")]
-    let _virq_deferral = super::VirtualIrqDeferral::new();
+    super::atomic_mode::might_sleep();
 
+    // RCU callbacks may sleep or yield. Run them before marking this Task's
+    // scheduling transition and before committing a runqueue decision.
+    // SAFETY: `might_sleep` checked that no preemption guard or RCU reader
+    // is held and that local IRQs are enabled outside bootstrap context.
+    unsafe { crate::sync::finish_grace_period() };
+
+    // IRQs may run after the runqueue decision and before the context switch.
+    // Keep their preemption checks from replacing this Task's unfinished
+    // decision. The next Task has its own mark and can still be preempted.
+    let scheduling_guard = super::SchedulingGuard::new();
+
+    reschedule_with_guard(f, scheduling_guard);
+}
+
+fn reschedule_with_guard<F>(mut f: F, _scheduling_guard: super::SchedulingGuard)
+where
+    F: FnMut(&mut dyn LocalRunQueue) -> ReschedAction,
+{
     // Even if the decision below is `DoNothing`, we should clear this flag. Meanwhile, to avoid
     // race conditions, we should do this before making the decision.
     cpu_local::clear_need_preempt();
@@ -648,4 +729,82 @@ enum ReschedAction {
     Retry,
     /// Switch to target task.
     SwitchTo(Arc<Task>),
+}
+
+#[cfg(ktest)]
+mod test {
+    #[cfg(not(feature = "kernelet"))]
+    use core::sync::atomic::{AtomicBool, Ordering};
+
+    use super::*;
+
+    #[ktest]
+    fn preemption_waits_for_scheduler_decision() {
+        assert!(!super::super::scheduling_in_progress());
+
+        reschedule(|_| {
+            assert!(super::super::scheduling_in_progress());
+            ReschedAction::DoNothing
+        });
+
+        assert!(!super::super::scheduling_in_progress());
+
+        // The runqueue closure itself holds a preemption guard. Exercise the
+        // later decision-to-switch window separately, without that guard.
+        let scheduling_guard = super::super::SchedulingGuard::new();
+        let irq_guard = crate::irq::disable_local();
+        cpu_local::set_need_preempt();
+        assert!(cpu_local::should_preempt());
+        might_preempt();
+        assert!(cpu_local::need_preempt());
+        drop(irq_guard);
+        assert!(cpu_local::need_preempt());
+        cpu_local::clear_need_preempt();
+        drop(scheduling_guard);
+        assert!(!super::super::scheduling_in_progress());
+    }
+
+    #[cfg(not(feature = "kernelet"))]
+    #[ktest]
+    fn rcu_destructor_can_yield_before_scheduler_decision() {
+        // Other CPUs must report their own quiescent states. This regression
+        // uses one CPU so the real global grace period completes synchronously.
+        if crate::cpu::num_cpus() != 1 {
+            return;
+        }
+
+        struct YieldOnDrop(Arc<AtomicBool>);
+
+        impl Drop for YieldOnDrop {
+            fn drop(&mut self) {
+                assert!(crate::arch::irq::is_local_enabled());
+                assert!(!crate::task::scheduling_in_progress());
+                Task::yield_now();
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let worker_ran = Arc::new(AtomicBool::new(false));
+        let worker_observed = worker_ran.clone();
+        let worker = crate::task::TaskOptions::new(move || {
+            worker_observed.store(true, Ordering::Release);
+        })
+        .spawn()
+        .unwrap();
+        let dropped = Arc::new(AtomicBool::new(false));
+        drop(crate::sync::RcuDrop::new(YieldOnDrop(dropped.clone())));
+
+        // A prior grace period may precede the one containing this destructor.
+        // Yield through the public API so the destructor itself can switch Tasks.
+        for _ in 0..3 {
+            Task::yield_now();
+            if dropped.load(Ordering::Acquire) {
+                break;
+            }
+        }
+
+        assert!(dropped.load(Ordering::Acquire));
+        assert!(worker_ran.load(Ordering::Acquire));
+        drop(worker);
+    }
 }

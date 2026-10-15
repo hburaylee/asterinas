@@ -41,7 +41,7 @@ intrusive-collections.workspace = true
 int-to-c-enum.workspace = true
 io-util.workspace = true
 jhash.workspace = true
-kernelet-abi.workspace = true
+kernelet-abi = { workspace = true, optional = true }
 keyable-arc.workspace = true
 lending-iterator.workspace = true
 logo-ascii-art.workspace = true
@@ -56,7 +56,7 @@ rand = { workspace = true, features = ["small_rng", "std_rng"] }
 ring-buffer.workspace = true
 short-vis-path.workspace = true
 smallvec.workspace = true
-smoltcp.workspace = true
+smoltcp = { workspace = true, optional = true }
 sparse-id-alloc.workspace = true
 spin.workspace = true
 takeable.workspace = true
@@ -69,7 +69,6 @@ zerocopy.workspace = true
 
 [target.x86_64-unknown-none.dependencies]
 tdx-guest = { workspace = true, optional = true }
-x86_64.workspace = true
 
 [target.riscv64imac-unknown-none-elf.dependencies]
 riscv.workspace = true
@@ -83,6 +82,7 @@ coverage = ["ostd/coverage"]
 cvm_guest = ["dep:tdx-guest", "ostd/cvm_guest", "aster-virtio/cvm_guest"]
 pvh_boot = ["ostd/pvh_boot"]
 kernelet = ["ostd/kernelet", "aster-time/kernelet", "aster-virtio/kernelet"]
+kernelet-host = ["ostd/kernelet-host", "aster-block/kernelet-host", "dep:kernelet-abi", "dep:smoltcp"]
 # By default we use the Sv48 address translation mode.
 riscv_sv39_mode = ["ostd/riscv_sv39_mode"]
 

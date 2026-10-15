@@ -45,7 +45,11 @@ use crate::{
     },
     prelude::*,
     process::signal::{PollHandle, Pollable, Pollee},
-    util::{MultiRead, MultiWrite, ioctl::RawIoctl, net::SockType},
+    util::{
+        MultiRead, MultiWrite,
+        ioctl::{RawIoctl, common_defs::GetNumBytesToRead, dispatch_ioctl},
+        net::SockType,
+    },
 };
 
 mod connected;
@@ -66,6 +70,8 @@ pub(crate) struct StreamSocket {
     timeouts: SocketTimeouts,
 
     pollee: Pollee,
+    #[cfg(feature = "kernelet-host")]
+    nat_charge: Arc<SpinLock<Option<crate::endovisor::NativeTcpBufferCharge>>>,
     common: FileCommon,
 }
 
@@ -114,6 +120,8 @@ impl StreamSocket {
             options: RwLock::new(OptionSet::new()),
             timeouts: SocketTimeouts::new(),
             pollee: Pollee::new(),
+            #[cfg(feature = "kernelet-host")]
+            nat_charge: Arc::new(SpinLock::new(None)),
             common: new_socket_common(is_nonblocking),
         })
     }
@@ -157,7 +165,13 @@ impl StreamSocket {
         });
 
         let pollee = Pollee::new();
-        connected_stream.init_observer(StreamObserver::new(pollee.clone()));
+        #[cfg(feature = "kernelet-host")]
+        let nat_charge = Arc::new(SpinLock::new(None));
+        connected_stream.init_observer(StreamObserver::new(
+            pollee.clone(),
+            #[cfg(feature = "kernelet-host")]
+            nat_charge.clone(),
+        ));
 
         Arc::new(Self {
             state: RwLock::new(Takeable::new(State::Connected(connected_stream))),
@@ -165,8 +179,24 @@ impl StreamSocket {
             options: RwLock::new(options),
             timeouts: listener_timeouts.clone(),
             pollee,
+            #[cfg(feature = "kernelet-host")]
+            nat_charge,
             common: new_socket_common(is_nonblocking),
         })
+    }
+
+    /// Retains NAT TCP buffer accounting through the native protocol lifetime.
+    #[cfg(feature = "kernelet-host")]
+    pub(crate) fn retain_nat_charge(
+        &self,
+        charge: crate::endovisor::NativeTcpBufferCharge,
+    ) -> Result<()> {
+        let mut retained = self.nat_charge.lock();
+        if retained.is_some() {
+            return_errno_with_message!(Errno::EALREADY, "native NAT TCP charge already installed");
+        }
+        *retained = Some(charge);
+        Ok(())
     }
 
     /// Ensures that the socket state is up to date and obtains a read lock on it.
@@ -270,7 +300,11 @@ impl StreamSocket {
                 self.family,
                 &raw_option,
                 options.socket.reuse_addr(),
-                StreamObserver::new(self.pollee.clone()),
+                StreamObserver::new(
+                    self.pollee.clone(),
+                    #[cfg(feature = "kernelet-host")]
+                    self.nat_charge.clone(),
+                ),
             ) {
                 Ok(connecting_stream) => {
                     let iface_to_poll = connecting_stream.iface().clone();
@@ -444,6 +478,18 @@ impl StreamSocket {
         self.pollee.invalidate();
         error
     }
+
+    #[cfg(kernelet_nat_failure_diag_host)]
+    pub(crate) fn reset_diagnostic(&self) -> Option<aster_bigtcp::socket::TcpResetDiagnostic> {
+        let diagnostic = {
+            let state = self.state.read();
+            match state.as_ref() {
+                State::Connected(connected_stream) => Some(connected_stream.reset_diagnostic()),
+                _ => None,
+            }
+        };
+        diagnostic
+    }
 }
 
 impl Pollable for StreamSocket {
@@ -459,16 +505,36 @@ impl SocketPrivate for StreamSocket {
     }
 
     fn protocol_ioctl(&self, raw_ioctl: RawIoctl) -> Result<i32> {
-        // Handle common IPv4/IPv6 ioctl commands.
-        match self.family {
-            IpAddressFamily::IPv4 => ipv4_ioctl(raw_ioctl),
-            IpAddressFamily::IPv6 => {
-                // TODO: Add support for IPv6 ioctl commands.
-                return_errno_with_message!(Errno::ENOTTY, "the socket ioctl command is unknown")
+        dispatch_ioctl!(match raw_ioctl {
+            cmd @ GetNumBytesToRead => {
+                // Linux rejects LISTEN sockets and counts only queued unread data.
+                // Reference: <https://man7.org/linux/man-pages/man7/tcp.7.html>.
+                let num_bytes = {
+                    let state = self.read_updated_state();
+                    match state.as_ref() {
+                        State::Init(_) | State::Connecting(_) => 0,
+                        State::Connected(stream) => stream.raw_with(|socket| socket.recv_queue()),
+                        State::Listen(_) => {
+                            return_errno_with_message!(Errno::EINVAL, "the socket is listening");
+                        }
+                    }
+                };
+                let num_bytes = i32::try_from(num_bytes).map_err(|_| {
+                    Error::with_message(Errno::EOVERFLOW, "the receive queue length exceeds i32")
+                })?;
+                // Release the socket locks before writing to userspace.
+                cmd.write(&num_bytes)?;
+                Ok(0)
             }
-        }
-
-        // Handle ioctl commands that require TCP-specific handling.
+            // Handle common IPv4/IPv6 ioctl commands.
+            _ => match self.family {
+                IpAddressFamily::IPv4 => ipv4_ioctl(raw_ioctl),
+                IpAddressFamily::IPv6 => {
+                    // TODO: Add support for IPv6 ioctl commands.
+                    return_errno_with_message!(Errno::ENOTTY, "the socket ioctl command is unknown")
+                }
+            },
+        })
     }
 }
 
@@ -528,7 +594,11 @@ impl Socket for StreamSocket {
             let listen_stream = match init_stream.listen(
                 backlog,
                 &raw_option,
-                StreamObserver::new(self.pollee.clone()),
+                StreamObserver::new(
+                    self.pollee.clone(),
+                    #[cfg(feature = "kernelet-host")]
+                    self.nat_charge.clone(),
+                ),
             ) {
                 Ok(listen_stream) => listen_stream,
                 Err((err, init_stream)) => {

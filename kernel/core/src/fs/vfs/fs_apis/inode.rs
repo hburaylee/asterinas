@@ -433,6 +433,26 @@ pub(crate) trait Inode: Any + FileOps + Send + Sync {
     /// Sets the inode's metadata-change time.
     fn set_ctime(&self, self_dentry: &Dentry, time: Duration);
 
+    /// Updates explicit timestamps, allowing layered filesystems to prepare storage.
+    ///
+    /// A `None` timestamp is left unchanged.
+    fn set_times(
+        &self,
+        self_dentry: &Dentry,
+        atime: Option<Duration>,
+        mtime: Option<Duration>,
+        ctime: Duration,
+    ) -> Result<()> {
+        if let Some(atime) = atime {
+            self.set_atime(self_dentry, atime);
+        }
+        if let Some(mtime) = mtime {
+            self.set_mtime(self_dentry, mtime);
+        }
+        self.set_ctime(self_dentry, ctime);
+        Ok(())
+    }
+
     /// Returns the inode's page cache, if it has one.
     fn page_cache(&self) -> Option<Arc<Vmo>> {
         None

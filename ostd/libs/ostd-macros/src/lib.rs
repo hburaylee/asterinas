@@ -120,13 +120,7 @@ fn ostd_main_body(main_fn_name: &Ident) -> proc_macro2::TokenStream {
     quote! {
         let _: () = #main_fn_name();
 
-        ::ostd::task::Task::yield_now();
-
-        // If we reach this point, the user-provided main function did not
-        // spawn any tasks, so there is nothing left to schedule.
-        // Power off gracefully.
-        ::core::assert!(::ostd::task::Task::current().is_none());
-        ::ostd::power::poweroff(::ostd::power::ExitCode::Success);
+        ::ostd::boot::__main_epilogue();
     }
 }
 
@@ -314,6 +308,7 @@ pub fn panic_handler(_attr: TokenStream, item: TokenStream) -> TokenStream {
         // SAFETY: The name does not collide with other symbols.
         #[unsafe(no_mangle)]
         extern "Rust" fn __ostd_panic_handler(info: &::core::panic::PanicInfo) -> ! {
+            ::ostd::panic::__handler_entry(info);
             #handler_fn_name(info);
         }
 
@@ -337,6 +332,7 @@ pub fn test_panic_handler(_attr: TokenStream, item: TokenStream) -> TokenStream 
         // SAFETY: The name does not collide with other symbols.
         #[unsafe(no_mangle)]
         extern "Rust" fn __ostd_panic_handler(info: &::core::panic::PanicInfo) -> ! {
+            ::ostd::panic::__handler_entry(info);
             #handler_fn_name(info);
         }
 

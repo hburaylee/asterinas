@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::{collections::BinaryHeap, sync::Arc};
+#[cfg(feature = "kernelet-host")]
+use core::num::NonZeroU16;
 use core::{
     cmp::{self, Reverse},
     sync::atomic::{AtomicU64, Ordering},
@@ -25,6 +27,10 @@ use crate::{
 };
 
 const WEIGHT_0: u64 = 1024;
+
+// Keep small shares representable without changing the user-visible nice ladder.
+#[cfg(feature = "kernelet-host")]
+const WEIGHT_SCALE: u64 = 1 << 16;
 
 const HAS_PENDING: u64 = 1 << (u64::BITS - 1);
 
@@ -68,6 +74,11 @@ pub(crate) const fn nice_to_weight(nice: Nice) -> u64 {
     NICE_TO_WEIGHT[(nice.value().get() + 20) as usize]
 }
 
+#[cfg(feature = "kernelet-host")]
+fn effective_weight(nice: Nice, divisor: NonZeroU16) -> u64 {
+    nice_to_weight(nice) * WEIGHT_SCALE / u64::from(divisor.get())
+}
+
 /// The scheduling entity for the FAIR scheduling class.
 ///
 /// The structure contains a significant indicator: `vruntime`.
@@ -80,6 +91,8 @@ pub(crate) const fn nice_to_weight(nice: Nice) -> u64 {
 ///
 /// and a thread with a lower vruntime gains a greater privilege to be
 /// scheduled, making the whole run queue balanced on vruntime (thus FAIR).
+/// With Kernelet Host support, weights and the numerator use the same
+/// fixed-point scale so dividing carrier shares does not round them to zero.
 ///
 /// # Scheduling periods
 ///
@@ -128,21 +141,45 @@ pub(crate) struct FairAttr {
     weight: AtomicU64,
     pending_weight: SpinLock<u64>,
     vruntime: AtomicU64,
+    #[cfg(feature = "kernelet-host")]
+    weight_divisor: NonZeroU16,
 }
 
 impl FairAttr {
     pub(crate) fn new(nice: Nice) -> Self {
-        let weight = nice_to_weight(nice);
+        #[cfg(feature = "kernelet-host")]
+        {
+            Self::new_with_weight_divisor(nice, NonZeroU16::MIN)
+        }
+        #[cfg(not(feature = "kernelet-host"))]
+        {
+            let weight = nice_to_weight(nice);
+            Self {
+                weight: weight.into(),
+                pending_weight: SpinLock::new(weight),
+                vruntime: Default::default(),
+            }
+        }
+    }
+
+    #[cfg(feature = "kernelet-host")]
+    pub(super) fn new_with_weight_divisor(nice: Nice, weight_divisor: NonZeroU16) -> Self {
+        let weight = effective_weight(nice, weight_divisor);
         FairAttr {
             weight: weight.into(),
             pending_weight: SpinLock::new(weight),
             vruntime: Default::default(),
+            weight_divisor,
         }
     }
 
     pub(crate) fn update(&self, nice: Nice) {
         let mut pending_weight = self.pending_weight.lock();
-        *pending_weight = nice_to_weight(nice);
+        #[cfg(feature = "kernelet-host")]
+        let weight = effective_weight(nice, self.weight_divisor);
+        #[cfg(not(feature = "kernelet-host"))]
+        let weight = nice_to_weight(nice);
+        *pending_weight = weight;
         self.weight.store(
             self.weight.load(Ordering::Relaxed) | HAS_PENDING,
             Ordering::Relaxed,
@@ -150,6 +187,12 @@ impl FairAttr {
     }
 
     fn update_vruntime(&self, delta: u64, weight: u64) -> u64 {
+        #[cfg(feature = "kernelet-host")]
+        let delta = u64::try_from(
+            u128::from(delta) * u128::from(WEIGHT_0 * WEIGHT_SCALE) / u128::from(weight),
+        )
+        .expect("fair vruntime delta overflow");
+        #[cfg(not(feature = "kernelet-host"))]
         let delta = delta * WEIGHT_0 / weight;
         self.vruntime.fetch_add(delta, Ordering::Relaxed) + delta
     }
@@ -273,7 +316,16 @@ impl FairClassRq {
 
     /// The time slice for each thread in the run queue, measured in sched clocks.
     fn time_slice(&self, cur_weight: u64) -> u64 {
-        self.period() * cur_weight / (self.total_weight + cur_weight)
+        #[cfg(feature = "kernelet-host")]
+        {
+            // The quotient is at most the period, so it fits in `u64`.
+            (u128::from(self.period()) * u128::from(cur_weight)
+                / (u128::from(self.total_weight) + u128::from(cur_weight))) as u64
+        }
+        #[cfg(not(feature = "kernelet-host"))]
+        {
+            self.period() * cur_weight / (self.total_weight + cur_weight)
+        }
     }
 }
 
@@ -342,5 +394,130 @@ impl SchedClassRq for FairClassRq {
             }
             UpdateFlags::Exit => !self.is_empty(),
         }
+    }
+}
+
+#[cfg(ktest)]
+mod test {
+    use ostd::prelude::ktest;
+
+    use super::*;
+    #[cfg(feature = "kernelet-host")]
+    use crate::sched::SchedPolicy;
+    use crate::thread::kernel_thread::ThreadOptions;
+
+    #[cfg(not(feature = "kernelet-host"))]
+    #[ktest]
+    fn native_fair_weights_preserve_nice_runtime_and_time_slice() {
+        for value in -20..=19 {
+            let nice = Nice::try_from(value).unwrap();
+            let weight = nice_to_weight(nice);
+            let attr = FairAttr::new(nice);
+            assert_eq!(attr.fetch_weight(), (weight, weight));
+            assert_eq!(attr.update_vruntime(137 * weight, weight), 137 * WEIGHT_0);
+            attr.update(Nice::MAX);
+            assert_eq!(attr.fetch_weight(), (weight, nice_to_weight(Nice::MAX)));
+        }
+        let peer = ThreadOptions::new(|| {}).build();
+        let mut rq = FairClassRq::new(CpuId::current_racy());
+        rq.enqueue(peer, Some(EnqueueFlags::Spawn));
+        assert_eq!(rq.time_slice(WEIGHT_0), rq.period() / 2);
+        assert!(rq.pick_next().is_some());
+        assert_eq!(rq.total_weight, 0);
+    }
+
+    #[cfg(feature = "kernelet-host")]
+    #[ktest]
+    fn fair_shares_preserve_nice_weights_and_positive_extreme_shares() {
+        assert_eq!(nice_to_weight(Nice::default()), 1024);
+        assert_eq!(nice_to_weight(Nice::MAX), 14);
+        for value in -20..=19 {
+            let nice = Nice::try_from(value).unwrap();
+            let base_weight = nice_to_weight(nice);
+            let whole_weight = base_weight * WEIGHT_SCALE;
+            let ordinary = FairAttr::new(nice);
+            assert_eq!(ordinary.fetch_weight(), (whole_weight, whole_weight));
+            let delta = 137 * base_weight;
+            assert_eq!(
+                ordinary.update_vruntime(delta, whole_weight),
+                137 * WEIGHT_0
+            );
+
+            for divisor in [1, 2, 3, 64, u16::MAX] {
+                let attr =
+                    FairAttr::new_with_weight_divisor(nice, NonZeroU16::new(divisor).unwrap());
+                let (old_weight, weight) = attr.fetch_weight();
+                assert_eq!(old_weight, weight);
+                assert_ne!(weight, 0);
+                assert_eq!(weight & HAS_PENDING, 0);
+                // Flooring loses less than one fixed-point unit per carrier.
+                let total_weight = weight * u64::from(divisor);
+                assert!(total_weight <= whole_weight);
+                assert!(whole_weight - total_weight < u64::from(divisor));
+            }
+        }
+    }
+
+    #[cfg(feature = "kernelet-host")]
+    #[ktest]
+    fn policy_updates_preserve_fair_share_and_latest_queued_weight() {
+        let divisor = NonZeroU16::new(64).unwrap();
+        let task = ThreadOptions::new(|| {})
+            .fair_weight_divisor(divisor)
+            .build();
+        let attr = task.as_thread().unwrap().sched_attr();
+        let initial_weight = effective_weight(Nice::default(), divisor);
+        let mut rq = FairClassRq::new(CpuId::current_racy());
+        rq.enqueue(task.clone(), Some(EnqueueFlags::Spawn));
+        assert_eq!(rq.total_weight, initial_weight);
+
+        attr.set_policy(SchedPolicy::Fair(Nice::MIN));
+        attr.update_policy(|policy| *policy = SchedPolicy::Fair(Nice::MAX));
+        assert_eq!(attr.policy(), SchedPolicy::Fair(Nice::MAX));
+        assert_eq!(attr.fair.weight_divisor, divisor);
+        assert_eq!(rq.total_weight, initial_weight);
+
+        let picked = rq.pick_next().unwrap();
+        assert!(Arc::ptr_eq(&picked, &task));
+        assert_eq!(rq.total_weight, 0);
+        let updated_weight = effective_weight(Nice::MAX, divisor);
+        assert_eq!(attr.fair.fetch_weight(), (updated_weight, updated_weight));
+        rq.enqueue(picked, Some(EnqueueFlags::Wake));
+        assert_eq!(rq.total_weight, updated_weight);
+        assert!(rq.pick_next().is_some());
+        assert_eq!(rq.total_weight, 0);
+
+        attr.set_policy(SchedPolicy::Idle);
+        attr.set_policy(SchedPolicy::Fair(Nice::default()));
+        assert_eq!(attr.fair.fetch_weight(), (updated_weight, initial_weight));
+    }
+
+    #[cfg(feature = "kernelet-host")]
+    #[ktest]
+    fn fair_runqueue_uses_divided_share_for_runtime_and_time_slice() {
+        let peer = ThreadOptions::new(|| {}).build();
+        let mut rq = FairClassRq::new(CpuId::current_racy());
+        rq.enqueue(peer, Some(EnqueueFlags::Spawn));
+        let ordinary = SchedAttr::new(SchedPolicy::Fair(Nice::default()));
+        let divided = SchedAttr::new(SchedPolicy::Fair(Nice::default()))
+            .with_fair_weight_divisor(NonZeroU16::new(64).unwrap());
+        let (_, ordinary_weight) = ordinary.fair.fetch_weight();
+        let (_, divided_weight) = divided.fair.fetch_weight();
+        let period = rq.period();
+        assert_eq!(rq.time_slice(ordinary_weight), period / 2);
+        assert_eq!(rq.time_slice(divided_weight), period / 65);
+
+        // The fixed-point multiplication exceeds u64, while both results fit.
+        let runtime = CurrentRuntime {
+            start: 0,
+            delta: 1 << 40,
+            period_delta: period,
+        };
+        assert!(rq.update_current(&runtime, &ordinary, UpdateFlags::Tick));
+        assert!(rq.update_current(&runtime, &divided, UpdateFlags::Tick));
+        assert_eq!(ordinary.fair.vruntime.load(Ordering::Relaxed), 1 << 40);
+        assert_eq!(divided.fair.vruntime.load(Ordering::Relaxed), 1 << 46);
+        assert!(rq.pick_next().is_some());
+        assert_eq!(rq.total_weight, 0);
     }
 }

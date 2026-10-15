@@ -152,6 +152,7 @@ pub fn register_ap_entry(entry: fn()) {
 /// Continues a prepared virtual CPU after its replica and identity are installed.
 #[cfg(feature = "kernelet")]
 pub(crate) fn kernelet_ap_entry() -> ! {
+    crate::task::adopt_boot_task();
     let vcpu = crate::cpu::CpuId::current_racy().as_usize();
     report_kernelet_online(vcpu);
 
@@ -164,8 +165,7 @@ pub(crate) fn kernelet_ap_entry() -> ! {
     };
     crate::arch::irq::enable_local();
     entry();
-    Task::yield_now();
-    unreachable!("virtual AP idle task must take over")
+    crate::task::exit_current_task();
 }
 
 #[cfg(feature = "kernelet")]

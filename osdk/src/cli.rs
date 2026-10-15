@@ -24,9 +24,7 @@ pub fn main() {
         let manifest = TomlManifest::load();
         let scheme = manifest.get_scheme(common_args.scheme.as_ref());
         let mut config = Config::new(scheme, common_args);
-        config
-            .build
-            .append_rustflags(&std::env::var("RUSTFLAGS").unwrap_or_default());
+        config.append_rustflags(&std::env::var("RUSTFLAGS").unwrap_or_default());
         config
     };
 
@@ -39,10 +37,7 @@ pub fn main() {
             execute_build_command(&load_config(&build_args.common_args), build_args);
         }
         OsdkSubcommand::Run(run_args) => {
-            execute_run_command(
-                &load_config(&run_args.common_args),
-                run_args.gdb_server.as_deref(),
-            );
+            execute_run_command(&load_config(&run_args.common_args), run_args);
         }
         OsdkSubcommand::Debug(debug_args) => {
             execute_debug_command(
@@ -176,15 +171,21 @@ pub struct BuildArgs {
         default_value_t
     )]
     pub for_test: bool,
+    #[command(flatten)]
+    pub output_args: OutputArgs,
+    #[command(flatten)]
+    pub common_args: CommonArgs,
+}
+
+#[derive(Debug, Args)]
+pub struct OutputArgs {
     #[arg(
         long = "output",
         short = 'o',
-        help = "Output directory for all generated artifacts",
+        help = "Output directory for OSDK artifacts; Cargo compilation caches remain shared",
         value_name = "DIR"
     )]
     pub output: Option<PathBuf>,
-    #[command(flatten)]
-    pub common_args: CommonArgs,
 }
 
 #[derive(Debug, Parser)]
@@ -201,6 +202,8 @@ pub struct RunArgs {
         default_missing_value = ""
     )]
     pub gdb_server: Option<String>,
+    #[command(flatten)]
+    pub output_args: OutputArgs,
     #[command(flatten)]
     pub common_args: CommonArgs,
 }
@@ -342,6 +345,8 @@ pub struct TestArgs {
         help = "Only run tests containing this string in their names"
     )]
     pub test_name: Option<String>,
+    #[command(flatten)]
+    pub output_args: OutputArgs,
     #[command(flatten)]
     pub common_args: CommonArgs,
 }
@@ -513,4 +518,27 @@ pub struct CommonArgs {
     pub encoding: Option<PayloadEncoding>,
     #[arg(long = "coverage", help = "Enable coverage", global = true)]
     pub coverage: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn build_run_and_test_accept_output_directory() {
+        for command in ["build", "run", "test"] {
+            for flag in ["--output", "-o"] {
+                let cli =
+                    Cli::try_parse_from(["cargo", "osdk", command, flag, "artifacts"]).unwrap();
+                let CargoSubcommand::Osdk(command) = cli.cargo_subcommand;
+                let output = match command {
+                    OsdkSubcommand::Build(args) => args.output_args.output,
+                    OsdkSubcommand::Run(args) => args.output_args.output,
+                    OsdkSubcommand::Test(args) => args.output_args.output,
+                    _ => unreachable!(),
+                };
+                assert_eq!(output, Some(PathBuf::from("artifacts")));
+            }
+        }
+    }
 }

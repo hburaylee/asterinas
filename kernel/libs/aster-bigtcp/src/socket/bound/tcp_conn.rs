@@ -52,6 +52,60 @@ pub struct RawTcpSocketExt<E: Ext> {
     is_recv_shut: bool,
     /// Indicates if the socket is closed by a RST packet.
     is_rst_closed: bool,
+    #[cfg(kernelet_nat_failure_diag_host)]
+    reset_diagnostic: TcpResetDiagnostic,
+}
+
+/// A bounded snapshot of TCP reset conditions and error consumption.
+#[cfg(kernelet_nat_failure_diag_host)]
+#[derive(Clone, Copy, Debug)]
+pub struct TcpResetDiagnostic {
+    records: [Option<TcpResetCondition>; 2],
+    overflow: bool,
+    consumed_by: Option<&'static str>,
+}
+
+#[cfg(kernelet_nat_failure_diag_host)]
+#[derive(Clone, Copy, Debug)]
+struct TcpResetCondition {
+    condition: &'static str,
+    source: &'static str,
+    native_key: ConnectionKey,
+    old_state: State,
+    state_before_abort: Option<State>,
+    new_state: State,
+    recv_shut: bool,
+    old_recv_queue: usize,
+    new_recv_queue: usize,
+    is_rst: bool,
+}
+
+#[cfg(kernelet_nat_failure_diag_host)]
+impl TcpResetDiagnostic {
+    const fn new() -> Self {
+        Self {
+            records: [None; 2],
+            overflow: false,
+            consumed_by: None,
+        }
+    }
+
+    fn record(&mut self, record: TcpResetCondition) {
+        // Retain the first consumption instead of mixing a later reset into its history.
+        if self.consumed_by.is_some() {
+            self.overflow = true;
+            return;
+        }
+        if let Some(slot) = self.records.iter_mut().find(|slot| slot.is_none()) {
+            *slot = Some(record);
+        } else {
+            self.overflow = true;
+        }
+    }
+
+    fn consume(&mut self, consumer: &'static str) {
+        self.consumed_by.get_or_insert(consumer);
+    }
 }
 
 impl<E: Ext> Deref for RawTcpSocketExt<E> {
@@ -125,6 +179,7 @@ impl<E: Ext> RawTcpSocketExt<E> {
         old_state: State,
         old_recv_queue: usize,
         is_rst: bool,
+        #[cfg(kernelet_nat_failure_diag_host)] source: &'static str,
     ) -> (SocketEvents, TcpConnBecameDead) {
         let became_dead = if self.state() != State::Established {
             // After the connection is closed by the user, no new data can be read, and such unread
@@ -139,8 +194,26 @@ impl<E: Ext> RawTcpSocketExt<E> {
                 // Strictly speaking, the socket isn't closed by an incoming RST packet in this
                 // situation. Instead, we reset the connection and _send_ an outgoing RST packet.
                 // However, Linux reports `ECONNRESET`, so we have to follow Linux.
+                #[cfg(kernelet_nat_failure_diag_host)]
+                let state_before_abort = self.state();
                 self.is_rst_closed = true;
                 self.abort();
+                #[cfg(kernelet_nat_failure_diag_host)]
+                {
+                    let record = TcpResetCondition {
+                        condition: "local_recv_shutdown_data",
+                        source,
+                        native_key: this.inner.connection_key,
+                        old_state,
+                        state_before_abort: Some(state_before_abort),
+                        new_state: self.state(),
+                        recv_shut: self.is_recv_shut,
+                        old_recv_queue,
+                        new_recv_queue: self.recv_queue(),
+                        is_rst,
+                    };
+                    self.reset_diagnostic.record(record);
+                }
             }
             self.check_dead(this)
         } else {
@@ -150,6 +223,22 @@ impl<E: Ext> RawTcpSocketExt<E> {
         let events = if self.state() != old_state {
             if self.state() == State::Closed && is_rst {
                 self.is_rst_closed = true;
+                #[cfg(kernelet_nat_failure_diag_host)]
+                {
+                    let record = TcpResetCondition {
+                        condition: "closed_transition_with_processed_rst_repr",
+                        source,
+                        native_key: this.inner.connection_key,
+                        old_state,
+                        state_before_abort: None,
+                        new_state: self.state(),
+                        recv_shut: self.is_recv_shut,
+                        old_recv_queue,
+                        new_recv_queue: self.recv_queue(),
+                        is_rst,
+                    };
+                    self.reset_diagnostic.record(record);
+                }
             }
             self.on_new_state(this)
         } else {
@@ -239,6 +328,8 @@ impl<E: Ext> TcpConnectionInner<E> {
             has_connected: false,
             is_recv_shut: false,
             is_rst_closed: false,
+            #[cfg(kernelet_nat_failure_diag_host)]
+            reset_diagnostic: TcpResetDiagnostic::new(),
         };
 
         TcpConnectionInner {
@@ -391,6 +482,8 @@ impl<E: Ext> TcpConnection<E> {
         let mut socket = self.0.inner.lock();
 
         if socket.is_rst_closed {
+            #[cfg(kernelet_nat_failure_diag_host)]
+            socket.reset_diagnostic.consume("send");
             socket.is_rst_closed = false;
             return Err(IoError::Socket(SendError::ConnReset));
         }
@@ -510,6 +603,8 @@ impl<E: Ext> TcpConnection<E> {
 
             let copy_result = match recv_result {
                 Err(_) if socket.is_rst_closed && total_recv_bytes == 0 => {
+                    #[cfg(kernelet_nat_failure_diag_host)]
+                    socket.reset_diagnostic.consume("recv");
                     socket.is_rst_closed = false;
                     return Err(IoError::Socket(RecvError::ConnReset));
                 }
@@ -548,8 +643,22 @@ impl<E: Ext> TcpConnection<E> {
         let mut socket = self.0.inner.lock();
 
         let is_rst = socket.is_rst_closed;
+        #[cfg(kernelet_nat_failure_diag_host)]
+        if is_rst {
+            socket.reset_diagnostic.consume("socket_error");
+        }
         socket.is_rst_closed = false;
         is_rst
+    }
+
+    /// Copies the reset history without consuming the socket error or changing its state.
+    #[cfg(kernelet_nat_failure_diag_host)]
+    pub fn reset_diagnostic(&self) -> TcpResetDiagnostic {
+        let diagnostic = {
+            let socket = self.0.inner.lock();
+            socket.reset_diagnostic
+        };
+        diagnostic
     }
 
     /// Shuts down the sending half of the connection.
@@ -739,8 +848,14 @@ impl<E: Ext> TcpConnectionBg<E> {
             Some((ip_repr, tcp_repr)) => TcpProcessResult::ProcessedWithReply(ip_repr, tcp_repr),
         };
 
-        let (state_events, became_dead) =
-            socket.check_state(self, old_state, old_recv_queue, is_rst);
+        let (state_events, became_dead) = socket.check_state(
+            self,
+            old_state,
+            old_recv_queue,
+            is_rst,
+            #[cfg(kernelet_nat_failure_diag_host)]
+            "process",
+        );
         events |= state_events;
 
         self.notify_events(events);
@@ -792,8 +907,14 @@ impl<E: Ext> TcpConnectionBg<E> {
             );
         }
 
-        let (state_events, became_dead) =
-            socket.check_state(self, old_state, old_recv_queue, is_rst);
+        let (state_events, became_dead) = socket.check_state(
+            self,
+            old_state,
+            old_recv_queue,
+            is_rst,
+            #[cfg(kernelet_nat_failure_diag_host)]
+            "dispatch",
+        );
         events |= state_events;
 
         self.notify_events(events);

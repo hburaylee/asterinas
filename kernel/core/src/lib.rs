@@ -45,7 +45,7 @@ pub mod context;
 mod cpu;
 pub mod device;
 mod driver;
-#[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+#[cfg(feature = "kernelet-host")]
 mod endovisor;
 pub mod error;
 pub mod events;

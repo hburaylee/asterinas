@@ -9,7 +9,7 @@ use std::{
     os::{
         fd::AsRawFd,
         unix::{
-            fs::{DirBuilderExt, OpenOptionsExt},
+            fs::{DirBuilderExt, FileTypeExt, OpenOptionsExt},
             net::UnixStream,
         },
     },
@@ -77,6 +77,101 @@ enum HolderPlacement {
 
 /// Bounded wait for the freshly spawned holder to acknowledge ownership.
 const HOLDER_HANDOFF_TIMEOUT_SECS: u64 = 10;
+
+const LOG_LEVEL_ANNOTATION: &str = "org.asterinas.kernelet.log-level";
+const IMAGE_CMDLINE: &str = "root=/dev/vda rootfstype=ext2 ro init=/sbin/kernelet-agent";
+
+/// Carries one validated early-parser value through the existing boot command line.
+fn image_cmdline(config: &Config) -> Result<String> {
+    let Some(value) = config.annotations.get(LOG_LEVEL_ANNOTATION) else {
+        return Ok(IMAGE_CMDLINE.to_owned());
+    };
+    // The kernel's early parser interprets the level. Restrict this unquoted
+    // value to its accepted single tokens so it cannot add boot parameters.
+    ensure!(
+        matches!(
+            value.as_str(),
+            "0" | "1"
+                | "2"
+                | "3"
+                | "4"
+                | "5"
+                | "6"
+                | "7"
+                | "8"
+                | "off"
+                | "emerg"
+                | "alert"
+                | "crit"
+                | "error"
+                | "err"
+                | "warning"
+                | "warn"
+                | "notice"
+                | "info"
+                | "debug"
+        ),
+        "{LOG_LEVEL_ANNOTATION} must be a loglevel from 0 to 8 or a lowercase level name"
+    );
+    Ok(format!("{IMAGE_CMDLINE} loglevel={value}"))
+}
+
+const RQ1_IO_ANNOTATION: &str = "org.asterinas.kernelet.rq1-io";
+const RQ1_RAM_BYTES: u64 = 4 * 1024 * 1024;
+const RQ1_RAM_MAGIC: &[u8] = b"KerneletRQ1RAMv1";
+
+/// Selects the opt-in diagnostic device. One rootfs guarantees that the
+/// additional backing is vdb, as required by the in-kernel probe.
+fn rq1_io_requested(config: &Config, root_images: usize) -> Result<bool> {
+    let Some(value) = config.annotations.get(RQ1_IO_ANNOTATION) else {
+        return Ok(false);
+    };
+    ensure!(value == "ram", "{RQ1_IO_ANNOTATION} only accepts 'ram'");
+    ensure!(
+        root_images == 1,
+        "RQ1 RAM I/O requires exactly one rootfs image so the fixture is vdb"
+    );
+    Ok(true)
+}
+
+fn validate_rq1_ram(backing: &mut (impl Read + Seek)) -> Result<()> {
+    ensure!(
+        backing.seek(SeekFrom::End(0))? == RQ1_RAM_BYTES,
+        "RQ1 RAM fixture must be exactly 4 MiB"
+    );
+    backing.seek(SeekFrom::Start(0))?;
+    let mut magic = [0u8; RQ1_RAM_MAGIC.len()];
+    backing
+        .read_exact(&mut magic)
+        .context("read RQ1 RAM fixture magic")?;
+    ensure!(magic == RQ1_RAM_MAGIC, "RQ1 RAM fixture magic differs");
+    backing.seek(SeekFrom::Start(0))?;
+    Ok(())
+}
+
+/// Only the Host diagnostic device is accepted, never an annotation-supplied
+/// pathname. Normal kernels do not register this device.
+fn open_rq1_ram() -> Result<File> {
+    let mut backing = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/dev/rq1ram")
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                std::io::Error::from_raw_os_error(libc::ENODEV)
+            } else {
+                error
+            }
+        })
+        .context("open diagnostic Host /dev/rq1ram")?;
+    ensure!(
+        backing.metadata()?.file_type().is_block_device(),
+        "RQ1 RAM fixture must be a block device"
+    );
+    validate_rq1_ram(&mut backing)?;
+    Ok(backing)
+}
 
 pub(crate) fn create_for_shim(root: &Path, id: &str, bundle: &Path) -> Result<()> {
     validate_id(id)?;
@@ -196,7 +291,7 @@ fn stage_state(
 
 /// The durable `config.json` record: the OCI state plus the resolved config.
 /// It is written once up front and rewritten when creation resolves more of
-/// the configuration (guest networking).
+/// the configuration (guest networking and the CREATE-assigned CID).
 struct RecordFile {
     record: Record,
     file: File,
@@ -214,6 +309,7 @@ impl RecordFile {
                 annotations: config.annotations.clone(),
             },
             config: config.clone(),
+            vsock_cid: None,
         };
         let mut file = OpenOptions::new()
             .write(true)
@@ -227,8 +323,10 @@ impl RecordFile {
     }
 
     /// Rewrites the record in place with the further-resolved configuration.
-    fn persist(&mut self, config: &Config) -> Result<()> {
+    fn persist(&mut self, config: &Config, cid: u32) -> Result<()> {
+        super::vsock::Identity::new(&self.record.state.id, Some(cid))?;
         self.record.config = config.clone();
+        self.record.vsock_cid = Some(cid);
         self.file.set_len(0)?;
         self.file.seek(SeekFrom::Start(0))?;
         serde_json::to_writer(&mut self.file, &self.record)?;
@@ -273,17 +371,31 @@ impl BootedSandbox {
         console_socket: Option<&Path>,
     ) -> Result<Self> {
         let mut args = create_args(settings, config)?;
+        let rq1_ram = if rq1_io_requested(config, images.len())? {
+            Some(open_rq1_ram()?)
+        } else {
+            None
+        };
         // The content-addressed base image is immutable. The guest overlays it
         // with a writable upper layer before applying OCI's root.readonly flag.
-        let cmdline = "root=/dev/vda rootfstype=ext2 ro init=/sbin/kernelet-agent";
+        let cmdline = image_cmdline(config)?;
         let capability = SandboxCleanup {
-            sandbox: Sandbox::create(&mut args, cmdline).context("create kernelet sandbox")?,
+            sandbox: Sandbox::create(&mut args, &cmdline).context("create kernelet sandbox")?,
             armed: true,
         };
         let sandbox = &capability.sandbox;
         config.network = crate::network::configure(&config.annotations, args.out_cid)?;
-        record.persist(config)?;
-        for image in images {
+        record.persist(config, args.out_cid)?;
+        // The image's VirtIO MMIO driver pops transports in reverse attachment
+        // order. With exactly one root image, attaching RAM first keeps the
+        // root at /dev/vda and the diagnostic backing at /dev/vdb.
+        if let Some(backing) = rq1_ram {
+            sandbox
+                .attach(uapi::BLOCK, Some(&backing), 0)
+                .context("attach diagnostic RQ1 RAM backing as vdb")?;
+        }
+        // Reverse discovery must preserve root=vda and bind1=vdb, bind2=vdc.
+        for image in images.iter().rev() {
             let block = uapi::open_image(image)?;
             sandbox
                 .attach(uapi::BLOCK, Some(&block), uapi::BLOCK_READ_ONLY)
@@ -487,7 +599,10 @@ fn create_args(settings: &CreateSettings, config: &Config) -> Result<CreateArgs>
         }
         if let Some(shares) = cpu.get("shares").and_then(|value| value.as_u64()) {
             ensure!(shares > 0, "cpu shares must be positive");
-            args.nice = (10.0 - (shares as f64).log2()).round().clamp(-20.0, 19.0) as i8;
+            args.nice = (10.0 - (shares as f64).log2())
+                .round()
+                .clamp(kernelet_abi::MIN_NICE as f64, kernelet_abi::MAX_NICE as f64)
+                as i8;
         }
         if let Some(quota) = cpu
             .get("quota")
@@ -663,6 +778,14 @@ fn drain_boot_endpoint(source: &File, output: &mut File, tail: &mut Vec<u8>) -> 
     Ok(())
 }
 
+fn diagnostic_counter(value: u64) -> String {
+    if value == kernelet_abi::STATS_UNAVAILABLE {
+        "unavailable".to_owned()
+    } else {
+        value.to_string()
+    }
+}
+
 fn boot_diagnostics(sandbox: &Sandbox, output: &BootOutput<'_>) -> String {
     let status = match sandbox.status() {
         Ok(status) => {
@@ -688,9 +811,9 @@ fn boot_diagnostics(sandbox: &Sandbox, output: &BootOutput<'_>) -> String {
             stats.oopses,
             stats.cpu_time_ns,
             stats.throttled_ns,
-            stats.service_calls,
-            stats.mmio_accesses,
-            stats.irqs_raised,
+            diagnostic_counter(stats.service_calls),
+            diagnostic_counter(stats.mmio_accesses),
+            diagnostic_counter(stats.irqs_raised),
             stats.host_overhead_bytes,
             stats.log_records_dropped
         ),
@@ -711,6 +834,112 @@ mod tests {
 
     use super::*;
 
+    fn log_level_config(value: Option<&str>) -> Config {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "ociVersion": "1.0.2",
+            "root": { "path": "rootfs" },
+            "process": { "args": ["/bin/sh"], "cwd": "/" },
+        }))
+        .unwrap();
+        if let Some(value) = value {
+            config
+                .annotations
+                .insert(LOG_LEVEL_ANNOTATION.into(), value.into());
+        }
+        config
+    }
+
+    #[test]
+    fn image_cmdline_preserves_unspecified_image_log_level() {
+        assert_eq!(
+            image_cmdline(&log_level_config(None)).unwrap(),
+            "root=/dev/vda rootfstype=ext2 ro init=/sbin/kernelet-agent"
+        );
+    }
+
+    #[test]
+    fn image_cmdline_passes_one_valid_log_level_token() {
+        for value in [
+            "0", "1", "2", "3", "4", "5", "6", "7", "8", "off", "emerg", "alert", "crit", "error",
+            "err", "warning", "warn", "notice", "info", "debug",
+        ] {
+            assert_eq!(
+                image_cmdline(&log_level_config(Some(value))).unwrap(),
+                format!(
+                    "root=/dev/vda rootfstype=ext2 ro init=/sbin/kernelet-agent loglevel={value}"
+                )
+            );
+        }
+    }
+
+    #[test]
+    fn image_cmdline_rejects_invalid_or_injected_log_levels() {
+        for value in [
+            "",
+            "9",
+            "99",
+            "-1",
+            "Trace",
+            "trace",
+            "Error",
+            "error ",
+            " error",
+            "error init=/bin/sh",
+            "error\ninit=/bin/sh",
+            "error\0",
+            "\"error\"",
+            "error --",
+            "error;reboot",
+        ] {
+            let error = image_cmdline(&log_level_config(Some(value))).unwrap_err();
+            assert!(
+                error.to_string().contains(LOG_LEVEL_ANNOTATION),
+                "{value:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn rq1_ram_attachment_requires_explicit_annotation_and_one_root_image() {
+        let mut config: Config = serde_json::from_value(serde_json::json!({
+            "ociVersion": "1.0.2",
+            "root": { "path": "rootfs" },
+            "process": { "args": ["/bin/sh"], "cwd": "/" },
+        }))
+        .unwrap();
+        assert!(!rq1_io_requested(&config, 1).unwrap());
+        config
+            .annotations
+            .insert(RQ1_IO_ANNOTATION.into(), "ram".into());
+        assert!(rq1_io_requested(&config, 1).unwrap());
+        for count in [0, 2] {
+            assert!(rq1_io_requested(&config, count).is_err());
+        }
+        for value in ["", "disk", "/dev/vda", "RAM"] {
+            config
+                .annotations
+                .insert(RQ1_IO_ANNOTATION.into(), value.into());
+            assert!(rq1_io_requested(&config, 1).is_err());
+        }
+    }
+
+    #[test]
+    fn rq1_ram_validation_checks_capacity_magic_and_resets_offset() {
+        let mut bytes = vec![0u8; RQ1_RAM_BYTES as usize];
+        bytes[..RQ1_RAM_MAGIC.len()].copy_from_slice(RQ1_RAM_MAGIC);
+        let mut backing = std::io::Cursor::new(bytes);
+        backing.set_position(123);
+        validate_rq1_ram(&mut backing).unwrap();
+        assert_eq!(backing.position(), 0);
+        backing.get_mut()[0] ^= 1;
+        assert!(validate_rq1_ram(&mut backing).is_err());
+        backing.get_mut()[0] ^= 1;
+        backing.get_mut().pop();
+        assert!(validate_rq1_ram(&mut backing).is_err());
+        backing.get_mut().extend_from_slice(&[0, 0]);
+        assert!(validate_rq1_ram(&mut backing).is_err());
+    }
+
     #[test]
     fn shim_create_defaults_match_the_parsed_cli() {
         let cli = Cli::parse_from(["kernelet-runtime", "create", "test", "--bundle", "/tmp"]);
@@ -720,7 +949,7 @@ mod tests {
     }
 
     #[test]
-    fn unspecified_memory_limit_uses_the_user_policy_ceiling() {
+    fn unspecified_memory_limit_leaves_headroom_for_host_execution() {
         let cli = Cli::parse_from(["kernelet-runtime", "create", "test", "--bundle", "/tmp"]);
         let settings = CreateSettings::from(&cli);
         let mut config: Config = serde_json::from_value(serde_json::json!({
@@ -739,7 +968,8 @@ mod tests {
             config.linux = linux;
             let args = create_args(&settings, &config).unwrap();
             assert_eq!(args.max_grains, super::super::DEFAULT_MAX_GRAINS);
-            assert_eq!(args.initial_grains, 128);
+            assert_eq!(args.max_grains, 256);
+            assert_eq!(args.initial_grains, 64);
             assert_eq!(args.max_meta_sections, super::super::DEFAULT_MAX_GRAINS);
         }
     }

@@ -7,6 +7,8 @@ use ostd::{
 };
 use spin::Once;
 
+#[cfg(feature = "kernelet")]
+use crate::thread::AsThread;
 use crate::{sched::SchedPolicy, thread::Thread};
 
 /// Represents CPU usage statistics for a system.
@@ -131,6 +133,12 @@ impl CpuTimeStatsManager {
 }
 
 fn update_cpu_statistics() {
+    // L1 samples are settled against their original stack owner. L2 has no
+    // POSIX Task charge and remains a per-vCPU system-time tick.
+    #[cfg(feature = "kernelet")]
+    if InterruptLevel::current() != InterruptLevel::L2 {
+        return;
+    }
     let manager = CpuTimeStatsManager::singleton();
 
     // No races because we are in IRQs.
@@ -157,6 +165,22 @@ fn update_cpu_statistics() {
     }
 }
 
+#[cfg(feature = "kernelet")]
+fn update_sampled_cpu_statistics(task: &ostd::task::Task, privilege: PrivilegeLevel, ticks: u64) {
+    let manager = CpuTimeStatsManager::singleton();
+    let cpu = CpuId::current_racy();
+    let idle = task
+        .as_thread()
+        .is_some_and(|thread| thread.sched_attr().policy() == SchedPolicy::Idle);
+    for _ in 0..ticks {
+        match privilege {
+            PrivilegeLevel::User => manager.inc_user_time(cpu),
+            PrivilegeLevel::Kernel if idle => manager.inc_idle_time(cpu),
+            PrivilegeLevel::Kernel => manager.inc_system_time(cpu),
+        }
+    }
+}
+
 fn is_idle() -> bool {
     if let Some(current_thread) = Thread::current() {
         current_thread.sched_attr().policy() == SchedPolicy::Idle
@@ -177,4 +201,6 @@ pub(crate) fn init() {
 
 pub(crate) fn init_on_each_cpu() {
     ostd::timer::register_callback_on_cpu(update_cpu_statistics);
+    #[cfg(feature = "kernelet")]
+    ostd::timer::register_sampled_task_callback_on_cpu(update_sampled_cpu_statistics);
 }

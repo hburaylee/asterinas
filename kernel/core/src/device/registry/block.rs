@@ -8,6 +8,8 @@ use aster_virtio::device::block::device::BlockDevice as VirtIoBlockDevice;
 use device_id::DeviceId;
 use ostd::mm::VmIo;
 
+#[cfg(feature = "kernelet-host")]
+use crate::fs::file::{FileLike, InodeHandle};
 use crate::{
     context::current_userspace,
     device::{Device, DeviceType},
@@ -137,6 +139,13 @@ impl Device for BlockFile {
 // `PerOpenFileOps` trait. It leads to redundant vtable dispatch and heap allocation. We should
 // devise a better strategy to eliminate the unnecessary intermediate `Box`.
 struct OpenBlockFile(Arc<dyn BlockDevice>);
+
+/// Obtains the block capability retained by an opened block-device file.
+#[cfg(feature = "kernelet-host")]
+pub(crate) fn block_device_from_file(file: &dyn FileLike) -> Option<Arc<dyn BlockDevice>> {
+    let file = file.downcast_ref::<InodeHandle>()?;
+    Some(file.downcast_open_file::<OpenBlockFile>().ok()??.0.clone())
+}
 
 impl FileOps for OpenBlockFile {
     fn read_at(

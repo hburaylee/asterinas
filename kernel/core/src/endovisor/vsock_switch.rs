@@ -23,13 +23,22 @@ use endpoint::{HostEndpoint, HostEndpointFile};
 pub(super) use packet::Packet;
 
 const HOST_CID: u32 = 2;
+
+#[cfg(kernelet_host_connect_gate)]
+pub(super) struct DiagConnectIdentity {
+    cid: u32,
+    host_port: u32,
+    device: Weak<VirtioVsock>,
+    endpoint: Weak<HostEndpoint>,
+}
 const WINDOW: usize = 64 * 1024;
 const MAX_PAYLOAD: usize = 4096 - Packet::HEADER_LEN;
 const MAX_CONNECTIONS_PER_CID: usize = 256;
 const CONNECTION_CHARGE: usize = size_of::<PeerConnection>() + 128;
 const NOTICE_CHARGE: usize = size_of::<QueuedPacket>() + 32;
 const NOTICE_QUEUE_CHARGE: usize = size_of::<QueuedPacket>() * MAX_CONNECTIONS_PER_CID;
-const RETIRE_QUEUE_CHARGE: usize = size_of::<Arc<PeerRef>>() * MAX_CONNECTIONS_PER_CID;
+const RETIRE_QUEUE_CHARGE: usize =
+    size_of::<Arc<PeerRef>>() * MAX_CONNECTIONS_PER_CID + size_of::<HostCleanup>() + 32;
 const PEER_REF_CHARGE: usize = size_of::<PeerRef>() + 32;
 
 struct SwitchState {
@@ -42,16 +51,19 @@ struct SwitchState {
     allowed_pairs: BTreeSet<(u32, u32)>,
     /// Guest-to-guest connections, keyed in the direction of the request.
     peers: BTreeMap<(u32, u32, u32, u32), PeerConnection>,
+    /// Assigned at publication so a split-lock revoke cannot retire later peers.
+    next_peer_generation: u64,
 }
 
 impl SwitchState {
     fn enqueue_notice(
         &mut self,
         packet: Packet,
-        charge: Arc<PacketCharge>,
+        charge: PacketCharge,
     ) -> core::result::Result<(), QueuedPacket> {
         let queued = QueuedPacket {
             packet,
+            payload_offset: 0,
             charge,
             switch_ref: None,
         };
@@ -100,12 +112,13 @@ impl SwitchState {
 }
 
 struct PeerConnection {
+    generation: u64,
     a_owner: Arc<Kernelet>,
     b_owner: Arc<Kernelet>,
     _a_reservation: EndpointReservation,
     _b_reservation: EndpointReservation,
-    a_notice: Option<Arc<PacketCharge>>,
-    b_notice: Option<Arc<PacketCharge>>,
+    a_notice: Option<PacketCharge>,
+    b_notice: Option<PacketCharge>,
     reference: Arc<PeerRef>,
     established: bool,
     a_alloc: u32,
@@ -198,22 +211,81 @@ impl Drop for SwitchRef {
     }
 }
 
+/// Counts Host-owned channel resources after switch admission closes.
+/// The counter and wait queue retain no Kernelet or device reference.
+struct HostCleanup {
+    active: AtomicUsize,
+    drained: Arc<WaitQueue>,
+}
+
+impl HostCleanup {
+    fn acquire(self: &Arc<Self>) -> Option<HostCleanupLease> {
+        self.active
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_add(1)
+            })
+            .ok()?;
+        Some(HostCleanupLease(self.clone()))
+    }
+}
+
+/// Releases the destruction gate after its owned resources have been freed.
+struct HostCleanupLease(Arc<HostCleanup>);
+
+impl HostCleanupLease {
+    fn try_clone(&self) -> Option<Self> {
+        self.0.acquire()
+    }
+}
+
+impl Drop for HostCleanupLease {
+    fn drop(&mut self) {
+        let previous = self
+            .0
+            .active
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |active| {
+                active.checked_sub(1)
+            })
+            .expect("vsock Host cleanup lease released twice");
+        if previous == 1 {
+            #[cfg(ktest)]
+            endpoint::tests::after_cleanup_zero(&self.0);
+            self.0.drained.wake_all();
+        }
+    }
+}
+
+/// Keeps activation's owner and admission alive until the last lease drop.
+struct HostEndpointAccount {
+    device: Weak<VirtioVsock>,
+    owner: Arc<Kernelet>,
+    admission: Arc<Admission>,
+    cleanup: HostCleanupLease,
+}
+
 struct RetireQueue {
     owner: Arc<Kernelet>,
     _reservation: EndpointReservation,
     pending: VecDeque<Arc<PeerRef>>,
     drained: Arc<WaitQueue>,
+    host_cleanup: Arc<HostCleanup>,
 }
 
 impl RetireQueue {
     fn new(owner: Arc<Kernelet>, admission: Arc<Admission>) -> Option<Self> {
         let reservation = admission.reserve_endpoint_bytes(RETIRE_QUEUE_CHARGE).ok()?;
         owner.charge_host_bytes(RETIRE_QUEUE_CHARGE).ok()?;
+        let drained = Arc::new(WaitQueue::new());
+        let host_cleanup = Arc::new(HostCleanup {
+            active: AtomicUsize::new(0),
+            drained: drained.clone(),
+        });
         Some(Self {
             owner,
             _reservation: reservation,
             pending: VecDeque::with_capacity(MAX_CONNECTIONS_PER_CID),
-            drained: Arc::new(WaitQueue::new()),
+            drained,
+            host_cleanup,
         })
     }
 }
@@ -300,6 +372,56 @@ static SWITCH: Once<Arc<VsockSwitch>> = Once::new();
 static NEXT_HOST_PORT: AtomicU32 = AtomicU32::new(49152);
 
 impl VsockSwitch {
+    #[cfg(kernelet_host_connect_gate)]
+    pub(super) fn connect_gate_identity(
+        &self,
+        cid: u32,
+        host_port: u32,
+        device: &VirtioVsock,
+    ) -> Option<DiagConnectIdentity> {
+        let state = self.state.lock();
+        let identity = state.devices.get(&cid)?;
+        if !core::ptr::eq(identity.as_ptr(), device) {
+            return None;
+        }
+        Some(DiagConnectIdentity {
+            cid,
+            host_port,
+            device: identity.clone(),
+            endpoint: Arc::downgrade(state.listeners.get(&(cid, host_port))?),
+        })
+    }
+
+    #[cfg(kernelet_host_connect_gate)]
+    pub(super) fn poll_connect_gate_cancelled(
+        &self,
+        identity: &DiagConnectIdentity,
+        poller: Option<&mut crate::process::signal::PollHandle>,
+    ) -> crate::events::IoEvents {
+        use crate::events::IoEvents;
+        let endpoint = {
+            let state = self.state.lock();
+            if !state
+                .devices
+                .get(&identity.cid)
+                .is_some_and(|device| Weak::ptr_eq(device, &identity.device))
+            {
+                return IoEvents::ERR;
+            }
+            let Some(endpoint) = state.listeners.get(&(identity.cid, identity.host_port)) else {
+                return IoEvents::ERR;
+            };
+            if !core::ptr::eq(Arc::as_ptr(endpoint), identity.endpoint.as_ptr()) {
+                return IoEvents::ERR;
+            }
+            endpoint.clone()
+        };
+        let events = endpoint.gate_poll_cancelled(poller);
+        // No endpoint/account/device strong reference crosses the gate park.
+        drop(endpoint);
+        events
+    }
+
     pub(super) fn global() -> Arc<Self> {
         SWITCH
             .call_once(|| {
@@ -311,6 +433,7 @@ impl VsockSwitch {
                         listeners: BTreeMap::new(),
                         allowed_pairs: BTreeSet::new(),
                         peers: BTreeMap::new(),
+                        next_peer_generation: 0,
                     }),
                 })
             })
@@ -340,6 +463,20 @@ impl VsockSwitch {
         self.state.lock().notices.get_mut(&cid)?.pending.pop_front()
     }
 
+    /// Host control state is bounded by admitted endpoints and charged in their
+    /// fixed footprint. A control header needs no data-queue slot or allocation.
+    pub(super) fn take_host_control(
+        &self,
+        cid: u32,
+        credit_blocked: impl Fn(u32, u32) -> bool,
+    ) -> Option<Packet> {
+        let state = self.state.lock();
+        state
+            .listeners
+            .range((cid, 0)..=(cid, u32::MAX))
+            .find_map(|(_, endpoint)| endpoint.take_control(&credit_blocked))
+    }
+
     pub(super) fn retire_wait_queue(&self, cid: u32) -> Option<Arc<WaitQueue>> {
         self.state
             .lock()
@@ -356,6 +493,36 @@ impl VsockSwitch {
 
     fn device(&self, cid: u32) -> Option<Arc<VirtioVsock>> {
         self.state.lock().devices.get(&cid)?.upgrade()
+    }
+
+    fn host_endpoint_account(&self, cid: u32) -> Result<HostEndpointAccount> {
+        // Register the lease before any device/owner reference escapes.
+        // on_dying removes the device under this same switch lock.
+        let (identity, cleanup) = {
+            let state = self.state.lock();
+            let identity = state.devices.get(&cid).ok_or_else(|| {
+                Error::with_message(Errno::ENODEV, "kernelet vsock device unavailable")
+            })?;
+            let retired = state.retired.get(&cid).ok_or_else(|| {
+                Error::with_message(Errno::ENODEV, "kernelet vsock retire queue unavailable")
+            })?;
+            let cleanup = retired.host_cleanup.acquire().ok_or_else(|| {
+                Error::with_message(Errno::ENOSPC, "vsock Host cleanup count exhausted")
+            })?;
+            (identity.clone(), cleanup)
+        };
+        let device = identity.upgrade().ok_or_else(|| {
+            Error::with_message(Errno::ENODEV, "kernelet vsock device unavailable")
+        })?;
+        let account = HostEndpointAccount {
+            device: identity,
+            owner: device.account_owner(),
+            admission: device.account_admission(),
+            cleanup,
+        };
+        // The account retains the lease throughout this final device drop.
+        drop(device);
+        Ok(account)
     }
 
     pub(super) fn charge_account(
@@ -386,15 +553,20 @@ impl VsockSwitch {
             return Ok(());
         }
         state.allowed_pairs.remove(&pair);
+        let cutoff = state.next_peer_generation;
         drop(state);
+        #[cfg(ktest)]
+        endpoint::tests::after_peer_revoke_boundary(a);
         loop {
             let reset_pair = {
                 let mut state = self.state.lock();
                 let key = state
                     .peers
-                    .keys()
-                    .find(|(src, _, dst, _)| ordered_pair(*src, *dst) == pair)
-                    .copied();
+                    .iter()
+                    .find(|((src, _, dst, _), connection)| {
+                        ordered_pair(*src, *dst) == pair && connection.generation < cutoff
+                    })
+                    .map(|(key, _)| *key);
                 key.map(|(src, src_port, dst, dst_port)| {
                     let mut retired = state.peers.remove(&(src, src_port, dst, dst_port)).unwrap();
                     retired.reference.dead.store(true, Ordering::Release);
@@ -409,6 +581,7 @@ impl VsockSwitch {
                         buf_alloc: 0,
                         fwd_cnt: 0,
                         payload: Vec::new(),
+                        payload_charge: None,
                     };
                     let reverse = forward.reply(Packet::RST, 0, 0);
                     let failed_forward = state
@@ -474,6 +647,7 @@ impl VsockSwitch {
             return_errno_with_message!(Errno::ENOSPC, "vsock connection limit reached");
         }
         state.listeners.insert((cid, port), endpoint.clone());
+        drop(state);
         Ok(Arc::new(HostEndpointFile::new(endpoint)))
     }
 
@@ -481,23 +655,27 @@ impl VsockSwitch {
         if cid < 3 || port == 0 {
             return_errno_with_message!(Errno::EINVAL, "invalid vsock destination");
         }
-        let device = self.device(cid).ok_or_else(|| {
-            Error::with_message(Errno::ENODEV, "kernelet vsock device unavailable")
-        })?;
+        let account = self.host_endpoint_account(cid)?;
+        let device = account.device.clone();
         let host_port = NEXT_HOST_PORT
             .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                 (next < u32::MAX).then_some(next + 1)
             })
             .map_err(|_| Error::with_message(Errno::ENOSPC, "Host vsock port space exhausted"))?;
-        let endpoint = HostEndpoint::new_connect(
-            cid,
-            host_port,
-            port,
-            Arc::downgrade(self),
-            device.account_admission(),
-        )?;
+        let endpoint =
+            HostEndpoint::new_connect(cid, host_port, port, Arc::downgrade(self), account)?;
         {
             let mut state = self.state.lock();
+            // Activation may race on_dying while outside the switch lock.
+            // A late connect must not restore a listener after admission closes.
+            if !state
+                .devices
+                .get(&cid)
+                .is_some_and(|current| Weak::ptr_eq(current, &device))
+                || !state.retired.contains_key(&cid)
+            {
+                return_errno_with_message!(Errno::ENODEV, "kernelet vsock device unavailable");
+            }
             state.prune_retired(cid);
             if state.listeners.contains_key(&(cid, host_port)) {
                 return_errno_with_message!(Errno::EADDRINUSE, "Host vsock port already used");
@@ -537,17 +715,10 @@ impl VsockSwitch {
             buf_alloc: WINDOW as u32,
             fwd_cnt: 0,
             payload: Vec::new(),
+            payload_charge: None,
         };
-        if !self.deliver(request) {
-            return_errno_with_message!(Errno::EAGAIN, "kernelet vsock receive queue full");
-        }
-        let connected = file.wait_connected();
-        if let Err(error) = connected {
-            if error.error() == Errno::ETIME {
-                return_errno_with_message!(Errno::ETIMEDOUT, "vsock connection timed out");
-            }
-            return Err(error);
-        }
+        file.submit_request(request, &device)?;
+        file.wait_connected(&device)?;
         Ok(file)
     }
 
@@ -644,6 +815,7 @@ impl VsockSwitch {
                     return;
                 };
                 Some(PeerConnection {
+                    generation: 0,
                     a_owner,
                     b_owner,
                     _a_reservation: a_reservation,
@@ -698,9 +870,12 @@ impl VsockSwitch {
                         || state.peers.contains_key(&reverse)
                         || count_for(sender) >= MAX_CONNECTIONS_PER_CID
                         || count_for(packet.dst_cid) >= MAX_CONNECTIONS_PER_CID
+                        || state.next_peer_generation == u64::MAX
                     {
                         (false, None, None)
                     } else {
+                        prepared.as_mut().unwrap().generation = state.next_peer_generation;
+                        state.next_peer_generation += 1;
                         state.peers.insert(key, prepared.take().unwrap());
                         let reference = state.peers.get(&key).unwrap().reference.borrow();
                         (true, None, Some(reference))
@@ -738,28 +913,67 @@ impl VsockSwitch {
                 self.reset_sender(&packet);
                 return;
             }
-            let reset = (packet.op != Packet::RST).then(|| packet.reply(Packet::RST, 0, 0));
-            let op = packet.op;
-            if !device.enqueue_with_ref(packet, reference) {
-                if op == Packet::REQUEST {
-                    let retired = {
-                        let mut state = self.state.lock();
-                        let retired = state.peers.remove(&key);
-                        if let Some(connection) = &retired {
-                            connection.reference.dead.store(true, Ordering::Release);
-                            state.retire(connection);
-                        }
-                        retired
-                    };
-                    drop(retired);
-                }
-                if let Some(reset) = reset {
-                    let _ = self.deliver(reset);
+            if let Err((_error, reference)) = device.enqueue_with_ref(packet, reference) {
+                debug_assert!(reference.is_some());
+                if let Some(reference) = reference {
+                    self.reset_peer(key, &reference);
                 }
             }
         } else {
             self.reset_sender(&packet);
         }
+    }
+
+    /// Retires a connection whose accepted packet cannot be delivered.
+    fn reset_peer(&self, key: (u32, u32, u32, u32), expected: &SwitchRef) {
+        let reverse = (key.2, key.3, key.0, key.1);
+        let notifications = {
+            let mut state = self.state.lock();
+            let connection_key = if state.peers.contains_key(&key) {
+                key
+            } else {
+                reverse
+            };
+            if !state
+                .peers
+                .get(&connection_key)
+                .is_some_and(|connection| Arc::ptr_eq(&connection.reference, &expected.0))
+            {
+                // A reset and reconnect may reuse the tuple while delivery
+                // runs outside the switch lock. Only retire the failed lease.
+                return;
+            }
+            let mut retired = state.peers.remove(&connection_key).unwrap();
+            retired.reference.dead.store(true, Ordering::Release);
+            state.retire(&retired);
+            let (src, src_port, dst, dst_port) = connection_key;
+            let forward = Packet {
+                src_cid: src,
+                dst_cid: dst,
+                src_port,
+                dst_port,
+                op: Packet::RST,
+                flags: 0,
+                buf_alloc: 0,
+                fwd_cnt: 0,
+                payload: Vec::new(),
+                payload_charge: None,
+            };
+            let reverse = forward.reply(Packet::RST, 0, 0);
+            let failed_forward = state
+                .enqueue_notice(forward, retired.b_notice.take().unwrap())
+                .err();
+            let failed_reverse = state
+                .enqueue_notice(reverse, retired.a_notice.take().unwrap())
+                .err();
+            (src, dst, failed_forward, failed_reverse, retired)
+        };
+        let (src, dst, failed_forward, failed_reverse, retired) = notifications;
+        // Retiring exchanges a live slot for its pre-reserved notices.
+        debug_assert!(failed_forward.is_none() && failed_reverse.is_none());
+        drop((failed_forward, failed_reverse, retired));
+        self.wake_notice(src);
+        self.wake_notice(dst);
     }
 
     fn route_host(&self, packet: Packet) {
@@ -833,6 +1047,21 @@ impl VsockSwitch {
             .is_some_and(|device| device.enqueue(packet))
     }
 
+    fn deliver_host(&self, packet: Packet) -> bool {
+        let Ok(account) = self.host_endpoint_account(packet.dst_cid) else {
+            return false;
+        };
+        let Some(device) = account.device.upgrade() else {
+            return false;
+        };
+        let delivered = device.enqueue(packet);
+        // Native calls are not adopted device workers. Keep their temporary
+        // device/account references inside the same destruction gate.
+        drop(device);
+        drop(account);
+        delivered
+    }
+
     /// Rechecks a queued peer packet when a receiver is about to publish it.
     /// Host-originated packets and reset notices are independent of the
     /// sender's liveness; other peer data needs a live, permitted connection.
@@ -871,14 +1100,19 @@ impl VsockSwitch {
             })
     }
 
+    /// Rejects an unallocated Guest packet without trusting its source CID.
+    pub(super) fn reject_packet(&self, sender: u32, packet: &Packet) {
+        if packet.op != Packet::RST {
+            let mut reset = packet.reply(Packet::RST, 0, 0);
+            reset.dst_cid = sender;
+            let _ = self.deliver(reset);
+        }
+    }
+
     fn reset_sender(&self, packet: &Packet) {
         if packet.op != Packet::RST {
             let _ = self.deliver(packet.reply(Packet::RST, 0, 0));
         }
-    }
-
-    pub(super) fn remove_listener(&self, cid: u32, port: u32) {
-        self.state.lock().listeners.remove(&(cid, port));
     }
 
     fn remove_listener_if(&self, cid: u32, port: u32, endpoint: &Arc<HostEndpoint>) {
@@ -950,6 +1184,7 @@ impl VsockSwitch {
                         buf_alloc: 0,
                         fwd_cnt: 0,
                         payload: Vec::new(),
+                        payload_charge: None,
                     };
                     let failed_notice = state.enqueue_notice(notice, charge).err();
                     (dst_cid, failed_notice, retired)
@@ -981,6 +1216,11 @@ impl VsockSwitch {
         let retired = {
             let mut state = self.state.lock();
             if state.devices.contains_key(&cid)
+                || state.listeners.keys().any(|(owner, _)| *owner == cid)
+                || state
+                    .retired
+                    .get(&cid)
+                    .is_some_and(|queue| queue.host_cleanup.active.load(Ordering::Acquire) != 0)
                 || state
                     .peers
                     .keys()

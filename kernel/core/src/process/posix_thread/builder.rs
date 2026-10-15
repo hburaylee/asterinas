@@ -8,7 +8,7 @@ use ostd::{
     arch::cpu::context::{FpuContext, UserContext},
     cpu::CpuSet,
     sync::RwArc,
-    task::Task,
+    task::{Task, TaskOptions},
 };
 use spin::Once;
 
@@ -148,7 +148,8 @@ impl PosixThreadBuilder {
         self
     }
 
-    pub(crate) fn build(self) -> Arc<Task> {
+    pub(crate) fn build(self) -> Result<Arc<Task>> {
+        let stack = TaskOptions::prepare_stack()?;
         let Self {
             tid,
             user_ctx,
@@ -178,7 +179,7 @@ impl PosixThreadBuilder {
         let fs = fs
             .unwrap_or_else(|| Arc::new(ThreadFsInfo::new(ns_proxy.mnt_ns().new_path_resolver())));
 
-        Arc::new_cyclic(|weak_task| {
+        Ok(Arc::new_cyclic(|weak_task| {
             let posix_thread = {
                 let prof_clock = ProfClock::new();
                 let virtual_timer_manager = TimerManager::new(prof_clock.user_clock().clone());
@@ -228,7 +229,7 @@ impl PosixThreadBuilder {
                 ns_proxy,
             );
 
-            task::create_new_user_task(user_ctx, thread, thread_local)
-        })
+            task::create_new_user_task(user_ctx, thread, thread_local, stack)
+        }))
     }
 }

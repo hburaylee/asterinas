@@ -2,10 +2,15 @@
 
 use core::time::Duration;
 
-use aster_time::{read_monotonic_time, read_start_time};
+#[cfg(not(feature = "kernelet"))]
+use aster_time::read_start_time;
 use spin::Once;
-use time::{Date, Month, PrimitiveDateTime, Time};
+#[cfg(not(feature = "kernelet"))]
+use time::Month;
+use time::{Date, PrimitiveDateTime, Time};
 
+#[cfg(not(feature = "kernelet"))]
+use super::read_monotonic_time;
 use crate::prelude::*;
 
 /// This struct corresponds to `SystemTime` in Rust std.
@@ -16,7 +21,18 @@ pub(crate) static START_TIME: Once<SystemTime> = Once::new();
 pub(super) static START_TIME_AS_DURATION: Once<Duration> = Once::new();
 
 pub(super) fn init() {
+    #[cfg(not(feature = "kernelet"))]
     let start_time = convert_system_time(read_start_time()).unwrap();
+    #[cfg(feature = "kernelet")]
+    let start_time = {
+        let boot = ostd::kernelet::entry::boot_args();
+        // Both fields use nanoseconds; their difference gives the Unix time
+        // corresponding to the shared monotonic clock's origin.
+        let boot_realtime_ns = boot.realtime_base_ns.saturating_sub(boot.monotonic_base_ns);
+        SystemTime::UNIX_EPOCH
+            .checked_add(Duration::from_nanos(boot_realtime_ns))
+            .unwrap()
+    };
     START_TIME_AS_DURATION
         .call_once(|| start_time.duration_since(&SystemTime::UNIX_EPOCH).unwrap());
     START_TIME.call_once(|| start_time);
@@ -40,12 +56,22 @@ impl SystemTime {
 
     /// Returns the current system time
     pub(crate) fn now() -> Self {
-        // The get real time result should always be valid
-        START_TIME
-            .get()
-            .unwrap()
-            .checked_add(read_monotonic_time())
-            .unwrap()
+        #[cfg(feature = "kernelet")]
+        {
+            Self::UNIX_EPOCH
+                .checked_add(Duration::from_nanos(
+                    ostd::kernelet::entry::realtime_now_ns(),
+                ))
+                .unwrap()
+        }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            START_TIME
+                .get()
+                .unwrap()
+                .checked_add(read_monotonic_time())
+                .unwrap()
+        }
     }
 
     /// Add a duration to self. If the result does not exceed inner bounds return Some(t), else return None.
@@ -84,6 +110,7 @@ impl SystemTime {
 }
 
 /// convert ostd::time::Time to System time
+#[cfg(not(feature = "kernelet"))]
 fn convert_system_time(system_time: aster_time::SystemTime) -> Result<SystemTime> {
     let month = match Month::try_from(system_time.month) {
         Ok(month) => month,

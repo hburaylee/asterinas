@@ -147,7 +147,7 @@ where
         let Ok(slot) = get_slot(frame) else {
             return false;
         };
-        slot.in_list.load(Ordering::Relaxed) == self.lazy_get_id()
+        slot.list_id() == self.lazy_get_id()
     }
 
     /// Gets a cursor at the specified frame if the frame is in the list.
@@ -157,7 +157,7 @@ where
         let Ok(slot) = get_slot(frame) else {
             return None;
         };
-        let contains = slot.in_list.load(Ordering::Relaxed) == self.lazy_get_id();
+        let contains = slot.list_id() == self.lazy_get_id();
         if contains {
             Some(CursorMut {
                 list: self,
@@ -202,7 +202,10 @@ where
         // FIXME: Self-incrementing IDs may overflow, while `core::pin::Pin`
         // is not compatible with locks. Think about a better solution.
         static LIST_ID_ALLOCATOR: AtomicU64 = AtomicU64::new(1);
+        #[cfg(not(feature = "kernelet"))]
         const MAX_LIST_ID: u64 = i64::MAX as u64;
+        #[cfg(feature = "kernelet")]
+        const MAX_LIST_ID: u64 = crate::kernelet::dma::LIST_ID_MASK;
 
         if self.list_id == 0 {
             let id = LIST_ID_ALLOCATOR.fetch_add(1, Ordering::Relaxed);
@@ -318,7 +321,7 @@ where
         frame.meta_mut().next = None;
         frame.meta_mut().prev = None;
 
-        frame.slot().in_list.store(0, Ordering::Relaxed);
+        frame.slot().set_list_id(0);
 
         self.list.size -= 1;
 
@@ -334,7 +337,7 @@ where
         // own the frame so there can't be any unique pointers to it.
         debug_assert!(frame.meta_mut().next.is_none());
         debug_assert!(frame.meta_mut().prev.is_none());
-        debug_assert_eq!(frame.slot().in_list.load(Ordering::Relaxed), 0);
+        debug_assert_eq!(frame.slot().list_id(), 0);
 
         let frame_ptr = NonNull::from(frame.meta_mut());
 
@@ -377,10 +380,7 @@ where
             }
         }
 
-        frame
-            .slot()
-            .in_list
-            .store(self.list.lazy_get_id(), Ordering::Relaxed);
+        frame.slot().set_list_id(self.list.lazy_get_id());
 
         // Forget the frame to transfer the ownership to the list.
         let _ = frame.into_raw();

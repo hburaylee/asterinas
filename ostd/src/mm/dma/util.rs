@@ -104,6 +104,13 @@ pub(super) fn alloc_kva(
     nframes: usize,
     is_cache_coherent: bool,
 ) -> Result<(KVirtArea, Paddr), Error> {
+    // Host grants use the Writeback linear mapping. An image must not expose
+    // an Uncacheable alias of that same memory through its safe DMA APIs.
+    #[cfg(feature = "kernelet")]
+    if !is_cache_coherent {
+        return Err(Error::InvalidArgs);
+    }
+
     let segment = Segment::from_unsized(
         FrameAllocOptions::new()
             .zeroed(false)
@@ -155,7 +162,7 @@ pub(super) fn alloc_kva(
 ///
 /// The provided physical address range must be untyped DMA memory that
 /// outlives the following [`unprepare_dma()`] call.
-pub(super) unsafe fn prepare_dma(pa_range: &Range<Paddr>) -> Option<Daddr> {
+pub(super) unsafe fn prepare_dma(pa_range: &Range<Paddr>) -> Result<Option<Daddr>, Error> {
     // SAFETY: The safety condition is upheld by the caller.
     #[cfg(any(debug_assertions, all(target_arch = "x86_64", feature = "cvm_guest")))]
     unsafe {
@@ -163,7 +170,25 @@ pub(super) unsafe fn prepare_dma(pa_range: &Range<Paddr>) -> Option<Daddr> {
     }
 
     // SAFETY: The safety condition is upheld by the caller.
-    unsafe { dma_remap(pa_range) }
+    let daddr = unsafe { dma_remap(pa_range) };
+    #[cfg(feature = "kernelet")]
+    {
+        // Publish only after existing DMA bookkeeping has completed. A panic
+        // there must not leave Host authorization on an unconstructed object.
+        // SAFETY: The constructor retains its complete untyped storage through
+        // registration and through rollback on every returned failure.
+        if let Err(error) = unsafe { crate::kernelet::dma::register(pa_range) } {
+            unmap_dma_remap(daddr.map(|start| start..start + pa_range.len()));
+            #[cfg(any(debug_assertions, all(target_arch = "x86_64", feature = "cvm_guest")))]
+            // SAFETY: This range was prepared above and registration already
+            // retired every partially acquired owner before returning failure.
+            unsafe {
+                dealloc_protect_physical_range(pa_range);
+            }
+            return Err(error);
+        }
+    }
+    Ok(daddr)
 }
 
 /// Unprepares a physical address range from DMA mapping.
@@ -173,6 +198,12 @@ pub(super) unsafe fn prepare_dma(pa_range: &Range<Paddr>) -> Option<Daddr> {
 /// The provided physical address range must be untyped DMA memory that was
 /// previously prepared by an [`alloc_unprotect_physical_range()`] call.
 pub(super) unsafe fn unprepare_dma(pa_range: &Range<Paddr>, daddr: Option<Daddr>) {
+    #[cfg(feature = "kernelet")]
+    {
+        // SAFETY: The DMA owner has not dropped its underlying storage yet.
+        // The packed retirement gate rejects new Host users and drains prior pins.
+        unsafe { crate::kernelet::dma::unregister(pa_range) };
+    }
     unmap_dma_remap(daddr.map(|daddr| daddr..daddr + pa_range.len()));
 
     // SAFETY: The safety condition is upheld by the caller.

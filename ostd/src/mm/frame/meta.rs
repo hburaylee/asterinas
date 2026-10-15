@@ -98,11 +98,15 @@ pub const FRAME_METADATA_MAX_SIZE: usize = META_SLOT_SIZE
 /// The maximum alignment in bytes of the metadata of a frame.
 pub const FRAME_METADATA_MAX_ALIGN: usize = META_SLOT_SIZE;
 
-const META_SLOT_SIZE: usize = 64;
+pub(crate) const META_SLOT_SIZE: usize = 64;
 
 /// Byte offset of the reference count in the Host-created metadata pages.
-#[cfg(not(feature = "kernelet"))]
+#[cfg(feature = "kernelet-host")]
 pub(crate) const META_REF_COUNT_OFFSET: usize = core::mem::offset_of!(MetaSlot, ref_count);
+
+/// Packed image DMA/list state, addressed through Host-owned metadata pages.
+#[cfg(feature = "kernelet-host")]
+pub(crate) const META_IO_STATE_OFFSET: usize = core::mem::offset_of!(MetaSlot, in_list);
 
 #[repr(C)]
 pub(in crate::mm) struct MetaSlot {
@@ -140,9 +144,10 @@ pub(in crate::mm) struct MetaSlot {
     pub(super) ref_count: AtomicU64,
     /// The virtual table that indicates the type of the metadata.
     pub(super) vtable_ptr: UnsafeCell<MaybeUninit<FrameMetaVtablePtr>>,
-    /// This is only accessed by [`crate::mm::frame::linked_list`].
-    /// It stores 0 if the frame is not in any list, otherwise it stores the
-    /// ID of the list.
+    /// Native kernels use this word for the frame linked-list ID. Images
+    /// retain the low 31 bits for that ID and use the remaining bits for
+    /// OSTD-owned DMA visibility and Host access pins. All updates preserve
+    /// the other fields; frame metadata remains 64 bytes.
     ///
     /// It is ugly but allows us to tell if a frame is in a specific list by
     /// one relaxed read. Otherwise, if we store it conditionally in `storage`
@@ -252,7 +257,35 @@ pub(super) fn get_slot(paddr: Paddr) -> Result<&'static MetaSlot, GetFrameError>
     Ok(unsafe { &*ptr })
 }
 
+#[cfg(feature = "kernelet")]
+pub(crate) fn dma_state(paddr: Paddr) -> Result<&'static AtomicU64, GetFrameError> {
+    get_slot(paddr).map(|slot| &slot.in_list)
+}
+
 impl MetaSlot {
+    #[inline]
+    pub(super) fn list_id(&self) -> u64 {
+        let value = self.in_list.load(Ordering::Relaxed);
+        #[cfg(feature = "kernelet")]
+        let value = value & crate::kernelet::dma::LIST_ID_MASK;
+        value
+    }
+
+    pub(super) fn set_list_id(&self, id: u64) {
+        #[cfg(feature = "kernelet")]
+        {
+            let mask = crate::kernelet::dma::LIST_ID_MASK;
+            debug_assert_eq!(id & !mask, 0);
+            self.in_list
+                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    Some((old & !mask) | id)
+                })
+                .unwrap();
+        }
+        #[cfg(not(feature = "kernelet"))]
+        self.in_list.store(id, Ordering::Relaxed);
+    }
+
     /// Initializes the metadata slot of a frame assuming it is unused.
     ///
     /// If successful, the function returns a pointer to the metadata slot.

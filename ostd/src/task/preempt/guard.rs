@@ -23,7 +23,7 @@ unsafe impl InAtomicMode for DisabledPreemptGuard {}
 
 impl DisabledPreemptGuard {
     fn new() -> Self {
-        // Keep the native and shared counts consistent across virtual IRQ
+        // Keep the image-local and shared counts consistent across virtual IRQ
         // delivery, which may switch to another task on this vCPU.
         #[cfg(feature = "kernelet")]
         let _irq_guard = crate::irq::disable_local();
@@ -47,6 +47,8 @@ impl Drop for DisabledPreemptGuard {
         super::cpu_local::dec_guard_count();
         #[cfg(feature = "kernelet")]
         crate::kernelet::entry::leave_preempt_guard();
+        #[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+        super::check_preempt();
     }
 }
 

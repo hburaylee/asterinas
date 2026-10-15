@@ -13,7 +13,7 @@ use super::{
     },
     *,
 };
-use crate::{arch::mm::tlb_flush_addr_range, mm::HasSize};
+use crate::arch::mm::tlb_flush_addr_range;
 
 impl RegisteredImage {
     /// Creates a new instance of the kind: one contiguous mapping in the
@@ -25,11 +25,7 @@ impl RegisteredImage {
     /// addend, so identical instructions executed through different
     /// instances' mappings reach each instance's own data.
     ///
-    /// # Panics
-    ///
-    /// Panics if the kernel virtual area allocator runs out of virtual
-    /// space, which the current [`KVirtArea`] API reports by panic rather
-    /// than by result. Frame exhaustion is returned as [`Error::NoMemory`].
+    /// Frame or kernel virtual address exhaustion returns [`Error::NoMemory`].
     pub(crate) fn instantiate(
         &self,
         boot: &BootArgs,
@@ -92,45 +88,45 @@ impl RegisteredImage {
             .ok_or(Error::Overflow)?;
         let [after_text, after_rodata, after_data] = self.gap_pages;
 
-        // The shared text run opens the area with executable permissions.
-        // Every later run is appended as additional tracked base pages, each
-        // carrying its own permission so the image keeps its W^X layout.
-        let kvirt = KVirtArea::map_frames(
-            mapping_size,
-            0,
-            huge_page_frames(self.text_frames.iter().cloned()),
-            TEXT_PAGE_PROP,
-        )
-        .with_synchronous_reclaim();
-        let runs = [
+        // Both virtual and physical image runs are 2 MiB aligned, yielding
+        // huge PTEs with distinct text, read-only, and writable permissions.
+        // The area owns every mapped segment through its final shootdown.
+        let mut kvirt = KVirtArea::try_reserve_aligned(mapping_size, HUGE_PAGE_SIZE)?
+            .with_synchronous_reclaim();
+        let huge_runs = [
+            (self.text_frames.clone(), TEXT_PAGE_PROP),
             (
-                filler_frames(self.filler.as_ref(), after_text)?,
+                filler_segments(self.filler.as_ref(), after_text)?,
                 READONLY_PAGE_PROP,
             ),
+            (self.rodata_frames.clone(), READONLY_PAGE_PROP),
             (
-                huge_page_frames(self.rodata_frames.iter().cloned()).collect(),
+                filler_segments(self.filler.as_ref(), after_rodata)?,
                 READONLY_PAGE_PROP,
             ),
+            (data_segment.iter().cloned().collect(), DATA_PAGE_PROP),
             (
-                filler_frames(self.filler.as_ref(), after_rodata)?,
+                filler_segments(self.filler.as_ref(), after_data)?,
                 READONLY_PAGE_PROP,
             ),
-            (
-                huge_page_frames(data_segment.iter().cloned()).collect(),
-                DATA_PAGE_PROP,
-            ),
-            (
-                filler_frames(self.filler.as_ref(), after_data)?,
-                READONLY_PAGE_PROP,
-            ),
+        ];
+        let mut mapped = 0;
+        for (segments, prop) in huge_runs {
+            if segments.is_empty() {
+                continue;
+            }
+            let bytes = segments.len() * HUGE_PAGE_SIZE;
+            kvirt.map_additional_segments(mapped, segments.into_iter(), prop)?;
+            mapped += bytes;
+        }
+        let base_runs = [
             (cpu_local_frames.clone(), DATA_PAGE_PROP),
             (vec![boot_frame.clone()], READONLY_PAGE_PROP),
             (vcpu_frames.clone(), DATA_PAGE_PROP),
             (vec![clock_frame.clone()], READONLY_PAGE_PROP),
             (grant.shared_frames().collect(), READONLY_PAGE_PROP),
         ];
-        let mut mapped = self.text_frames.len() * HUGE_PAGE_SIZE;
-        for (frames, prop) in runs {
+        for (frames, prop) in base_runs {
             let count = frames.len();
             if count == 0 {
                 continue;
@@ -151,6 +147,9 @@ impl RegisteredImage {
         boot.meta_section_index = ((3 + record_pages + grant.run_pages()) * PAGE_SIZE) as u32;
         boot.meta_block_sections =
             ((3 + record_pages + grant.run_pages() + grant.index_pages()) * PAGE_SIZE) as u32;
+        boot.meta_grain_bitmap =
+            ((3 + record_pages + grant.run_pages() + grant.index_pages() + grant.reverse_pages())
+                * PAGE_SIZE) as u32;
         boot.cmdline_offset = size_of::<BootArgs>() as u32;
         boot.cmdline_len = cmdline.len() as u32;
         boot.devices_offset = devices_offset as u32;
@@ -191,6 +190,7 @@ impl RegisteredImage {
                 let segment = data_segment.as_ref().ok_or(Error::InvalidArgs)?;
                 let frame = segment
                     .slice(&(index * PAGE_SIZE..(index + 1) * PAGE_SIZE))
+                    .into_iter()
                     .next()
                     .ok_or(Error::InvalidArgs)?;
                 frame.write_bytes(in_frame, &value.to_le_bytes())?;
@@ -247,6 +247,24 @@ impl RegisteredImage {
             virq_entry: base
                 + usize::try_from(self.entry_table.virq_entry_offset)
                     .map_err(|_| Error::Overflow)?,
+            yield_entry: base
+                + usize::try_from(self.entry_table.yield_entry_offset)
+                    .map_err(|_| Error::Overflow)?,
+            exit_entry: base
+                + usize::try_from(self.entry_table.exit_entry_offset)
+                    .map_err(|_| Error::Overflow)?,
+            stub_range: (base
+                + usize::try_from(self.entry_table.stub_range_start_offset)
+                    .map_err(|_| Error::Overflow)?)
+                ..(base
+                    + usize::try_from(self.entry_table.stub_range_end_offset)
+                        .map_err(|_| Error::Overflow)?),
+            cpu_access_range: (base
+                + usize::try_from(self.entry_table.cpu_access_start_offset)
+                    .map_err(|_| Error::Overflow)?)
+                ..(base
+                    + usize::try_from(self.entry_table.cpu_access_end_offset)
+                        .map_err(|_| Error::Overflow)?),
             ex_table_start: base
                 + usize::try_from(self.entry_table.ex_table_start_offset)
                     .map_err(|_| Error::Overflow)?,
@@ -264,7 +282,8 @@ impl RegisteredImage {
         if self.data.is_none() {
             return Ok(None);
         }
-        let segment = FrameAllocOptions::new().alloc_segment(FRAMES_PER_HUGE_PAGE)?;
+        let segment =
+            FrameAllocOptions::new().alloc_segment_aligned(FRAMES_PER_HUGE_PAGE, HUGE_PAGE_SIZE)?;
         let mut buf = vec![0u8; PAGE_SIZE];
         for (index, template) in self.data_template.iter().enumerate() {
             let chunk_len = self.template_chunk_len(index);
@@ -272,6 +291,7 @@ impl RegisteredImage {
                 template.read_bytes(0, &mut buf[..chunk_len])?;
                 let frame = segment
                     .slice(&(index * PAGE_SIZE..(index + 1) * PAGE_SIZE))
+                    .into_iter()
                     .next()
                     .ok_or(Error::InvalidArgs)?;
                 frame.write_bytes(0, &buf[..chunk_len])?;
@@ -293,30 +313,24 @@ impl RegisteredImage {
     }
 }
 
-/// Flattens shared huge pages into consecutive tracked base frames.
-fn huge_page_frames(
-    pages: impl IntoIterator<Item = Segment<()>>,
-) -> impl Iterator<Item = Frame<()>> {
-    pages.into_iter().flatten()
-}
-
-/// Yields the shared read-only filler frames covering one 2 MiB-aligned gap.
+/// Yields the shared read-only filler segments covering one 2 MiB-aligned gap.
 ///
 /// Registration guarantees that a nonzero gap has a filler page to cover it;
 /// a missing filler for a nonzero gap is rejected instead of silently
 /// collapsing the layout slot.
-fn filler_frames(filler: Option<&Segment<()>>, pages: usize) -> Result<Vec<Frame<()>>> {
+fn filler_segments(filler: Option<&Segment<()>>, pages: usize) -> Result<Vec<Segment<()>>> {
     let Some(filler) = filler else {
         if pages == 0 {
             return Ok(Vec::new());
         }
         return Err(Error::InvalidArgs);
     };
-    let mut frames = Vec::with_capacity(pages * filler.size() / PAGE_SIZE);
-    for _ in 0..pages {
-        frames.extend(filler.clone());
-    }
-    Ok(frames)
+    let mut segments = Vec::new();
+    segments
+        .try_reserve_exact(pages)
+        .map_err(|_| Error::NoMemory)?;
+    segments.resize_with(pages, || filler.clone());
+    Ok(segments)
 }
 
 /// Serializes the fixed boot ABI into a page without creating an alias to its
@@ -349,10 +363,6 @@ fn write_boot_args(frame: &Frame<()>, boot: &BootArgs) -> Result<()> {
         &boot.cpu_slot_gs_offset.to_le_bytes(),
     )?;
     frame.write_bytes(
-        offset_of!(BootArgs, host_preempt_gs_offset),
-        &boot.host_preempt_gs_offset.to_le_bytes(),
-    )?;
-    frame.write_bytes(
         offset_of!(BootArgs, cpu_local_replica_bytes),
         &boot.cpu_local_replica_bytes.to_le_bytes(),
     )?;
@@ -381,6 +391,10 @@ fn write_boot_args(frame: &Frame<()>, boot: &BootArgs) -> Result<()> {
     frame.write_bytes(
         offset_of!(BootArgs, meta_block_sections),
         &boot.meta_block_sections.to_le_bytes(),
+    )?;
+    frame.write_bytes(
+        offset_of!(BootArgs, meta_grain_bitmap),
+        &boot.meta_grain_bitmap.to_le_bytes(),
     )?;
     frame.write_bytes(
         offset_of!(BootArgs, max_meta_sections),

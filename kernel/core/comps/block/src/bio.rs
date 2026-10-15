@@ -398,6 +398,40 @@ impl BioSegment {
         Self::alloc_inner(nblocks, 0, nblocks * BLOCK_SIZE, direction)
     }
 
+    /// Allocates a block-aligned segment, returning allocation failures.
+    pub fn try_alloc(nblocks: usize, direction: BioDirection) -> Result<Self, Error> {
+        let len = nblocks.checked_mul(BLOCK_SIZE).ok_or(Error::Overflow)?;
+        if len == 0 {
+            return Err(Error::InvalidArgs);
+        }
+        Self::try_alloc_inner(nblocks, 0, len, direction)
+    }
+
+    /// Returns a sector-aligned view that shares this segment's DMA memory.
+    #[cfg(feature = "kernelet-host")]
+    pub fn slice(&self, range: Range<usize>) -> Result<Self, Error> {
+        if range.start >= range.end
+            || range.end > self.nbytes()
+            || !is_sector_aligned(range.start)
+            || !is_sector_aligned(range.end)
+        {
+            return Err(Error::InvalidArgs);
+        }
+        if range == (0..self.nbytes()) {
+            return Ok(self.clone());
+        }
+        let offset = self.inner.storage.offset().start;
+        Ok(Self {
+            inner: Arc::new(BioSegmentInner {
+                storage: Slice::new(
+                    self.inner.storage.mem_obj().clone_shared(),
+                    offset + range.start..offset + range.end,
+                ),
+                direction: self.inner.direction,
+            }),
+        })
+    }
+
     /// The inner function that do the real segment allocation.
     ///
     /// Support two extended parameters:
@@ -415,6 +449,15 @@ impl BioSegment {
         len: usize,
         direction: BioDirection,
     ) -> Self {
+        Self::try_alloc_inner(nblocks, offset_within_first_block, len, direction).unwrap()
+    }
+
+    fn try_alloc_inner(
+        nblocks: usize,
+        offset_within_first_block: usize,
+        len: usize,
+        direction: BioDirection,
+    ) -> Result<Self, Error> {
         let offset = offset_within_first_block;
         assert!(
             is_sector_aligned(offset)
@@ -424,19 +467,24 @@ impl BioSegment {
         );
 
         // The target segment is whether from the pool or newly-allocated
-        let bio_segment_inner = target_pool(direction)
-            .and_then(|pool| pool.alloc(nblocks, offset, len))
-            .unwrap_or_else(|| {
-                let dma_stream = DmaStream::alloc_uninit(nblocks, false).unwrap();
-                BioSegmentInner {
-                    storage: Slice::new(DmaBuffer::Direct(dma_stream), offset..offset + len),
-                    direction,
+        let bio_segment_inner =
+            match target_pool(direction).and_then(|pool| pool.alloc(nblocks, offset, len)) {
+                Some(segment) => segment,
+                None => {
+                    let dma_stream = DmaStream::alloc_uninit(nblocks, false)?;
+                    BioSegmentInner {
+                        storage: Slice::new(
+                            share_buffer(DmaBuffer::Direct(dma_stream)),
+                            offset..offset + len,
+                        ),
+                        direction,
+                    }
                 }
-            });
+            };
 
-        Self {
+        Ok(Self {
             inner: Arc::new(bio_segment_inner),
-        }
+        })
     }
 
     /// Constructs a new `BioSegment` with a given `USegment` and the bio direction.
@@ -445,7 +493,7 @@ impl BioSegment {
         let dma_stream = DmaStream::map(segment, false).unwrap();
         Self {
             inner: Arc::new(BioSegmentInner {
-                storage: Slice::new(DmaBuffer::Direct(dma_stream), 0..len),
+                storage: Slice::new(share_buffer(DmaBuffer::Direct(dma_stream)), 0..len),
                 direction,
             }),
         }
@@ -551,7 +599,7 @@ impl BioSegmentPool {
         let arena = self.arena_pool.alloc(nblocks)?;
         Some(BioSegmentInner {
             storage: Slice::new(
-                DmaBuffer::Arena(arena),
+                share_buffer(DmaBuffer::Arena(arena)),
                 offset_within_first_block..offset_within_first_block + len,
             ),
             direction: self.direction,
@@ -583,4 +631,17 @@ fn target_pool(direction: BioDirection) -> Option<&'static Arc<BioSegmentPool>> 
 /// Checks if the given offset is aligned to sector.
 pub(crate) fn is_sector_aligned(offset: usize) -> bool {
     offset.is_multiple_of(SECTOR_SIZE)
+}
+
+// Native buffers retain the upstream ownership and layout. Host views share the
+// owning DMA buffer, including its arena slot, until the last view is dropped.
+fn share_buffer(buffer: DmaBuffer<FromAndToDevice>) -> DmaBuffer<FromAndToDevice> {
+    #[cfg(feature = "kernelet-host")]
+    {
+        DmaBuffer::Shared(Arc::new(buffer))
+    }
+    #[cfg(not(feature = "kernelet-host"))]
+    {
+        buffer
+    }
 }

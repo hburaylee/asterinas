@@ -20,7 +20,7 @@ __atomic_cmpxchg_fallible: # (ptr: *mut u32, old_val: u32, new_val: u32) -> u64
 .size __atomic_cmpxchg_fallible, .-__atomic_cmpxchg_fallible
 
 .pushsection .ex_table, "a", @progbits
-    .align 8
+    .balign 8
     .quad .cmpxchg - .
     .quad .cmpxchg_fault - .
 .popsection

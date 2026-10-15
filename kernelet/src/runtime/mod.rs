@@ -3,10 +3,14 @@
 //! OCI command lifecycle and its descriptor-owning holder process.
 
 mod create;
+mod crossing_capture;
 mod holder;
 mod hooks;
 mod rootfs;
+mod status;
 mod terminal;
+mod tlb_capture;
+mod vsock;
 
 use std::{
     fs::{self, File},
@@ -20,11 +24,14 @@ use anyhow::{Context, Result, bail, ensure};
 use clap::{Parser, Subcommand};
 pub(crate) use create::create_for_shim;
 use serde::{Deserialize, Serialize};
+use status::InstanceStatus;
+use vsock::PairAction;
 
 use crate::{config::Process, protocol};
 
-// The first-version Host admits up to 512 grains per user by default.
-const DEFAULT_MAX_GRAINS: u32 = 512;
+// Leave headroom for Host execution storage within the default per-user
+// admission budget of 512 grains, which includes both Guest and Host memory.
+const DEFAULT_MAX_GRAINS: u32 = 256;
 const DEFAULT_VCPUS: u16 = 2;
 const DEFAULT_ROOT: &str = "/run/kernelet";
 const DEFAULT_CACHE: &str = "/var/cache/kernelet";
@@ -73,6 +80,35 @@ enum Operation {
     Stats {
         id: String,
     },
+    /// Read the kernel instance state and exit reason without changing lifecycle.
+    InspectStatus {
+        id: String,
+    },
+    /// Control a Host-only RQ1 TLB capture in the sandbox FD owner.
+    Rq1Tlb {
+        id: String,
+        #[command(subcommand)]
+        action: TlbAction,
+    },
+    /// Capture one bounded crossing window in the sandbox FD owner.
+    Rq1Crossing {
+        id: String,
+        #[command(subcommand)]
+        action: CrossingAction,
+    },
+    /// Query the CID returned by sandbox creation.
+    VsockCid {
+        id: String,
+        #[arg(long)]
+        value: bool,
+    },
+    /// Explicitly authorize or revoke one pair of live sandboxes.
+    VsockPair {
+        id: String,
+        peer_id: String,
+        #[command(subcommand)]
+        action: PairAction,
+    },
     Kill {
         id: String,
         #[arg(default_value = "TERM")]
@@ -108,6 +144,26 @@ enum Operation {
     },
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Subcommand)]
+pub(crate) enum TlbAction {
+    /// Arm a new per-open capture; the instance must be running.
+    Arm,
+    /// Close admission and read a snapshot; EBUSY permits a later retry.
+    Finish,
+    /// Release the capture, including an unfinished capture.
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Subcommand)]
+pub(crate) enum CrossingAction {
+    /// Arm a window with a nonzero evidence nonce; the instance must be running.
+    Arm { nonce: u64 },
+    /// Close admission and read the snapshot; EBUSY permits a later retry.
+    Finish,
+    /// Release or cancel the holder's capture lease.
+    Close,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct State {
@@ -123,6 +179,8 @@ pub(crate) struct State {
 pub(crate) struct Record {
     pub(crate) state: State,
     pub(crate) config: crate::config::Config,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) vsock_cid: Option<u32>,
 }
 
 #[derive(Deserialize, Serialize)]
@@ -131,10 +189,20 @@ pub(crate) enum Control {
     Resize { id: u64, columns: u16, rows: u16 },
     State,
     Stats,
+    InspectStatus,
+    Rq1Tlb { action: TlbAction },
+    Rq1Crossing { action: CrossingAction },
+    VsockCid,
+    VsockCapability,
     Processes,
+    ExitStatus { id: u64 },
+    ForgetExited { id: u64 },
     Start { attach: bool },
     Exec { process: Process },
+    ReserveProcess,
+    Launch { id: u64, process: Option<Process> },
     Signal { id: u64, signal: i32 },
+    SignalAll { signal: i32 },
     Delete { force: bool },
 }
 
@@ -143,7 +211,14 @@ pub(crate) enum Reply {
     Ready,
     State(State),
     Stats(Stats),
+    InspectStatus(InstanceStatus),
+    Rq1TlbSnapshot(String),
+    Rq1CrossingSnapshot(String),
+    VsockIdentity(vsock::Identity),
     Processes(Vec<u32>),
+    ExitStatus { code: Option<i32> },
+    Reserved { id: u64 },
+    StartRejected(String),
     Started { id: u64 },
     Done,
     Error(String),
@@ -153,8 +228,8 @@ pub(crate) enum Reply {
 pub(crate) struct Stats {
     pub cpu_time_ns: u64,
     pub throttled_ns: u64,
-    pub completion_cpu_ns: u64,
-    pub ingress_copy_cpu_ns: u64,
+    pub completion_cpu_ns: Option<u64>,
+    pub ingress_copy_cpu_ns: Option<u64>,
     pub host_bytes_charged: u64,
     pub host_overhead_bytes: u64,
     pub stacks_allocated: u32,
@@ -171,6 +246,11 @@ pub fn run(cli: Cli) -> Result<i32> {
         | Operation::Start { id, .. }
         | Operation::State { id }
         | Operation::Stats { id }
+        | Operation::InspectStatus { id }
+        | Operation::Rq1Tlb { id, .. }
+        | Operation::Rq1Crossing { id, .. }
+        | Operation::VsockCid { id, .. }
+        | Operation::VsockPair { id, .. }
         | Operation::Kill { id, .. }
         | Operation::Delete { id, .. }
         | Operation::Resize { id, .. }
@@ -199,6 +279,43 @@ pub fn run(cli: Cli) -> Result<i32> {
         Operation::State { .. } => {
             let state = state(&directory)?;
             println!("{}", serde_json::to_string(&state)?);
+        }
+        Operation::InspectStatus { .. } => {
+            println!("{}", serde_json::to_string(&inspect_status(&directory)?)?);
+        }
+        Operation::VsockCid { value, .. } => {
+            let identity = vsock::query(&directory, id)?;
+            if *value {
+                println!("{}", identity.cid());
+            } else {
+                println!("{}", serde_json::to_string(&identity)?);
+            }
+        }
+        Operation::VsockPair {
+            peer_id, action, ..
+        } => {
+            let pair = vsock::set_pair(&cli.root, id, peer_id, *action)?;
+            println!("{}", serde_json::to_string(&pair)?);
+        }
+        Operation::Rq1Tlb { action, .. } => {
+            let (reply, _) = request(&directory, &Control::Rq1Tlb { action: *action })?;
+            match (action, reply) {
+                (TlbAction::Finish, Reply::Rq1TlbSnapshot(snapshot)) => {
+                    println!("{snapshot}");
+                }
+                (TlbAction::Arm | TlbAction::Close, Reply::Done) => {}
+                _ => bail!("invalid holder TLB capture response"),
+            }
+        }
+        Operation::Rq1Crossing { action, .. } => {
+            let (reply, _) = request(&directory, &Control::Rq1Crossing { action: *action })?;
+            match (action, reply) {
+                (CrossingAction::Finish, Reply::Rq1CrossingSnapshot(snapshot)) => {
+                    println!("{snapshot}")
+                }
+                (CrossingAction::Arm { .. } | CrossingAction::Close, Reply::Done) => {}
+                _ => bail!("invalid holder crossing capture response"),
+            }
         }
         Operation::Stats { .. } => {
             let (reply, _) = request(&directory, &Control::Stats)?;
@@ -230,7 +347,7 @@ pub fn run(cli: Cli) -> Result<i32> {
                     )?;
                     stdout.flush()?;
                 }
-                return terminal::forward(&directory, stream, id, terminal);
+                return forward_process(&directory, stream, id, terminal);
             }
         }
         Operation::Exec { process, .. } => {
@@ -241,7 +358,7 @@ pub fn run(cli: Cli) -> Result<i32> {
             let Reply::Started { id } = reply else {
                 bail!("invalid holder exec response");
             };
-            return terminal::forward(&directory, stream, id, terminal);
+            return forward_process(&directory, stream, id, terminal);
         }
         Operation::Resize { columns, rows, .. } => {
             request(
@@ -274,6 +391,14 @@ pub fn run(cli: Cli) -> Result<i32> {
     Ok(0)
 }
 
+fn forward_process(directory: &Path, stream: UnixStream, id: u64, terminal: bool) -> Result<i32> {
+    let code = terminal::forward(directory, stream, id, terminal)?;
+    // The consumer owns this status after forwarding returned the actual exit.
+    // An interrupted attachment keeps its status available for later observation.
+    request(directory, &Control::ForgetExited { id })?;
+    Ok(code)
+}
+
 /// A missing listener after successful creation means the capability owner died.
 fn holder_disconnected(error: &anyhow::Error) -> bool {
     error.downcast_ref::<std::io::Error>().is_some_and(|error| {
@@ -282,6 +407,16 @@ fn holder_disconnected(error: &anyhow::Error) -> bool {
             Some(libc::ENOENT | libc::ECONNREFUSED)
         )
     })
+}
+
+/// Query the retained sandbox capability; never substitute OCI or agent state.
+fn inspect_status(directory: &Path) -> Result<InstanceStatus> {
+    let (reply, _) = request(directory, &Control::InspectStatus)?;
+    let Reply::InspectStatus(status) = reply else {
+        bail!("invalid holder instance status response");
+    };
+    status.validate()?;
+    Ok(status)
 }
 
 pub(crate) fn state(directory: &Path) -> Result<State> {
@@ -319,6 +454,9 @@ pub(crate) fn delete(directory: &Path, force: bool) -> Result<()> {
 pub(crate) fn request(directory: &Path, operation: &Control) -> Result<(Reply, UnixStream)> {
     let mut stream = begin_request(directory, operation)?;
     let reply = receive_reply(&mut stream)?;
+    if let Reply::StartRejected(detail) = &reply {
+        bail!("{detail}");
+    }
     Ok((reply, stream))
 }
 
@@ -392,6 +530,149 @@ fn parse_signal(value: &str) -> Result<i32> {
 mod tests {
     use super::*;
 
+    struct StatusDirectory(PathBuf);
+
+    impl StatusDirectory {
+        fn new() -> Self {
+            let directory = std::env::temp_dir().join(format!(
+                "kernelet-inspect-status-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            fs::create_dir(&directory).unwrap();
+            Self(directory)
+        }
+    }
+
+    impl Drop for StatusDirectory {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // A real local IPC exchange verifies the holder protocol, not a kernel ioctl.
+    fn status_reply(reply: serde_json::Value) -> Result<InstanceStatus> {
+        let directory = StatusDirectory::new();
+        let listener =
+            std::os::unix::net::UnixListener::bind(directory.0.join("control.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            assert!(matches!(
+                protocol::receive_value::<Control>(&mut stream).unwrap(),
+                Control::InspectStatus
+            ));
+            protocol::send_value(&mut stream, &reply).unwrap();
+        });
+        let result = inspect_status(&directory.0);
+        server.join().unwrap();
+        result
+    }
+
+    fn status_json(state: &str, reason: &str) -> serde_json::Value {
+        serde_json::json!({"InspectStatus": {
+            "version": 1, "state": state, "reason": reason, "code": 0,
+            "uptime_ns": 12, "cpu_time_ns": 7,
+            "fault_addr": "0x0000000000000000", "fault_ip": "0x0000000000000000",
+            "message": "", "message_truncated": false
+        }})
+    }
+
+    #[test]
+    fn tlb_capture_commands_select_explicit_holder_actions() {
+        for (name, expected) in [("arm", "Arm"), ("finish", "Finish"), ("close", "Close")] {
+            let cli =
+                Cli::try_parse_from(["kernelet-runtime", "rq1-tlb", "subject", name]).unwrap();
+            let Operation::Rq1Tlb { id, action } = cli.command else {
+                panic!("wrong diagnostic command");
+            };
+            assert_eq!(id, "subject");
+            assert_eq!(serde_json::to_value(action).unwrap(), expected);
+        }
+        assert!(Cli::try_parse_from(["kernelet-runtime", "rq1-tlb", "subject"]).is_err());
+        assert!(
+            Cli::try_parse_from(["kernelet-runtime", "rq1-tlb", "subject", "unknown"]).is_err()
+        );
+    }
+
+    #[test]
+    fn inspect_status_reads_running_and_exited_diagnostics_without_agent_state() {
+        let cli = Cli::try_parse_from(["kernelet-runtime", "inspect-status", "subject"]).unwrap();
+        assert!(matches!(cli.command, Operation::InspectStatus { id } if id == "subject"));
+        for state in ["running", "exited"] {
+            let reply = status_reply(status_json(state, "none")).unwrap();
+            assert_eq!(serde_json::to_value(reply).unwrap()["state"], state);
+        }
+        let mut reply = status_json("exited", "panicked");
+        reply["InspectStatus"]["message"] = "panic: original message\n中文".into();
+        assert_eq!(
+            serde_json::to_value(status_reply(reply).unwrap()).unwrap()["message"],
+            "panic: original message\n中文"
+        );
+    }
+
+    #[test]
+    fn inspect_status_rejects_wrong_malformed_and_failed_holder_replies() {
+        assert!(
+            status_reply(serde_json::json!("Done"))
+                .unwrap_err()
+                .to_string()
+                .contains("invalid holder instance status")
+        );
+        let error =
+            status_reply(serde_json::json!({"Error":"STATUS ioctl denied: original diagnostic"}))
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "STATUS ioctl denied: original diagnostic"
+        );
+        for invalid in ["version", "state", "message", "extra"] {
+            let mut reply = status_json("running", "none");
+            reply["InspectStatus"][invalid] = match invalid {
+                "version" => 2.into(),
+                "state" => "unrecognized".into(),
+                "message" => 7.into(),
+                _ => true.into(),
+            };
+            assert!(status_reply(reply).is_err(), "accepted malformed {invalid}");
+        }
+        let directory = StatusDirectory::new();
+        let listener =
+            std::os::unix::net::UnixListener::bind(directory.0.join("control.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let _: Control = protocol::receive_value(&mut stream).unwrap();
+            // A truncated response is an IPC failure, never a synthetic exit.
+            stream.write_all(&10u32.to_le_bytes()).unwrap();
+            stream.write_all(b"{").unwrap();
+        });
+        assert!(inspect_status(&directory.0).is_err());
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn inspect_status_has_no_oci_fallback_after_holder_loss_or_delete() {
+        let directory = StatusDirectory::new();
+        fs::write(
+            directory.0.join("config.json"),
+            b"{\"state\":{\"status\":\"stopped\"}}",
+        )
+        .unwrap();
+        let error = inspect_status(&directory.0).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        fs::remove_dir_all(&directory.0).unwrap();
+        let error = inspect_status(&directory.0).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
     #[test]
     fn lost_holder_state_is_stopped_and_can_be_deleted() {
         let directory =
@@ -419,4 +700,51 @@ mod tests {
             &std::io::Error::from_raw_os_error(libc::EACCES).into()
         ));
     }
+    #[test]
+    fn crossing_commands_preserve_full_width_nonce_and_holder_action() {
+        for nonce in [1, u64::MAX] {
+            let nonce_text = nonce.to_string();
+            let cli = Cli::try_parse_from([
+                "kernelet-runtime",
+                "rq1-crossing",
+                "subject",
+                "arm",
+                &nonce_text,
+            ])
+            .unwrap();
+            let Operation::Rq1Crossing { id, action } = cli.command else {
+                panic!("wrong crossing command");
+            };
+            assert_eq!(id, "subject");
+            assert!(matches!(action, CrossingAction::Arm { nonce: actual } if actual == nonce));
+            let raw = serde_json::to_vec(&Control::Rq1Crossing { action }).unwrap();
+            let request: Control = serde_json::from_slice(&raw).unwrap();
+            assert!(
+                matches!(request, Control::Rq1Crossing { action: CrossingAction::Arm { nonce: actual } } if actual == nonce)
+            );
+        }
+        for (command, expected) in [("finish", "Finish"), ("close", "Close")] {
+            let cli = Cli::try_parse_from(["kernelet-runtime", "rq1-crossing", "subject", command])
+                .unwrap();
+            let Operation::Rq1Crossing { action, .. } = cli.command else {
+                panic!("wrong crossing command")
+            };
+            assert_eq!(serde_json::to_value(action).unwrap(), expected);
+        }
+    }
+}
+
+/// Linux signal zero probes existence; real signal numbers are 1 through 64.
+pub(crate) fn validate_signal(signal: i32) -> Result<()> {
+    ensure!((0..=64).contains(&signal), "invalid signal number {signal}");
+    Ok(())
+}
+
+/// A launch observation outlives its caller's RPC deadline. Only a confirmed
+/// rejection permits reuse; transport failure leaves the operation uncertain.
+pub(crate) fn request_launch(directory: &Path, operation: &Control) -> Result<(Reply, UnixStream)> {
+    let mut stream = begin_request(directory, operation)?;
+    stream.set_read_timeout(None)?;
+    let reply = receive_reply(&mut stream)?;
+    Ok((reply, stream))
 }

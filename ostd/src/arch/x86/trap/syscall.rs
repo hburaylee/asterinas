@@ -27,6 +27,8 @@ use x86_64::{
 };
 
 use super::{RawUserContext, gdt};
+#[cfg(kernelet_getpid_profile)]
+use crate::kernelet::getpid_profile as profile;
 use crate::{irq::DisabledLocalIrqGuard, mm::PagingConstsTrait};
 
 global_asm!(
@@ -95,11 +97,68 @@ impl RawUserContext {
     ///
     /// If `trap_num` is `0x100`, it will go user by `sysret` (`rcx` and `r11` are dropped),
     /// otherwise it will use `iret`.
+    // Keep the small native entry wrapper inside its hot caller; optional
+    // per-call profiling has a separate, larger body.
+    #[cfg_attr(not(kernelet_getpid_profile), inline(always))]
     pub(in crate::arch) fn run(&mut self, guard: DisabledLocalIrqGuard) {
+        #[cfg(kernelet_getpid_profile)]
+        let raw_span = if profile::enabled() {
+            profile::event(profile::event_id::RAW_RUN);
+            // These are the actual syscall.S tests. Trap number is not one
+            // of them; an IRQ-restored context may also qualify for SYSRET.
+            let rcx_matches = self.general.rcx == self.general.rip;
+            let r11_matches = self.general.r11 == self.rflags;
+            let flags_allow = self.general.r11 & 0x10100 == 0;
+            let shift = usize::BITS - crate::arch::mm::PagingConsts::ADDRESS_WIDTH as u32;
+            let canonical =
+                (((self.general.rip << shift) as isize) >> shift) as usize == self.general.rip;
+            if !rcx_matches {
+                profile::event(profile::event_id::SYSRET_RCX_MISMATCH);
+            }
+            if !r11_matches {
+                profile::event(profile::event_id::SYSRET_R11_MISMATCH);
+            }
+            if !flags_allow {
+                profile::event(profile::event_id::SYSRET_RF_TF);
+            }
+            if !canonical {
+                profile::event(profile::event_id::SYSRET_NONCANONICAL);
+            }
+            if rcx_matches && r11_matches && flags_allow && canonical {
+                profile::event(profile::event_id::SYSRET_ELIGIBLE);
+            }
+            profile::span(profile::stage::NATIVE_RAW_RUN)
+        } else {
+            None
+        };
         // Return to userspace with interrupts disabled. Otherwise, interrupts
         // after executing `swapgs` will mess up the CPU state.
         core::mem::forget(guard);
 
+        // SAFETY: The native entry assembly uses the common register layout.
+        // The interrupt guard keeps entry atomic, and the context stays live
+        // until the matching syscall/trap has saved the register file in it.
         unsafe { syscall_return(self) };
+        #[cfg(feature = "kernelet-host")]
+        {
+            self.fault_addr = if self.trap_num == 14 {
+                x86_64::registers::control::Cr2::read_raw() as usize
+            } else {
+                0
+            };
+        }
+        #[cfg(kernelet_getpid_profile)]
+        {
+            let _ = profile::end(raw_span);
+            if profile::enabled() {
+                profile::event(if self.trap_num == 0x100 {
+                    profile::event_id::RETURN_SYSCALL
+                } else if self.trap_num <= 31 {
+                    profile::event_id::RETURN_EXCEPTION
+                } else {
+                    profile::event_id::RETURN_IRQ
+                });
+            }
+        }
     }
 }

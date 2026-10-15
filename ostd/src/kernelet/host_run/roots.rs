@@ -6,14 +6,14 @@
 //! Registration validates a Guest-provided root against the Host-built boot
 //! page before that root may be activated on any CPU.
 
-use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use super::{RETURNING, current_carrier_state, resources::RootRegistration};
+#[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
+use crate::cpu::CpuId;
 use crate::{
-    cpu::{CpuId, CpuSet},
-    kernelet::abi::{BootArgs, INVALID, STATE},
-    mm::PAGE_SIZE,
+    kernelet::abi::{BootArgs, INVALID, KERNEL_HALF_START, STATE},
+    mm::{MAX_USERSPACE_VADDR, PAGE_SIZE, tlb::TlbFlushOp},
 };
 
 // SAFETY: Every entry below is reached only through a stack-switching service
@@ -28,24 +28,32 @@ extern "C" fn kernelet_host_pt_root_register_impl(root: u64) -> i64 {
     };
     state.enter_schedulable_service();
     crate::arch::irq::enable_local();
-    let result = if root == 0
-        || !root.is_multiple_of(PAGE_SIZE as u64)
-        || !state.guest_memory.contains(root, PAGE_SIZE)
-    {
+    let result = if root == 0 || !root.is_multiple_of(PAGE_SIZE as u64) {
         -INVALID
     } else {
         let boot = unsafe { &*(state.boot_args as *const BootArgs) };
-        let mut valid = true;
-        for (index, expected) in boot.kernel_half_entries.iter().enumerate() {
-            let mut bytes = [0u8; 8];
-            let addr = root + ((256 + index) * size_of::<u64>()) as u64;
-            if state.guest_memory.read(addr, &mut bytes).is_err()
-                || u64::from_le_bytes(bytes) != *expected
-            {
-                valid = false;
-                break;
-            }
+        // One scoped pin retains the complete root page through validation.
+        // Release it before allocating the registration or locking `roots`.
+        // SAFETY: Only the immutable kernel-half words of the trusted
+        // vOSTD page-table root are read; this does not authorize Host writes
+        // to typed page-table memory or expose this capability to kernel code.
+        let valid = unsafe {
+            state
+                .guest_memory
+                .with_raw_reader(root, PAGE_SIZE, |reader| {
+                    reader.skip(KERNEL_HALF_START * size_of::<u64>());
+                    for expected in &boot.kernel_half_entries {
+                        let Ok(actual) = reader.read_val::<u64>() else {
+                            return false;
+                        };
+                        if u64::from_le(actual) != *expected {
+                            return false;
+                        }
+                    }
+                    true
+                })
         }
+        .unwrap_or(false);
         let registration = valid.then(|| RootRegistration::new(root)).flatten();
         let mut roots = state.execution.roots.lock();
         match roots.binary_search_by_key(&root, |entry| entry.paddr) {
@@ -82,7 +90,7 @@ extern "C" fn kernelet_host_pt_root_unregister_impl(root: u64) -> i64 {
     let result = match roots.binary_search_by_key(&root, |entry| entry.paddr) {
         Err(_) => -INVALID,
         Ok(index)
-            if !roots[index].active.is_empty()
+            if roots[index].table.is_active()
                 || state
                     .control
                     .carriers
@@ -113,14 +121,19 @@ extern "C" fn kernelet_host_pt_activate_impl(root: u64) -> i64 {
     };
     state.install_host_root();
     let roots = state.execution.roots.lock();
-    let result = if root == 0
-        || roots
+    let table = if root == 0 {
+        Some(None)
+    } else {
+        roots
             .binary_search_by_key(&root, |entry| entry.paddr)
-            .is_ok()
-    {
+            .ok()
+            .map(|index| Some(roots[index].table.clone()))
+    };
+    let result = if let Some(table) = table {
         // Keep the Host root through the service epilogue. The final assembly
         // transition installs this registered root immediately before entry.
         state.active_root.set(root as usize);
+        state.vm_space.set_registered_root(table);
         state.control.carriers[state.vcpu as usize]
             .active_root
             .store(root, Ordering::Release);
@@ -142,52 +155,105 @@ extern "C" fn kernelet_host_tlb_shootdown_impl(root: u64, start: u64, len: u64) 
         return -STATE;
     };
     state.enter_schedulable_service();
-    let result = if len != u64::MAX
-        && start
-            .checked_add(len)
-            .is_none_or(|end| end > usize::MAX as u64 || len > 128 * 1024)
-    {
-        -INVALID
-    } else {
+    let result = if let Some(op) = shootdown_op(start, len) {
         // The service has installed the Host root and left the active set.
-        // Keep physical IRQs enabled during allocation and IPI acknowledgement.
+        // Keep physical IRQs enabled during the snapshot and IPI acknowledgement.
         crate::arch::irq::enable_local();
-        let mut target_cpus = Vec::<CpuId>::new();
-        let result = if target_cpus
-            .try_reserve_exact(crate::cpu::num_cpus())
-            .is_err()
-        {
-            -STATE
-        } else {
-            let mut roots = state.execution.roots.lock();
+        let shootdown = {
+            let roots = state.execution.roots.lock();
             match roots.binary_search_by_key(&root, |entry| entry.paddr) {
-                Err(_) => -INVALID,
-                Ok(index) => match roots[index].generation.checked_add(1) {
-                    None => -STATE,
-                    Some(generation) => {
-                        roots[index].generation = generation;
-                        target_cpus.extend(roots[index].active.iter());
-                        0
-                    }
-                },
+                Err(_) => Err(-INVALID),
+                Ok(index) => roots[index].table.begin_shootdown().ok_or(-STATE),
             }
         };
-        if result == 0 {
-            let mut targets = CpuSet::new_empty();
-            for cpu in target_cpus {
-                targets.add(cpu);
+        let result = match shootdown {
+            Err(error) => error,
+            Ok(shootdown) => {
+                let targets = shootdown.active;
+                #[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
+                let request = state.control.tlb_profile.begin(
+                    crate::kernelet::tlb_profile::RequestDescriptor {
+                        root_id: shootdown.root_id,
+                        root_paddr: root,
+                        root_generation: shootdown.generation,
+                        source_vcpu: state.vcpu,
+                        source_cpu: u32::from(CpuId::current_racy()),
+                        start,
+                        len,
+                    },
+                    &targets,
+                );
+                // The callback only flushes the local hardware TLB. It never
+                // acquires `roots`, so simultaneous reciprocal waits can progress.
+                crate::mm::tlb::dispatch_tlb_flush_on_cpus(
+                    &targets,
+                    op,
+                    #[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
+                    request.as_ref(),
+                )
+                .wait();
+                #[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
+                if let Some(request) = request {
+                    request.wait_returned();
+                }
+                0
             }
-            // The callback only flushes the local hardware TLB. It never
-            // acquires `roots`, so simultaneous reciprocal waits can progress.
-            crate::smp::inter_processor_call(
-                &targets,
-                crate::arch::mm::tlb_flush_all_excluding_global,
-            )
-            .wait();
-        }
+        };
         crate::arch::irq::disable_local();
         result
+    } else {
+        -INVALID
     };
     state.set_phase(RETURNING);
     result
+}
+
+fn shootdown_op(start: u64, len: u64) -> Option<TlbFlushOp> {
+    if len == u64::MAX {
+        return Some(TlbFlushOp::for_all());
+    }
+    let end = start.checked_add(len)?;
+    if len == 0
+        || len > 128 * 1024
+        || !start.is_multiple_of(PAGE_SIZE as u64)
+        || !len.is_multiple_of(PAGE_SIZE as u64)
+        || end > MAX_USERSPACE_VADDR as u64
+    {
+        return None;
+    }
+    Some(TlbFlushOp::for_range(start as usize..end as usize))
+}
+
+#[cfg(ktest)]
+mod test {
+    use super::{MAX_USERSPACE_VADDR, PAGE_SIZE, TlbFlushOp, shootdown_op};
+    use crate::prelude::ktest;
+
+    #[ktest]
+    fn shootdown_accepts_user_ranges_and_full_flush() {
+        assert_eq!(
+            shootdown_op(0, PAGE_SIZE as u64),
+            Some(TlbFlushOp::for_single(0))
+        );
+        let start = MAX_USERSPACE_VADDR - PAGE_SIZE;
+        assert_eq!(
+            shootdown_op(start as u64, PAGE_SIZE as u64),
+            Some(TlbFlushOp::for_single(start))
+        );
+        assert_eq!(shootdown_op(0, u64::MAX), Some(TlbFlushOp::for_all()));
+    }
+
+    #[ktest]
+    fn shootdown_rejects_invalid_ranges() {
+        for (start, len) in [
+            (0, 0),
+            (1, PAGE_SIZE as u64),
+            (0, PAGE_SIZE as u64 - 1),
+            (MAX_USERSPACE_VADDR as u64, PAGE_SIZE as u64),
+            (0, 128 * 1024 + PAGE_SIZE as u64),
+            (u64::MAX - PAGE_SIZE as u64 + 1, PAGE_SIZE as u64),
+        ] {
+            assert_eq!(shootdown_op(start, len), None);
+        }
+    }
 }

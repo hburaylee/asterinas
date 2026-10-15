@@ -22,14 +22,19 @@ use ostd::{
 
 use super::{
     io_accounting::{ChargedSpan, WorkCategory},
+    policy::Admission,
     virtio_mmio::{
         CONFIG_OFFSET, feature_word, invalid_read, set_high, set_low, write_driver_feature_word,
     },
 };
 use crate::{
     fs::file::{FileLike, SyncMode},
+    prelude::{Errno, Result, VmReader, VmWriter, return_errno_with_message},
     thread::kernel_thread::ThreadOptions,
 };
+
+mod backing;
+use backing::BlockIo;
 
 const QUEUE_SIZE: usize = 64;
 const MAX_REQUEST_BYTES: usize = 4 * 1024 * 1024;
@@ -51,23 +56,7 @@ const STATUS_IO_ERROR: u8 = 1;
 const STATUS_UNSUPPORTED: u8 = 2;
 const DEVICE_NEEDS_RESET: u32 = 1 << 6;
 
-#[derive(Clone, Copy, Default)]
-struct Buffer {
-    paddr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
-}
-
-impl Buffer {
-    fn writable(self) -> bool {
-        self.flags & 2 != 0
-    }
-
-    fn has_next(self) -> bool {
-        self.flags & 1 != 0
-    }
-}
+type Buffer = super::virtio_mmio::Descriptor;
 
 struct Request {
     head: u16,
@@ -89,6 +78,7 @@ struct Registers {
     used: u64,
     last_avail: u16,
     next_used: u16,
+    collect_pending: bool,
     generation: u64,
     active: usize,
     pending_heads: [bool; QUEUE_SIZE],
@@ -111,6 +101,7 @@ impl Registers {
             used: 0,
             last_avail: 0,
             next_used: 0,
+            collect_pending: false,
             generation: 1,
             active: 0,
             pending_heads: [false; QUEUE_SIZE],
@@ -126,6 +117,7 @@ impl Registers {
         self.queue_ready = false;
         self.last_avail = 0;
         self.next_used = 0;
+        self.collect_pending = false;
         self.resetting = self.active != 0;
         if !self.resetting {
             self.status = 0;
@@ -136,6 +128,7 @@ impl Registers {
 /// One attached virtio block device. Its hook never performs file I/O.
 pub(super) struct VirtioBlock {
     kernelet: Arc<Kernelet>,
+    admission: Arc<Admission>,
     memory: GuestMemory,
     backing: Arc<dyn FileLike>,
     capacity_sectors: u64,
@@ -151,6 +144,7 @@ pub(super) struct VirtioBlock {
 impl VirtioBlock {
     pub(super) fn new(
         kernelet: Arc<Kernelet>,
+        admission: Arc<Admission>,
         backing: Arc<dyn FileLike>,
         capacity_sectors: u64,
         read_only: bool,
@@ -167,6 +161,7 @@ impl VirtioBlock {
         Ok(Arc::new(Self {
             memory: kernelet.guest_memory(),
             kernelet,
+            admission,
             backing,
             capacity_sectors,
             read_only,
@@ -190,6 +185,12 @@ impl VirtioBlock {
     }
 
     pub(super) fn read(&self, offset: u32, width: u32) -> MmioResult {
+        if offset == 0x60 && width == 4 {
+            return MmioResult {
+                status: 0,
+                value: self.interrupt_status.load(Ordering::Acquire) as u64,
+            };
+        }
         let registers = self.registers.lock();
         let value = if offset >= CONFIG_OFFSET {
             self.read_config(offset - CONFIG_OFFSET, width)
@@ -209,7 +210,6 @@ impl VirtioBlock {
                 0x34 => (registers.queue_select == 0) as u32 * QUEUE_SIZE as u32,
                 0x38 => registers.queue_num,
                 0x44 => registers.queue_ready as u32,
-                0x60 => self.interrupt_status.load(Ordering::Acquire),
                 0x70 => registers.status,
                 0xfc => 0,
                 _ => return invalid_read(),
@@ -261,7 +261,7 @@ impl VirtioBlock {
                     return -INVALID;
                 }
                 has_failed_completion = self.collect_requests(&mut registers);
-                wake_worker = true;
+                wake_worker = !registers.inbox.is_empty();
             }
             0x64 => {
                 self.interrupt_status.fetch_and(!value, Ordering::AcqRel);
@@ -310,18 +310,18 @@ impl VirtioBlock {
 
     fn queue_valid(&self, r: &Registers) -> bool {
         r.queue_select == 0
-            && r.queue_num > 0
-            && r.queue_num as usize <= QUEUE_SIZE
-            && r.queue_num.is_power_of_two()
-            && r.desc.is_multiple_of(16)
-            && r.avail.is_multiple_of(2)
-            && r.used.is_multiple_of(4)
-            && self.memory.contains(r.desc, r.queue_num as usize * 16)
-            && self.memory.contains(r.avail, 6 + r.queue_num as usize * 2)
-            && self.memory.contains(r.used, 6 + r.queue_num as usize * 8)
+            && super::virtio_mmio::layout_valid(
+                &self.memory,
+                r.queue_num,
+                QUEUE_SIZE,
+                r.desc,
+                r.avail,
+                r.used,
+            )
     }
 
     fn collect_requests(&self, r: &mut Registers) -> bool {
+        r.collect_pending = false;
         let Some(avail_index_addr) = r.avail.checked_add(2) else {
             r.status |= DEVICE_NEEDS_RESET;
             return false;
@@ -363,6 +363,9 @@ impl VirtioBlock {
             }
             r.last_avail = r.last_avail.wrapping_add(1);
         }
+        // A notification normally drains its available entries. Only a full
+        // inbox requires the worker's completion path to resume that walk.
+        r.collect_pending = r.last_avail != avail_idx && r.status & DEVICE_NEEDS_RESET == 0;
         has_failed_completion
     }
 
@@ -393,17 +396,10 @@ impl VirtioBlock {
             if self.memory.read(desc_addr, &mut bytes).is_err() {
                 return Err(None);
             }
-            let buffer = Buffer {
-                paddr: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
-                len: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
-                flags: u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
-                next: u16::from_le_bytes(bytes[14..16].try_into().unwrap()),
-            };
+            let buffer = Buffer::decode(bytes);
             let buffer_len = buffer.len as usize;
             let is_bounded = buffer_len <= MAX_CHAIN_BYTES;
-            if buffer.flags & !3 != 0
-                || !is_bounded
-                || !self.memory.contains(buffer.paddr, buffer_len)
+            if !buffer.supported() || !is_bounded || !self.memory.contains(buffer.paddr, buffer_len)
             {
                 is_valid = false;
             }
@@ -454,7 +450,14 @@ impl VirtioBlock {
         if self.kernelet.adopt_current_task().is_err() {
             return;
         }
+        // Resolve the retained open-file capability once, never a pathname or
+        // inode number that could name a different device after attach.
+        let mut block_io = crate::device::block_device_from_file(self.backing.as_ref())
+            .map(|device| BlockIo::new(device, self.kernelet.clone(), self.admission.clone()));
         loop {
+            if self.kernelet.wait_for_cpu_budget().is_err() {
+                break;
+            }
             let request = self.requests.wait_until(|| {
                 if self.cancelled.load(Ordering::Acquire) {
                     return Some(None);
@@ -467,13 +470,14 @@ impl VirtioBlock {
             let Some(request) = request else {
                 break;
             };
-            let result = self.execute(&request);
+            let result = self.execute(&request, block_io.as_mut());
             self.complete(request, result);
         }
+        drop(block_io);
         self.kernelet.disown_current_task();
     }
 
-    fn execute(&self, request: &Request) -> (u8, u32) {
+    fn execute(&self, request: &Request, block_io: Option<&mut BlockIo>) -> (u8, u32) {
         if request.len < 2 || request.buffers[0].writable() {
             return (STATUS_IO_ERROR, 0);
         }
@@ -533,40 +537,44 @@ impl VirtioBlock {
             return (STATUS_IO_ERROR, 0);
         }
 
-        let mut used_len = 0u32;
-        for buffer in &request.buffers[1..request.len - 1] {
-            let len = buffer.len as usize;
-            let result = if operation == REQUEST_READ {
-                self.memory
-                    .with_writer(buffer.paddr, len, |writer| {
-                        self.backing.read_at(offset, writer)
-                    })
-                    .map_err(|_| ())
-                    .and_then(|result| result.map_err(|_| ()))
-            } else {
-                self.memory
-                    .with_reader(buffer.paddr, len, |reader| {
-                        self.backing.write_at(offset, reader)
-                    })
-                    .map_err(|_| ())
-                    .and_then(|result| result.map_err(|_| ()))
+        if let Some(block_io) = block_io {
+            return match block_io.transfer(
+                &self.memory,
+                &request.buffers[1..request.len - 1],
+                offset,
+                end_offset - offset,
+                operation,
+            ) {
+                Ok(used_len) => (0, used_len),
+                Err((_, used_len)) => (STATUS_IO_ERROR, used_len),
             };
-            match result {
-                Ok(n) if n == len => {}
-                Ok(n) => {
-                    if operation == REQUEST_READ {
-                        used_len = used_len.saturating_add(n.min(len) as u32);
-                    }
-                    return (STATUS_IO_ERROR, used_len);
-                }
-                Err(_) => return (STATUS_IO_ERROR, used_len),
-            }
-            if operation == REQUEST_READ {
-                used_len = used_len.saturating_add(buffer.len);
-            }
-            offset += len;
         }
-        (0, used_len)
+
+        let mut used_len = 0u32;
+        let result = with_buffers(
+            &self.memory,
+            &request.buffers[1..request.len - 1],
+            |buffer, reader, writer| {
+                let len = buffer.len as usize;
+                let n = if operation == REQUEST_READ {
+                    self.backing.read_at(offset, writer)?
+                } else {
+                    self.backing.write_at(offset, reader)?
+                };
+                if operation == REQUEST_READ {
+                    used_len = used_len.saturating_add(n.min(len) as u32);
+                }
+                if n != len {
+                    return_errno_with_message!(Errno::EIO, "short block backing transfer");
+                }
+                offset += len;
+                Ok(())
+            },
+        );
+        match result {
+            Ok(()) => (0, used_len),
+            Err(_) => (STATUS_IO_ERROR, used_len),
+        }
     }
 
     fn complete(&self, request: Request, (status, data_len): (u8, u32)) {
@@ -590,14 +598,17 @@ impl VirtioBlock {
             0
         };
         let has_completion = self.publish_used(&mut registers, request.head, used_len);
-        let has_failed_completion =
-            if !self.cancelled.load(Ordering::Acquire) && registers.queue_ready {
-                self.collect_requests(&mut registers)
-            } else {
-                false
-            };
+        let has_failed_completion = if registers.collect_pending
+            && !self.cancelled.load(Ordering::Acquire)
+            && registers.queue_ready
+        {
+            self.collect_requests(&mut registers)
+        } else {
+            false
+        };
         drop(registers);
-        self.requests.wake_all();
+        // This is the only inbox consumer. It checks the queue again on the
+        // next iteration; producers and cancellation perform the needed wake.
         if has_completion || has_failed_completion {
             // Completion category: reporting the completions published
             // above, charged to this device's owning instance.
@@ -622,28 +633,22 @@ impl VirtioBlock {
             r.status |= DEVICE_NEEDS_RESET;
             return false;
         };
-        let Some(used_len_addr) = used_entry.checked_add(4) else {
-            r.status |= DEVICE_NEEDS_RESET;
-            return false;
-        };
         let Some(used_index) = r.used.checked_add(2) else {
             r.status |= DEVICE_NEEDS_RESET;
             return false;
         };
         let next_used = r.next_used.wrapping_add(1);
-        if self
-            .memory
-            .write(used_entry, &u32::from(head).to_le_bytes())
-            .and_then(|_| self.memory.write(used_len_addr, &used_len.to_le_bytes()))
-            .is_err()
-        {
+        let mut entry = [0u8; 8];
+        entry[..4].copy_from_slice(&u32::from(head).to_le_bytes());
+        entry[4..].copy_from_slice(&used_len.to_le_bytes());
+        if self.memory.write(used_entry, &entry).is_err() {
             r.status |= DEVICE_NEEDS_RESET;
             return false;
         }
         fence(Ordering::Release);
         if self
             .memory
-            .write(used_index, &next_used.to_le_bytes())
+            .write_u16_once(used_index, next_used.to_le())
             .is_err()
         {
             r.status |= DEVICE_NEEDS_RESET;
@@ -655,14 +660,210 @@ impl VirtioBlock {
     }
 
     fn read_u16(&self, paddr: u64) -> ostd::Result<u16> {
-        let mut bytes = [0u8; 2];
-        self.memory.read(paddr, &mut bytes)?;
-        Ok(u16::from_le_bytes(bytes))
+        let value = self.memory.read_u16_once(paddr)?;
+        fence(Ordering::Acquire);
+        Ok(u16::from_le(value))
     }
+}
+
+/// Visits each descriptor with its original access bounds and call boundary.
+/// Adjacent nonempty descriptors share a pin, but admission is rechecked before
+/// each subsequent call so destroy cannot turn one in-progress I/O into several.
+fn with_buffers(
+    memory: &GuestMemory,
+    mut buffers: &[Buffer],
+    mut transfer_fn: impl FnMut(&Buffer, &mut VmReader, &mut VmWriter) -> Result<()>,
+) -> Result<()> {
+    while !buffers.is_empty() {
+        let (run, len) = contiguous_run(buffers);
+        if run.len() == 1 {
+            memory.with_range(run[0].paddr, len, |mut reader, mut writer| {
+                transfer_fn(&run[0], &mut reader, &mut writer)
+            })??;
+            buffers = &buffers[1..];
+            continue;
+        }
+        let result = memory.with_range(run[0].paddr, len, |mut reader, mut writer| -> Result<()> {
+            for (index, buffer) in run.iter().enumerate() {
+                if index != 0 && !memory.contains(buffer.paddr, buffer.len as usize) {
+                    return Err(ostd::Error::AccessDenied.into());
+                }
+                transfer_buffer(buffer, &mut reader, &mut writer, &mut transfer_fn)?;
+            }
+            Ok(())
+        });
+        match result {
+            Ok(result) => result?,
+            // No callback ran when the aggregate pin failed. Preserve the
+            // original admission and completed-prefix behavior one descriptor
+            // at a time; never retry a transfer that ran and then failed.
+            Err(_) => {
+                for buffer in run {
+                    memory.with_range(
+                        buffer.paddr,
+                        buffer.len as usize,
+                        |mut reader, mut writer| transfer_fn(buffer, &mut reader, &mut writer),
+                    )??;
+                }
+            }
+        }
+        buffers = &buffers[run.len()..];
+    }
+    Ok(())
+}
+
+/// Returns the first physically contiguous, nonempty run. An empty descriptor
+/// keeps its own call, including the backing file's zero-length error behavior.
+fn contiguous_run(buffers: &[Buffer]) -> (&[Buffer], usize) {
+    let first = &buffers[0];
+    let mut len = first.len as usize;
+    let mut count = 1;
+    if len != 0 {
+        while let Some(next) = buffers.get(count) {
+            if next.len == 0 || first.paddr.checked_add(len as u64) != Some(next.paddr) {
+                break;
+            }
+            let Some(next_len) = len.checked_add(next.len as usize) else {
+                break;
+            };
+            if next_len > MAX_REQUEST_BYTES {
+                break;
+            }
+            len = next_len;
+            count += 1;
+        }
+    }
+    (&buffers[..count], len)
+}
+
+fn transfer_buffer(
+    buffer: &Buffer,
+    reader: &mut VmReader,
+    writer: &mut VmWriter,
+    transfer_fn: &mut impl FnMut(&Buffer, &mut VmReader, &mut VmWriter) -> Result<()>,
+) -> Result<()> {
+    let len = buffer.len as usize;
+    {
+        let mut chunk_reader = reader.clone();
+        chunk_reader.limit(len);
+        let mut chunk_writer = writer.clone_exclusive();
+        chunk_writer.limit(len);
+        transfer_fn(buffer, &mut chunk_reader, &mut chunk_writer)?;
+    }
+    // The clones do not advance the enclosing accessors. Move to the next
+    // descriptor only after this one completed successfully.
+    reader.skip(len);
+    writer.skip(len);
+    Ok(())
 }
 
 impl Drop for VirtioBlock {
     fn drop(&mut self) {
         self.kernelet.uncharge_host_bytes(self.charged_bytes);
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::{
+        mm::{FallibleVmRead, FrameAllocOptions, io::util::HasVmReaderWriter},
+        prelude::*,
+    };
+
+    use super::*;
+    use crate::prelude::Error;
+
+    fn buffer(paddr: u64, len: u32) -> Buffer {
+        Buffer {
+            paddr,
+            len,
+            ..Buffer::default()
+        }
+    }
+
+    #[ktest]
+    fn block_contiguous_runs_keep_empty_and_disjoint_buffers_separate() {
+        let buffers = [
+            buffer(4096, 512),
+            buffer(4608, 1024),
+            buffer(5632, 0),
+            buffer(5632, 512),
+            buffer(8192, 512),
+        ];
+        let (run, len) = contiguous_run(&buffers);
+        assert_eq!((run.len(), len), (2, 1536));
+        let (run, len) = contiguous_run(&buffers[2..]);
+        assert_eq!((run.len(), len), (1, 0));
+        let (run, len) = contiguous_run(&buffers[3..]);
+        assert_eq!((run.len(), len), (1, 512));
+
+        let buffers = [buffer(u64::MAX - 255, 512), buffer(256, 512)];
+        assert_eq!(contiguous_run(&buffers).0.len(), 1);
+        let buffers = [
+            buffer(4096, MAX_REQUEST_BYTES as u32),
+            buffer(4096 + MAX_REQUEST_BYTES as u64, 512),
+        ];
+        assert_eq!(contiguous_run(&buffers).0.len(), 1);
+    }
+
+    #[ktest]
+    fn block_transfer_buffer_limits_each_accessor_and_advances_the_run() {
+        let source = FrameAllocOptions::new().alloc_frame_with(()).unwrap();
+        let destination = FrameAllocOptions::new().alloc_frame_with(()).unwrap();
+        let data = [1u8, 2, 3, 4, 5, 6, 7, 8];
+        source.writer().write(&mut VmReader::from(data.as_slice()));
+        let mut reader = source.reader().to_fallible();
+        reader.limit(data.len());
+        let mut writer = destination.writer().to_fallible();
+        writer.limit(data.len());
+        let mut calls = 0;
+        let mut transfer_fn = |buffer: &Buffer, reader: &mut VmReader, writer: &mut VmWriter| {
+            let len = buffer.len as usize;
+            assert_eq!(reader.remain(), len);
+            assert_eq!(writer.avail(), len);
+            assert_eq!(reader.read_fallible(writer).unwrap(), len);
+            calls += 1;
+            Ok(())
+        };
+        for buffer in [buffer(0, 3), buffer(3, 5)] {
+            transfer_buffer(&buffer, &mut reader, &mut writer, &mut transfer_fn).unwrap();
+        }
+        assert_eq!(calls, 2);
+        assert_eq!(reader.remain(), 0);
+        assert_eq!(writer.avail(), 0);
+        let mut actual = [0u8; 8];
+        destination
+            .reader()
+            .read(&mut VmWriter::from(actual.as_mut_slice()));
+        assert_eq!(actual, data);
+    }
+
+    #[ktest]
+    fn block_transfer_buffer_preserves_error_and_does_not_advance_the_run() {
+        let source = FrameAllocOptions::new().alloc_frame_with(()).unwrap();
+        let destination = FrameAllocOptions::new().alloc_frame_with(()).unwrap();
+        let mut reader = source.reader().to_fallible();
+        reader.limit(8);
+        let mut writer = destination.writer().to_fallible();
+        writer.limit(8);
+        let mut calls = 0;
+        let result = transfer_buffer(
+            &buffer(0, 4),
+            &mut reader,
+            &mut writer,
+            &mut |_, reader, writer| {
+                calls += 1;
+                reader.skip(2);
+                writer.skip(2);
+                Err(Error::with_message(
+                    Errno::ENOSPC,
+                    "injected backing failure",
+                ))
+            },
+        );
+        assert!(matches!(result, Err(error) if error.error() == Errno::ENOSPC));
+        assert_eq!(calls, 1);
+        assert_eq!(reader.remain(), 8);
+        assert_eq!(writer.avail(), 8);
     }
 }

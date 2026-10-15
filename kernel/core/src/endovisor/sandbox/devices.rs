@@ -2,6 +2,8 @@
 
 //! Virtual device slots, device-model dispatch, and the sandbox's Host hooks.
 
+use core::num::NonZeroU16;
+
 use kernelet_abi::KILL_INTERNAL_ERROR;
 use ostd::{
     kernelet::{
@@ -27,6 +29,7 @@ use crate::{
     sched::{Nice, SchedPolicy},
     thread::{AsThread, Thread, kernel_thread::ThreadOptions},
     time::clocks::RealTimeClock,
+    vm::vmar::Vmar,
 };
 
 /// Size and command-line spelling of each virtual MMIO register window.
@@ -170,6 +173,7 @@ impl SandboxDevices {
 }
 
 pub(super) struct SandboxHooks {
+    pub(super) cid: u32,
     pub(super) devices: Once<SandboxDevices>,
     pub(super) console_endpoint: Option<Arc<ConsoleEndpoint>>,
     pub(super) net_endpoint: Option<Arc<NetEndpoint>>,
@@ -210,6 +214,11 @@ impl SandboxHooks {
 }
 
 impl KerneletHooks for SandboxHooks {
+    fn on_dying(&self, _: &Kernelet, _: &ostd::kernelet::control::ExitReason) {
+        self.cancel();
+        crate::endovisor::vsock_switch::on_dying(self.cid);
+    }
+
     fn realtime_now(&self) -> core::time::Duration {
         RealTimeClock::get().read_time()
     }
@@ -221,6 +230,11 @@ impl KerneletHooks for SandboxHooks {
         host_cpu: ostd::cpu::CpuId,
         nice: i8,
     ) -> ostd::Result<Arc<Task>> {
+        let vmar = Vmar::from_vm_space(kernelet.carrier_vm_space(vcpu)?);
+        // Divide by the configured carrier count, including carriers that are
+        // asleep or have not been built yet. The count is fixed for this instance.
+        let weight_divisor =
+            NonZeroU16::new(kernelet.num_vcpus()).ok_or(ostd::Error::InvalidArgs)?;
         let kernelet = Arc::downgrade(kernelet);
         let nice = Nice::try_from(nice).map_err(|_| ostd::Error::InvalidArgs)?;
         let task = ThreadOptions::new(move || {
@@ -237,8 +251,10 @@ impl KerneletHooks for SandboxHooks {
                 let _ = kernelet.kill(KillReason::HostPolicy(KILL_INTERNAL_ERROR));
             }
         })
+        .vmar(vmar)
         .cpu_affinity(host_cpu.into())
         .sched_policy(SchedPolicy::Fair(nice))
+        .fair_weight_divisor(weight_divisor)
         .build();
         self.carriers
             .lock()

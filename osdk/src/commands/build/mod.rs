@@ -13,7 +13,9 @@ use std::{
 
 use bin::{make_aarch64_image, make_elf_for_qemu, make_install_bzimage, make_stripped_boot_elf};
 
-use super::util::{COMMON_CARGO_ARGS, DEFAULT_TARGET_RELPATH, cargo, profile_name_adapter};
+use super::util::{
+    COMMON_CARGO_ARGS, cargo, lock_build_directory, profile_name_adapter, resolve_output_directory,
+};
 use crate::{
     arch::Arch,
     base_crate::{BaseCrateType, new_base_crate},
@@ -37,12 +39,22 @@ use crate::{
 
 pub fn execute_build_command(config: &Config, build_args: &BuildArgs) {
     let cargo_target_directory = get_target_directory();
-    let osdk_output_directory = build_args
-        .output
-        .clone()
-        .unwrap_or(cargo_target_directory.join(DEFAULT_TARGET_RELPATH));
+    let osdk_output_directory = resolve_output_directory(
+        build_args.output_args.output.as_deref(),
+        &cargo_target_directory,
+    )
+    .unwrap_or_else(|error| {
+        error_msg!("Failed to resolve the OSDK output directory: {error}");
+        process::exit(Errno::Cli as _);
+    });
     if !osdk_output_directory.exists() {
-        std::fs::create_dir_all(&osdk_output_directory).unwrap();
+        std::fs::create_dir_all(&osdk_output_directory).unwrap_or_else(|error| {
+            error_msg!(
+                "Failed to create the OSDK output directory {}: {error}",
+                osdk_output_directory.display()
+            );
+            process::exit(Errno::BuildCrate as _);
+        });
     }
 
     let target_info = get_kernel_crate();
@@ -75,10 +87,19 @@ pub fn create_base_and_cached_build(
     action: ActionChoice,
     rustflags: &[&str],
 ) -> Bundle {
+    let _build_lock =
+        lock_build_directory(cargo_target_directory.as_ref()).unwrap_or_else(|error| {
+            error_msg!(
+                "Failed to lock the Cargo target directory {} for the OSDK build: {error}",
+                cargo_target_directory.as_ref().display()
+            );
+            process::exit(Errno::BuildCrate as _);
+        });
     // One OSDK invocation builds the kernelet image first and the host image
     // second, embedding the kernelet image's bytes into the host image.
     let kernelet_image = kernelet::build_image_if_requested(
         config,
+        action,
         &target_crate,
         osdk_output_directory.as_ref(),
         cargo_target_directory.as_ref(),
@@ -147,10 +168,13 @@ pub fn do_cached_build(
         ActionChoice::Test => (&config.test.build, &config.test.boot, &config.test.grub),
     };
 
+    // The Image is built separately with `kernelet`; Host support also works
+    // without an embedded image when explicitly requested by its feature.
+    let features = host_features(&build.features, build.kernelet);
     let mut rustflags = rustflags.to_vec();
     rustflags.push(&build.rustflags);
     // Host service panics must unwind back through their protected continuation.
-    if build.kernelet {
+    if features.iter().any(|feature| feature == "kernelet-host") {
         rustflags.push("-C panic=unwind");
     }
     let extra_envs = match (build.kernelet, kernelet_image) {
@@ -166,7 +190,7 @@ pub fn do_cached_build(
     let aster_elf = build_kernel_elf(
         config.target_arch,
         &build.profile,
-        &build.features[..],
+        &features,
         build.no_default_features,
         &build.override_configs[..],
         &cargo_target_directory,
@@ -224,7 +248,7 @@ pub fn do_cached_build(
                     &osdk_output_directory,
                     &boot_elf,
                     build.linux_x86_legacy_boot,
-                    config.build.encoding.clone(),
+                    build.encoding.clone(),
                 )
             } else {
                 make_elf_for_qemu(boot_elf)
@@ -234,6 +258,14 @@ pub fn do_cached_build(
     }
 
     bundle
+}
+
+fn host_features(features: &[String], build_kernelet: bool) -> Vec<String> {
+    let mut features = features.to_vec();
+    if build_kernelet && !features.iter().any(|feature| feature == "kernelet-host") {
+        features.push("kernelet-host".to_string());
+    }
+    features
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -379,4 +411,30 @@ fn get_last_modified_time(path: impl AsRef<Path>) -> SystemTime {
         }
     }
     last_modified
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_features;
+
+    #[test]
+    fn native_build_does_not_enable_host_support() {
+        let features = vec!["cvm_guest".to_string()];
+        assert_eq!(host_features(&features, false), features);
+        assert!(host_features(&[], false).is_empty());
+    }
+
+    #[test]
+    fn paired_build_enables_host_support_without_image_feature() {
+        let features = host_features(&["coverage".to_string()], true);
+        assert_eq!(features, ["coverage", "kernelet-host"]);
+        assert!(!features.iter().any(|feature| feature == "kernelet"));
+    }
+
+    #[test]
+    fn explicit_host_support_does_not_require_embedding_or_duplicate_feature() {
+        let features = vec!["kernelet-host".to_string()];
+        assert_eq!(host_features(&features, false), features);
+        assert_eq!(host_features(&features, true), features);
+    }
 }

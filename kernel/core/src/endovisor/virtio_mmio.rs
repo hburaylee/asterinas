@@ -16,7 +16,63 @@
 //!
 //! See <https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html>.
 
-use ostd::kernelet::abi::{INVALID, MmioResult};
+use ostd::kernelet::{
+    abi::{INVALID, MmioResult},
+    guest_memory::GuestMemory,
+};
+
+/// One split-virtqueue descriptor (VirtIO 1.3 §2.7.5).
+#[derive(Clone, Copy, Default)]
+pub(super) struct Descriptor {
+    pub(super) paddr: u64,
+    pub(super) len: u32,
+    pub(super) flags: u16,
+    pub(super) next: u16,
+}
+
+impl Descriptor {
+    pub(super) fn decode(bytes: [u8; 16]) -> Self {
+        Self {
+            paddr: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
+            len: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
+            flags: u16::from_le_bytes(bytes[12..14].try_into().unwrap()),
+            next: u16::from_le_bytes(bytes[14..16].try_into().unwrap()),
+        }
+    }
+
+    pub(super) fn writable(self) -> bool {
+        self.flags & 2 != 0
+    }
+    pub(super) fn readable(self) -> bool {
+        !self.writable()
+    }
+    pub(super) fn has_next(self) -> bool {
+        self.flags & 1 != 0
+    }
+    pub(super) fn supported(self) -> bool {
+        self.flags & !3 == 0
+    }
+}
+
+/// Validates common split-ring geometry before a device activates it.
+pub(super) fn layout_valid(
+    memory: &GuestMemory,
+    num: u32,
+    max: usize,
+    desc: u64,
+    avail: u64,
+    used: u64,
+) -> bool {
+    num > 0
+        && num as usize <= max
+        && num.is_power_of_two()
+        && desc.is_multiple_of(16)
+        && avail.is_multiple_of(2)
+        && used.is_multiple_of(4)
+        && memory.contains(desc, num as usize * 16)
+        && memory.contains(avail, 6 + num as usize * 2)
+        && memory.contains(used, 6 + num as usize * 8)
+}
 
 /// The offset at which a device's configuration space starts, relative to
 /// the MMIO register base. Reads and writes below it address the common

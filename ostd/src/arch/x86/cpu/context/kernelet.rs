@@ -1,91 +1,36 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Adapts OSTD's private x86 user register file to the kernelet service ABI.
+//! Borrows the common user register file across the service boundary.
 
-use super::{GeneralRegs, RawUserContext};
-use crate::kernelet::abi::KletUserContext;
-
-fn to_wire(raw: &RawUserContext) -> KletUserContext {
-    let regs = &raw.general;
-    KletUserContext {
-        rax: regs.rax as u64,
-        rbx: regs.rbx as u64,
-        rcx: regs.rcx as u64,
-        rdx: regs.rdx as u64,
-        rsi: regs.rsi as u64,
-        rdi: regs.rdi as u64,
-        rbp: regs.rbp as u64,
-        rsp: regs.rsp as u64,
-        r8: regs.r8 as u64,
-        r9: regs.r9 as u64,
-        r10: regs.r10 as u64,
-        r11: regs.r11 as u64,
-        r12: regs.r12 as u64,
-        r13: regs.r13 as u64,
-        r14: regs.r14 as u64,
-        r15: regs.r15 as u64,
-        rip: regs.rip as u64,
-        rflags: regs.rflags as u64,
-        fsbase: 0,
-        gsbase: 0,
-        trap_num: 0,
-        error_code: 0,
-        fault_addr: 0,
-    }
-}
-
-fn from_wire(wire: &KletUserContext) -> RawUserContext {
-    RawUserContext {
-        general: GeneralRegs {
-            rax: wire.rax as usize,
-            rbx: wire.rbx as usize,
-            rcx: wire.rcx as usize,
-            rdx: wire.rdx as usize,
-            rsi: wire.rsi as usize,
-            rdi: wire.rdi as usize,
-            rbp: wire.rbp as usize,
-            rsp: wire.rsp as usize,
-            r8: wire.r8 as usize,
-            r9: wire.r9 as usize,
-            r10: wire.r10 as usize,
-            r11: wire.r11 as usize,
-            r12: wire.r12 as usize,
-            r13: wire.r13 as usize,
-            r14: wire.r14 as usize,
-            r15: wire.r15 as usize,
-            rip: wire.rip as usize,
-            rflags: wire.rflags as usize,
-        },
-        trap_num: wire.trap_num as usize,
-        error_code: wire.error_code as usize,
-    }
-}
-
-fn update_wire(wire: &mut KletUserContext, raw: &RawUserContext) {
-    let fsbase = wire.fsbase;
-    let gsbase = wire.gsbase;
-    let fault_addr = wire.fault_addr;
-    *wire = to_wire(raw);
-    wire.fsbase = fsbase;
-    wire.gsbase = gsbase;
-    wire.fault_addr = fault_addr;
-    wire.trap_num = raw.trap_num as u64;
-    wire.error_code = raw.error_code as u64;
-}
+use super::RawUserContext;
+#[cfg(kernelet_getpid_profile)]
+use crate::kernelet::getpid_profile as profile;
 
 #[cfg(feature = "kernelet")]
 pub(super) fn run_image_user(
     raw: &mut RawUserContext,
-    guard: crate::irq::DisabledLocalIrqGuard,
-) -> bool {
+    _guard: &crate::irq::DisabledLocalIrqGuard,
+) -> i32 {
     use crate::kernelet::abi::{USER_RETURN_EXCEPTION, USER_RETURN_PENDING, USER_RETURN_SYSCALL};
 
-    let mut wire = to_wire(raw);
-    wire.fsbase = super::KERNELET_USER_FS_BASE.load() as u64;
-    wire.gsbase = super::KERNELET_USER_GS_BASE.load() as u64;
-    // The image resumes with virtual IRQs masked. `execute` reenables them
-    // after interpreting the service result, as it does for native entry.
-    let result = (crate::kernelet::entry::services().user_run)(&mut wire);
+    // The Host borrows this task-stack object synchronously and retains no
+    // pointer. Its native entry assembly writes the returned registers here.
+    #[cfg(kernelet_getpid_profile)]
+    let result = {
+        let pre_span = profile::span(profile::stage::GUEST_USER_PRE);
+        let user_run = crate::kernelet::entry::services().user_run;
+        let _ = profile::end(pre_span);
+        user_run(raw)
+    };
+    #[cfg(not(kernelet_getpid_profile))]
+    let result = (crate::kernelet::entry::services().user_run)(raw);
+    #[cfg(kernelet_getpid_profile)]
+    let _post_span = profile::span(profile::stage::GUEST_USER_POST);
+    assert_ne!(
+        result,
+        -(crate::kernelet::abi::INVALID as i32),
+        "user context must reside on the current task's kernel stack and contain valid user addresses"
+    );
     assert!(
         matches!(
             result,
@@ -93,60 +38,259 @@ pub(super) fn run_image_user(
         ),
         "invalid user_run result: {result}"
     );
-    core::mem::forget(guard);
-    *raw = from_wire(&wire);
-    super::KERNELET_USER_FS_BASE.store(wire.fsbase as usize);
-    super::KERNELET_USER_GS_BASE.store(wire.gsbase as usize);
-    super::KERNELET_USER_FAULT_ADDR.store(wire.fault_addr as usize);
-    result == USER_RETURN_PENDING
+    result
 }
 
-#[cfg(not(feature = "kernelet"))]
-pub(crate) fn run_host_user(
-    wire: &mut KletUserContext,
-) -> (i64, Option<crate::arch::trap::TrapFrame>) {
-    use super::{FsBase, GsBase, UserContext};
-    use crate::{
-        kernelet::abi::{USER_RETURN_EXCEPTION, USER_RETURN_PENDING, USER_RETURN_SYSCALL},
-        user::UserContextApiInternal,
-    };
+#[cfg(feature = "kernelet-host")]
+#[cfg_attr(not(kernelet_getpid_profile), inline(always))]
+pub(crate) fn run_host_user(raw: &mut RawUserContext) -> i32 {
+    use crate::kernelet::abi::{USER_RETURN_PENDING, USER_RETURN_SYSCALL};
 
-    let guard = crate::irq::disable_local();
-    let mut old_fs = FsBase::default();
-    let mut old_gs = GsBase::default();
-    old_fs.save();
-    old_gs.save(&guard);
-    FsBase::new(wire.fsbase as usize).load();
-    GsBase::new(wire.gsbase as usize).load(&guard);
-
-    let mut raw = from_wire(wire);
-    raw.run(guard);
-    let fault_addr = if raw.trap_num == 14 {
-        x86_64::registers::control::Cr2::read_raw()
-    } else {
-        0
-    };
-    let guard = crate::irq::disable_local();
-    let mut user_fs = FsBase::default();
-    let mut user_gs = GsBase::default();
-    user_fs.save();
-    user_gs.save(&guard);
-    old_fs.load();
-    old_gs.load(&guard);
-    update_wire(wire, &raw);
-    wire.fsbase = user_fs.addr() as u64;
-    wire.gsbase = user_gs.addr() as u64;
-    wire.fault_addr = fault_addr;
+    #[cfg(kernelet_getpid_profile)]
+    let raw_span = profile::span(profile::stage::HOST_RAW_RUN);
+    raw.run(crate::irq::disable_local());
+    #[cfg(kernelet_getpid_profile)]
+    let _ = profile::end(raw_span);
 
     if raw.trap_num == 0x100 {
-        (USER_RETURN_SYSCALL, None)
-    } else if raw.trap_num <= 31 {
-        (USER_RETURN_EXCEPTION, None)
+        USER_RETURN_SYSCALL
+    } else if raw.trap_num >= crate::arch::irq::IRQ_NUM_MIN as usize {
+        USER_RETURN_PENDING
     } else {
-        let context = UserContext {
-            user_context: raw,
-            exception: None,
-        };
-        (USER_RETURN_PENDING, Some(context.as_trap_frame()))
+        classify_host_user_return(raw)
+    }
+}
+
+#[cfg(feature = "kernelet-host")]
+#[cold]
+#[inline(never)]
+fn classify_host_user_return(raw: &mut RawUserContext) -> i32 {
+    use crate::kernelet::abi::{USER_RETURN_EXCEPTION, USER_RETURN_PENDING};
+
+    if let Some(exception) =
+        super::CpuException::from_raw(raw.trap_num, raw.error_code, raw.fault_addr)
+    {
+        if exception.type_().is_fault_or_trap() {
+            USER_RETURN_EXCEPTION
+        } else {
+            // Machine events belong to the Host. Its existing policy is
+            // fatal for unsupported NMIs, machine checks and aborts; never
+            // turn those into a tenant exception or silently consume them.
+            crate::arch::trap::handle_user_machine_exception(&mut raw.as_trap_frame());
+            USER_RETURN_PENDING
+        }
+    } else {
+        USER_RETURN_PENDING
+    }
+}
+
+#[cfg(all(ktest, feature = "kernelet-host"))]
+mod test {
+    use super::{
+        super::{FsBase, GsBase},
+        *,
+    };
+    use crate::{
+        arch::irq::HwIrqLine,
+        cpu::PrivilegeLevel,
+        irq::call_irq_callback_functions,
+        kernelet::abi::{USER_RETURN_EXCEPTION, USER_RETURN_PENDING, USER_RETURN_SYSCALL},
+        mm::{
+            CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, VmSpace,
+            io::util::HasVmReaderWriter,
+        },
+        prelude::*,
+        task::disable_preempt,
+    };
+
+    const USER_CODE: usize = 0x400000;
+
+    fn segment_bases() -> (usize, usize) {
+        let guard = crate::irq::disable_local();
+        let mut fsbase = FsBase::default();
+        let mut gsbase = GsBase::default();
+        fsbase.save();
+        gsbase.save(&guard);
+        (fsbase.addr(), gsbase.addr())
+    }
+
+    struct RestoreSegmentBases {
+        fs: FsBase,
+        gs: GsBase,
+    }
+
+    impl RestoreSegmentBases {
+        fn load_user(fs: usize, gs: usize) -> Self {
+            let guard = crate::irq::disable_local();
+            let mut saved = Self {
+                fs: FsBase::default(),
+                gs: GsBase::default(),
+            };
+            saved.fs.save();
+            saved.gs.save(&guard);
+            FsBase::new(fs).load();
+            GsBase::new(gs).load(&guard);
+            saved
+        }
+    }
+
+    impl Drop for RestoreSegmentBases {
+        fn drop(&mut self) {
+            let guard = crate::irq::disable_local();
+            self.fs.load();
+            self.gs.load(&guard);
+        }
+    }
+
+    struct UserSpace {
+        _space: Arc<VmSpace>,
+    }
+
+    impl UserSpace {
+        fn new(code: &[u8]) -> Self {
+            let space = Arc::new(VmSpace::new());
+            let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+            frame.writer().write(&mut code.into());
+            let guard = disable_preempt();
+            space
+                .cursor_mut(&guard, &(USER_CODE..USER_CODE + PAGE_SIZE))
+                .unwrap()
+                .map(
+                    frame.into(),
+                    PageProperty::new_user(PageFlags::RWX, CachePolicy::Writeback),
+                );
+            space.activate();
+            Self { _space: space }
+        }
+
+        fn context(&self) -> RawUserContext {
+            RawUserContext {
+                general: super::super::GeneralRegs {
+                    rip: USER_CODE,
+                    rsp: USER_CODE + PAGE_SIZE,
+                    r12: 0x123456789abcdef0,
+                    ..Default::default()
+                },
+                rflags: 2 | (1 << 9),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl Drop for UserSpace {
+        fn drop(&mut self) {
+            VmSpace::deactivate();
+        }
+    }
+
+    fn enter_until_event(context: &mut RawUserContext) -> i32 {
+        loop {
+            let reason = run_host_user(context);
+            if reason == USER_RETURN_PENDING {
+                let frame = context.as_trap_frame();
+                call_irq_callback_functions(
+                    &frame,
+                    &HwIrqLine::new(frame.trap_num as u8),
+                    PrivilegeLevel::User,
+                );
+            }
+            crate::arch::irq::enable_local();
+            if reason != USER_RETURN_PENDING {
+                return reason;
+            }
+        }
+    }
+
+    #[ktest]
+    fn shared_context_survives_syscall_and_exception_entry() {
+        let _preempt = disable_preempt();
+        // mov eax, 0x13572468; syscall; ud2.
+        let space = UserSpace::new(&[0xb8, 0x68, 0x24, 0x57, 0x13, 0x0f, 0x05, 0x0f, 0x0b]);
+        let mut context = space.context();
+        assert_eq!(enter_until_event(&mut context), USER_RETURN_SYSCALL);
+        assert_eq!(context.general.rax, 0x13572468);
+        assert_eq!(context.general.r12, 0x123456789abcdef0);
+        assert_eq!(context.general.rip, USER_CODE + 7);
+        assert_eq!(context.trap_num, 0x100);
+        assert_eq!(context.fault_addr, 0);
+
+        assert_eq!(enter_until_event(&mut context), USER_RETURN_EXCEPTION);
+        assert_eq!(context.general.rip, USER_CODE + 7);
+        assert_eq!(context.general.r12, 0x123456789abcdef0);
+        assert_eq!(context.trap_num, 6);
+        assert_eq!(context.error_code, 0);
+    }
+
+    #[ktest]
+    fn shared_context_captures_user_page_fault_address() {
+        let _preempt = disable_preempt();
+        let fault_addr = 0x12345000usize;
+        // movabs rax, [fault_addr].
+        let mut code = alloc::vec![0x48, 0xa1];
+        code.extend_from_slice(&fault_addr.to_le_bytes());
+        let space = UserSpace::new(&code);
+        let mut context = space.context();
+        assert_eq!(enter_until_event(&mut context), USER_RETURN_EXCEPTION);
+        assert_eq!(context.trap_num, 14);
+        assert_eq!(context.fault_addr, fault_addr);
+        assert_eq!(context.general.rip, USER_CODE);
+        assert_eq!(context.general.r12, 0x123456789abcdef0);
+        assert_eq!(context.error_code & 7, 4);
+    }
+
+    #[ktest]
+    fn shared_context_uses_loaded_segment_bases() {
+        let _preempt = disable_preempt();
+        let fs_value = 0x123456789abcdef0u64;
+        let gs_value = 0xfedcba9876543210u64;
+        // mov rax, fs:[0]; mov rbx, gs:[0]; syscall; ud2.
+        let mut code = alloc::vec![
+            0x64, 0x48, 0x8b, 0x04, 0x25, 0, 0, 0, 0, 0x65, 0x48, 0x8b, 0x1c, 0x25, 0, 0, 0, 0,
+            0x0f, 0x05, 0x0f, 0x0b,
+        ];
+        code.resize(0x100, 0);
+        code.extend_from_slice(&fs_value.to_le_bytes());
+        code.extend_from_slice(&gs_value.to_le_bytes());
+        let space = UserSpace::new(&code);
+        let mut context = space.context();
+        let host_bases = segment_bases();
+        let user_bases = (USER_CODE + 0x100, USER_CODE + 0x108);
+        let restore = RestoreSegmentBases::load_user(user_bases.0, user_bases.1);
+
+        assert_eq!(enter_until_event(&mut context), USER_RETURN_SYSCALL);
+        assert_eq!(context.general.rax, fs_value as usize);
+        assert_eq!(context.general.rbx, gs_value as usize);
+        assert_eq!(segment_bases(), user_bases);
+
+        assert_eq!(enter_until_event(&mut context), USER_RETURN_EXCEPTION);
+        assert_eq!(context.trap_num, 6);
+        assert_eq!(segment_bases(), user_bases);
+        drop(restore);
+        assert_eq!(segment_bases(), host_bases);
+    }
+
+    #[ktest]
+    fn user_written_segment_bases_remain_live_after_syscall() {
+        let _preempt = disable_preempt();
+        let user_bases = (USER_CODE + 0x200, USER_CODE + 0x208);
+        // movabs rax, fs; wrfsbase rax; movabs rax, gs; wrgsbase rax;
+        // syscall; ud2.
+        let mut code = alloc::vec![0x48, 0xb8];
+        code.extend_from_slice(&user_bases.0.to_le_bytes());
+        code.extend_from_slice(&[0xf3, 0x48, 0x0f, 0xae, 0xd0, 0x48, 0xb8]);
+        code.extend_from_slice(&user_bases.1.to_le_bytes());
+        code.extend_from_slice(&[0xf3, 0x48, 0x0f, 0xae, 0xd8, 0x0f, 0x05, 0x0f, 0x0b]);
+        let space = UserSpace::new(&code);
+        let mut context = space.context();
+        let host_bases = segment_bases();
+        let restore = RestoreSegmentBases::load_user(0, 0);
+
+        assert_eq!(enter_until_event(&mut context), USER_RETURN_SYSCALL);
+        assert_eq!(segment_bases(), user_bases);
+        assert_eq!(enter_until_event(&mut context), USER_RETURN_EXCEPTION);
+        assert_eq!(context.trap_num, 6);
+        assert_eq!(segment_bases(), user_bases);
+        drop(restore);
+        assert_eq!(segment_bases(), host_bases);
     }
 }

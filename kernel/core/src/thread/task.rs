@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MPL-2.0
 
+#[cfg(kernelet_getpid_profile)]
+use ostd::kernelet::getpid_profile as profile;
 use ostd::{
     arch::cpu::context::UserContext,
     irq::DisabledLocalIrqGuard,
     mm::VmIo,
     sync::Waiter,
-    task::{Task, TaskOptions},
+    task::{PreparedTaskStack, Task, TaskOptions},
     user::{ReturnReason, UserContextApi, UserMode, UserModeHooks},
 };
 
@@ -28,6 +30,7 @@ pub(crate) fn create_new_user_task(
     user_ctx: Box<UserContext>,
     thread_ref: Arc<Thread>,
     thread_local: ThreadLocal,
+    stack: PreparedTaskStack,
 ) -> Task {
     let user_task_entry = move |user_ctx: UserContext| {
         let current_task = Task::current().unwrap();
@@ -68,9 +71,36 @@ pub(crate) fn create_new_user_task(
             crate::init::on_first_process_startup(&ctx);
         }
 
+        #[cfg(kernelet_getpid_profile)]
+        let mut kernel_round = None;
         while !current_thread.is_exited() {
+            #[cfg(kernelet_getpid_profile)]
+            let _ = profile::end(kernel_round.take());
             // Execute the user code
             let return_reason = user_mode.execute(&ctx);
+
+            #[cfg(kernelet_rq1_diagnostics)]
+            if matches!(&return_reason, ReturnReason::UserSyscall)
+                && user_mode.context().syscall_num() as u64
+                    == crate::syscall::GETPID_PROFILE_SYSCALL_NUMBER
+            {
+                ctx.thread_local
+                    .getpid_timeline()
+                    .borrow_mut()
+                    .begin(ostd::cpu::CpuId::current_racy().into());
+            }
+
+            #[cfg(kernelet_getpid_profile)]
+            {
+                kernel_round = if matches!(&return_reason, ReturnReason::UserSyscall)
+                    && user_mode.context().syscall_num() as u64
+                        == crate::syscall::GETPID_PROFILE_SYSCALL_NUMBER
+                {
+                    profile::span(profile::stage::KERNEL_ROUND)
+                } else {
+                    None
+                };
+            }
 
             // Handle user events
             let user_ctx = user_mode.context_mut();
@@ -125,14 +155,25 @@ pub(crate) fn create_new_user_task(
     let user_task_func = move || user_task_entry(*user_ctx);
 
     TaskOptions::new(move || {
-        // TODO: If a kernel "oops" is caught, we should kill the entire
-        // process rather than just ending the thread.
-        let _ = oops::catch_panics_as_oops(user_task_func);
+        if oops::catch_panics_as_oops(user_task_func).is_err() {
+            // Unwinding must also complete the POSIX lifecycle. Otherwise the
+            // dead OSTD Task remains in the process task set indefinitely.
+            let current_task = Task::current().unwrap();
+            let thread = current_task.as_thread().unwrap();
+            let posix_thread = thread.as_posix_thread().unwrap();
+            let ctx = Context {
+                process: posix_thread.process(),
+                thread_local: current_task.as_thread_local().unwrap(),
+                posix_thread,
+                thread,
+                task: &current_task,
+            };
+            crate::process::posix_thread::exit_after_oops(&ctx);
+        }
     })
     .data(thread_ref)
     .local_data(thread_local)
-    .build()
-    .expect("spawn task failed")
+    .build_with_stack(stack)
 }
 
 impl UserModeHooks for Context<'_> {
@@ -144,5 +185,10 @@ impl UserModeHooks for Context<'_> {
         self.thread_local
             .supp_user_context()
             .before_user_exec(guard);
+        #[cfg(kernelet_rq1_diagnostics)]
+        self.thread_local
+            .getpid_timeline()
+            .borrow_mut()
+            .complete(ostd::cpu::CpuId::current_racy().into());
     }
 }

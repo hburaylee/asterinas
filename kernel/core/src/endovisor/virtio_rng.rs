@@ -232,15 +232,14 @@ impl VirtioRng {
 
     fn queue_valid(&self, r: &Registers) -> bool {
         r.queue_select == 0
-            && r.queue_num > 0
-            && r.queue_num as usize <= QUEUE_SIZE
-            && r.queue_num.is_power_of_two()
-            && r.desc.is_multiple_of(16)
-            && r.avail.is_multiple_of(2)
-            && r.used.is_multiple_of(4)
-            && self.memory.contains(r.desc, r.queue_num as usize * 16)
-            && self.memory.contains(r.avail, 6 + r.queue_num as usize * 2)
-            && self.memory.contains(r.used, 6 + r.queue_num as usize * 8)
+            && super::virtio_mmio::layout_valid(
+                &self.memory,
+                r.queue_num,
+                QUEUE_SIZE,
+                r.desc,
+                r.avail,
+                r.used,
+            )
     }
 
     fn collect_requests(&self, r: &mut Registers) {
@@ -299,11 +298,17 @@ impl VirtioRng {
             self.memory
                 .read(r.desc.checked_add(index as u64 * 16)?, &mut bytes)
                 .ok()?;
-            let paddr = u64::from_le_bytes(bytes[0..8].try_into().ok()?);
-            let len = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
-            let flags = u16::from_le_bytes(bytes[12..14].try_into().ok()?);
-            let next = u16::from_le_bytes(bytes[14..16].try_into().ok()?);
-            if flags & 2 == 0 || flags & !3 != 0 || !self.memory.contains(paddr, len as usize) {
+            let descriptor = super::virtio_mmio::Descriptor::decode(bytes);
+            let super::virtio_mmio::Descriptor {
+                paddr,
+                len,
+                flags,
+                next,
+            } = descriptor;
+            if !descriptor.writable()
+                || !descriptor.supported()
+                || !self.memory.contains(paddr, len as usize)
+            {
                 return None;
             }
             request.total_bytes = request.total_bytes.checked_add(len as usize)?;
@@ -328,6 +333,9 @@ impl VirtioRng {
             return;
         }
         loop {
+            if self.kernelet.wait_for_cpu_budget().is_err() {
+                break;
+            }
             let request = self.requests.wait_until(|| {
                 if self.cancelled.load(Ordering::Acquire) {
                     return Some(None);
@@ -388,7 +396,7 @@ impl VirtioRng {
         fence(Ordering::Release);
         if self
             .memory
-            .write(r.used + 2, &r.next_used.to_le_bytes())
+            .write_u16_once(r.used + 2, r.next_used.to_le())
             .is_err()
         {
             r.status |= DEVICE_NEEDS_RESET;
@@ -401,8 +409,8 @@ impl VirtioRng {
     }
 
     fn read_u16(&self, paddr: u64) -> ostd::Result<u16> {
-        let mut bytes = [0u8; 2];
-        self.memory.read(paddr, &mut bytes)?;
-        Ok(u16::from_le_bytes(bytes))
+        let value = self.memory.read_u16_once(paddr)?;
+        fence(Ordering::Acquire);
+        Ok(u16::from_le(value))
     }
 }

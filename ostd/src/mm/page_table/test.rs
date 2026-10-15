@@ -14,6 +14,151 @@ use crate::{
     task::disable_preempt,
 };
 
+crate::cpu_local_cell! {
+    static NODE_ALLOCATION_BUDGET: usize = usize::MAX;
+}
+
+pub(super) fn fail_node_allocation() -> bool {
+    let remaining = NODE_ALLOCATION_BUDGET.load();
+    if remaining == usize::MAX {
+        return false;
+    }
+    if remaining == 0 {
+        return true;
+    }
+    NODE_ALLOCATION_BUDGET.store(remaining - 1);
+    false
+}
+
+pub(in crate::mm) struct NodeAllocationFailure {
+    previous: usize,
+    _irq_guard: crate::irq::DisabledLocalIrqGuard,
+}
+
+impl NodeAllocationFailure {
+    pub(in crate::mm) fn after(successes: usize) -> Self {
+        let guard = crate::irq::disable_local();
+        let previous = NODE_ALLOCATION_BUDGET.load();
+        NODE_ALLOCATION_BUDGET.store(successes);
+        Self {
+            previous,
+            _irq_guard: guard,
+        }
+    }
+}
+
+impl Drop for NodeAllocationFailure {
+    fn drop(&mut self) {
+        NODE_ALLOCATION_BUDGET.store(self.previous);
+    }
+}
+
+#[ktest]
+fn empty_query_stays_in_range_without_allocating_nodes() {
+    let table = PageTable::<UserPtConfig>::empty();
+    let range = PAGE_SIZE..2 * PAGE_SIZE;
+    let guard = disable_preempt();
+    let _failure = NodeAllocationFailure::after(0);
+    let mut cursor = table.cursor(&guard, &range).unwrap();
+    assert!(matches!(cursor.query(), Ok((queried, None)) if queried == range));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[ktest]
+fn empty_high_address_query_clips_an_ancestor_without_overflow() {
+    let table = PageTable::<KernelPtConfig>::empty();
+    let range = usize::MAX - 2 * PAGE_SIZE + 1..usize::MAX - PAGE_SIZE + 1;
+    let guard = disable_preempt();
+    let _failure = NodeAllocationFailure::after(0);
+    let mut cursor = table.cursor(&guard, &range).unwrap();
+    assert!(matches!(cursor.query(), Ok((queried, None)) if queried == range));
+}
+
+#[cfg(target_arch = "x86_64")]
+#[ktest]
+fn empty_high_address_find_next_stays_within_barrier_without_allocating() {
+    let table = PageTable::<KernelPtConfig>::empty();
+    let range = usize::MAX - 2 * PAGE_SIZE + 1..usize::MAX - PAGE_SIZE + 1;
+    let guard = disable_preempt();
+    let _failure = NodeAllocationFailure::after(0);
+    let mut cursor = table.cursor(&guard, &range).unwrap();
+    assert!(cursor.find_next(range.len()).is_none());
+    assert_eq!(cursor.virt_addr(), range.end);
+    cursor.jump(range.start).unwrap();
+    assert!(cursor.find_next(range.len()).is_none());
+    assert_eq!(cursor.virt_addr(), range.end);
+    drop(cursor);
+}
+
+#[cfg(target_arch = "x86_64")]
+#[ktest]
+fn high_address_mapping_preparation_releases_locks_after_oom_and_success() {
+    let range = usize::MAX - 2 * PAGE_SIZE + 1..usize::MAX - PAGE_SIZE + 1;
+    for successes in 0..=3 {
+        let table = PageTable::<KernelPtConfig>::empty();
+        let guard = disable_preempt();
+        {
+            let _failure = NodeAllocationFailure::after(successes);
+            let mut cursor = table.cursor_mut(&guard, &range).unwrap();
+            assert!(cursor.find_next(range.len()).is_none());
+            assert_eq!(cursor.virt_addr(), range.end);
+            cursor.jump(range.start).unwrap();
+            let prepared = cursor.prepare_mapping(range.start, 1);
+            if successes < 3 {
+                assert_eq!(prepared, Err(crate::Error::NoMemory));
+            } else {
+                assert_eq!(prepared, Ok(()));
+            }
+            assert!(matches!(cursor.query(), Ok((queried, None)) if queried == range));
+            // Drop walks newly created children at index511 on every level,
+            // including partially prepared trees after a genuine alloc error.
+            drop(cursor);
+        }
+        {
+            let _failure = NodeAllocationFailure::after(0);
+            // Retaining a higher existing root also exercises DFS acquisition
+            // over the children created above, without allocating more nodes.
+            let mut cursor = table.cursor_mut_for_mapping(&guard, &range, 2).unwrap();
+            assert!(cursor.find_next(range.len()).is_none());
+            assert_eq!(cursor.virt_addr(), range.end);
+            drop(cursor);
+        }
+    }
+}
+
+#[ktest]
+fn mapping_preparation_propagates_oom_before_any_leaf_publication() {
+    let table = PageTable::<UserPtConfig>::empty();
+    let guard = disable_preempt();
+    let mut cursor = table
+        .cursor_mut(&guard, &(0..2 * 1024 * 1024 + PAGE_SIZE))
+        .unwrap();
+    {
+        let _failure = NodeAllocationFailure::after(3);
+        cursor.prepare_mapping(0, 1).unwrap();
+        assert_eq!(
+            cursor.prepare_mapping(2 * 1024 * 1024, 1),
+            Err(crate::Error::NoMemory)
+        );
+        cursor.jump(0).unwrap();
+        assert!(cursor.query().unwrap().1.is_none());
+        cursor.jump(2 * 1024 * 1024).unwrap();
+        assert!(cursor.query().unwrap().1.is_none());
+    }
+    cursor.prepare_mapping(2 * 1024 * 1024, 1).unwrap();
+    let frame = FrameAllocOptions::new().alloc_frame().unwrap();
+    // SAFETY: The user range is owned by this test's private page table and
+    // only untyped memory is mapped. Preparation retained every needed node.
+    unsafe {
+        cursor.map(VmItem::new_tracked(
+            frame.into(),
+            PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback),
+        ));
+    }
+    cursor.jump(2 * 1024 * 1024).unwrap();
+    assert!(cursor.query().unwrap().1.is_some());
+}
+
 mod test_utils {
     use core::marker::PhantomData;
 
@@ -817,6 +962,61 @@ mod unmap {
 
 mod mapping {
     use super::{test_utils::*, *};
+
+    #[ktest]
+    fn exact_huge_ranges_map_at_requested_level() {
+        // Only page-table nodes are allocated. These unactivated test tables
+        // never access the synthetic 2 MiB or 1 GiB physical ranges.
+        for level in [2, 3] {
+            let pt = PageTable::<TestPtConfig>::empty();
+            let size = page_size::<TestPtConfig>(level);
+            let range = 0..size;
+            let prop = PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback);
+            let guard = disable_preempt();
+            {
+                let mut cursor = pt.cursor_mut_for_mapping(&guard, &range, level).unwrap();
+                // SAFETY: The table is never activated, and the mapping only
+                // represents a synthetic physical range for inspection.
+                unsafe { cursor.map((size, level, prop)) };
+            }
+            let mut cursor = pt.cursor(&guard, &range).unwrap();
+            for addr in [range.start, range.end - PAGE_SIZE] {
+                cursor.jump(addr).unwrap();
+                let (mapped_range, item) = cursor.query().unwrap();
+                assert_eq!(mapped_range, range);
+                assert_eq!(item.unwrap().0, (size, level, prop));
+                assert_eq!(pt.page_walk(addr).unwrap(), (size + addr, prop));
+            }
+        }
+    }
+
+    #[ktest]
+    #[should_panic(expected = "cursor virtual address out-of-bound for mapping")]
+    fn huge_mapping_cannot_cross_base_page_cursor_range() {
+        let pt = PageTable::<TestPtConfig>::empty();
+        let guard = disable_preempt();
+        let mut cursor = pt
+            .cursor_mut_for_mapping(&guard, &(0..PAGE_SIZE), 2)
+            .unwrap();
+        let prop = PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback);
+        // SAFETY: The test table is never activated. The range check must
+        // reject the item before publishing any PTE.
+        unsafe { cursor.map((page_size::<TestPtConfig>(2), 2, prop)) };
+    }
+
+    #[ktest]
+    #[should_panic(expected = "mapping level exceeds cursor lock root")]
+    fn huge_mapping_requires_adequate_lock_root() {
+        let pt = PageTable::<TestPtConfig>::empty();
+        let guard = disable_preempt();
+        let size = page_size::<TestPtConfig>(2);
+        // Ordinary cursors retain their existing deepest-root semantics.
+        let mut cursor = pt.cursor_mut(&guard, &(0..size)).unwrap();
+        let prop = PageProperty::new_user(PageFlags::RW, CachePolicy::Writeback);
+        // SAFETY: The test table is never activated. The lock-root check must
+        // reject the item before popping the only locked path entry.
+        unsafe { cursor.map((size, 2, prop)) };
+    }
 
     #[ktest]
     fn mixed_granularity_map_unmap() {

@@ -5,16 +5,20 @@
 use super::KerneletConfig;
 use crate::{
     Error,
-    kernelet::{abi::BootArgs, host_image::RegisteredImage},
+    kernelet::{
+        abi::{BootArgs, CpuSlot},
+        host_image::RegisteredImage,
+    },
     mm::PAGE_SIZE,
     util::id_set::Id,
 };
 
 pub(super) fn validate_config(config: &KerneletConfig<'_>) -> crate::Result<()> {
-    config.budget.validate()?;
+    config.budget.validate().map_err(|_| Error::InvalidArgs)?;
     if config.cpus.is_empty()
         || config.cpus.count() > super::super::abi::MAX_VCPUS
         || (config.max_tasks as usize) < config.cpus.count()
+        || config.max_tasks > super::MAX_TASKS
         || config.devices.len() > 64
     {
         return Err(Error::InvalidArgs);
@@ -27,6 +31,7 @@ pub(super) fn validate_config(config: &KerneletConfig<'_>) -> crate::Result<()> 
             .ok_or(Error::InvalidArgs)?;
         if device.kind != 1
             || device.irq < 32
+            || device.irq == u8::MAX
             || device.vcpu as usize >= config.cpus.count()
             || device.reg_bytes == 0
             || !device.reg_bytes.is_multiple_of(PAGE_SIZE as u32)
@@ -52,6 +57,7 @@ pub(super) fn validate_config(config: &KerneletConfig<'_>) -> crate::Result<()> 
 pub(super) fn boot_args(
     image: &RegisteredImage,
     config: &KerneletConfig<'_>,
+    identity: CpuSlot,
 ) -> crate::Result<BootArgs> {
     let cpu_local_bytes =
         image.entry_table().cpu_local_end_offset - image.entry_table().cpu_local_start_offset;
@@ -61,14 +67,13 @@ pub(super) fn boot_args(
     }
     Ok(BootArgs {
         size: size_of::<BootArgs>() as u32,
-        generation: 1,
+        generation: identity.generation,
         source_hash: image.entry_table().source_hash,
         tsc_freq_hz: crate::arch::tsc_freq(),
-        kernelet: 1,
+        kernelet: identity.kernelet,
         num_vcpus: config.cpus.count() as u16,
         vcpu_host_cpu,
-        cpu_slot_gs_offset: crate::cpu::host_cpu_gs_offset(),
-        host_preempt_gs_offset: crate::task::carrier_preempt::gs_offset(),
+        cpu_slot_gs_offset: super::super::vcpu_slot::gs_offset(),
         cpu_local_replica_bytes: cpu_local_bytes.try_into().map_err(|_| Error::InvalidArgs)?,
         linear_map_base: crate::mm::kspace::LINEAR_MAPPING_BASE_VADDR as u64,
         kernel_half_entries: kernel_half_entries(),
@@ -76,6 +81,7 @@ pub(super) fn boot_args(
         grant_table: 0,
         meta_section_index: 0,
         meta_block_sections: 0,
+        meta_grain_bitmap: 0,
         max_meta_sections: config.max_meta_sections,
         clock_page: 0,
         info_page: 0,
@@ -128,5 +134,48 @@ fn hex_digit(digit: u8) -> Option<u8> {
         b'a'..=b'f' => Some(digit - b'a' + 10),
         b'A'..=b'F' => Some(digit - b'A' + 10),
         _ => None,
+    }
+}
+
+#[cfg(ktest)]
+mod test {
+    use super::*;
+    use crate::{
+        cpu::{CpuId, CpuSet},
+        kernelet::control::{CpuBudget, KerneletPolicy},
+        prelude::ktest,
+    };
+
+    #[ktest]
+    fn device_vector_255_is_rejected_before_creation() {
+        let mut cpus = CpuSet::new_empty();
+        cpus.add(CpuId::bsp());
+        let device = super::super::DeviceEntry {
+            id: 1,
+            kind: 1,
+            irq: 254,
+            reserved: 0,
+            vcpu: 0,
+            reg_bytes: PAGE_SIZE as u32,
+            device_type: 1,
+            mmio_base: crate::mm::frame::max_paddr() as u64,
+        };
+        let config = |devices| KerneletConfig {
+            cmdline: "",
+            initial_grains: 1,
+            max_grains: 1,
+            max_meta_sections: 1,
+            budget: CpuBudget::default(),
+            policy: KerneletPolicy::default(),
+            max_tasks: 1,
+            devices,
+            cpus: cpus.clone(),
+        };
+        assert!(validate_config(&config(core::slice::from_ref(&device))).is_ok());
+        let reserved_device = super::super::DeviceEntry { irq: 255, ..device };
+        assert_eq!(
+            validate_config(&config(core::slice::from_ref(&reserved_device))),
+            Err(Error::InvalidArgs)
+        );
     }
 }

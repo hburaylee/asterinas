@@ -144,7 +144,8 @@ SQL
 
 The query prints the inserted row, and the integrity check prints `ok`.
 The database is in the Guest's writable overlay and lasts for this sandbox's
-lifetime. Run `exit` to leave Bash.
+lifetime.
+Run `exit` to leave Bash.
 
 When Bash exits, check the container state and delete it:
 

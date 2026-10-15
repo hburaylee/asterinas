@@ -14,6 +14,7 @@
 pub(crate) mod abi;
 pub(crate) mod audit;
 mod elf;
+mod external_sources;
 mod host_audit;
 pub(crate) mod rustc_wrapper;
 mod unsafe_allowlist;
@@ -32,7 +33,10 @@ use crate::{
     arch::Arch,
     base_crate::{BaseCrateType, kernelet_package_name, new_base_crate},
     commands::util::{COMMON_CARGO_ARGS, cargo, profile_name_adapter},
-    config::Config,
+    config::{
+        Config,
+        scheme::{ActionChoice, Build},
+    },
     error::Errno,
     error_msg,
     util::{CrateInfo, DirGuard, get_cargo_metadata},
@@ -80,25 +84,38 @@ impl KerneletImage {
 /// absolute path of the audited artifact.
 pub(crate) fn build_image_if_requested(
     config: &Config,
+    action: ActionChoice,
     target_crate: &CrateInfo,
     osdk_output_directory: &Path,
     cargo_target_directory: &Path,
 ) -> Option<KerneletImage> {
-    if !config.build.kernelet {
+    let build = image_build(config, action);
+    if !build.kernelet {
         return None;
     }
     Some(build_kernelet_image(
         config,
+        build,
         target_crate,
         osdk_output_directory,
         cargo_target_directory,
     ))
 }
 
+// Use the same finalized action options for the Guest and Host builds. The
+// global defaults may differ from action-level profiles, overrides and enablement.
+fn image_build(config: &Config, action: ActionChoice) -> &Build {
+    match action {
+        ActionChoice::Run => &config.run.build,
+        ActionChoice::Test => &config.test.build,
+    }
+}
+
 /// Builds one kernelet image from the same kernel crate the host image is
 /// built from, audits it, and returns the absolute path of the artifact.
 fn build_kernelet_image(
     config: &Config,
+    build: &Build,
     target_crate: &CrateInfo,
     osdk_output_directory: &Path,
     cargo_target_directory: &Path,
@@ -139,7 +156,7 @@ fn build_kernelet_image(
     };
     let _dir_guard = DirGuard::change_dir(&base_crate_path);
     let linked_elf_path = build_kernelet_elf(
-        config,
+        build,
         &target_crate.name,
         &audited_target_directory,
         &guest_build,
@@ -178,7 +195,7 @@ fn build_kernelet_image(
 /// small code model, the generated kernelet linker script, and no unresolved
 /// symbol.
 fn build_kernelet_elf(
-    config: &Config,
+    options: &Build,
     kernel_crate_name: &str,
     cargo_target_directory: &Path,
     build: &GuestBuildContext<'_>,
@@ -221,8 +238,8 @@ fn build_kernelet_elf(
         .arg("--target-dir")
         .arg(cargo_target_directory.as_os_str());
     command.args(COMMON_CARGO_ARGS);
-    command.arg("--profile=".to_string() + &config.build.profile);
-    for override_config in &config.build.override_configs {
+    command.arg("--profile=".to_string() + &options.profile);
+    for override_config in &options.override_configs {
         command.arg("--config").arg(override_config);
     }
     // C code linked into the image must be position-independent too.
@@ -237,7 +254,7 @@ fn build_kernelet_elf(
 
     cargo_target_directory
         .join(Arch::X86_64.triple())
-        .join(profile_name_adapter(&config.build.profile))
+        .join(profile_name_adapter(&options.profile))
         .join(kernelet_package_name(kernel_crate_name))
 }
 
@@ -272,6 +289,7 @@ fn audited_target_directory(cargo_target_directory: &Path) -> PathBuf {
         include_bytes!("mod.rs"),
         include_bytes!("rustc_wrapper.rs"),
         include_bytes!("unsafe_allowlist.rs"),
+        include_bytes!("external_sources.rs"),
         &compiler.stdout,
     ]);
     let fingerprint = hex_encode(&digest[..8]);
@@ -367,5 +385,36 @@ fn collect_files(files: &mut Vec<PathBuf>, directory: &Path) {
         } else {
             files.push(path);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn image_build_uses_selected_action_options_instead_of_global_defaults() {
+        let mut config = Config {
+            work_dir: PathBuf::from("/workspace"),
+            target_arch: Arch::X86_64,
+            build: Build::default(),
+            run: Default::default(),
+            test: Default::default(),
+        };
+        config.run.build.kernelet = true;
+        config.run.build.profile = "release".into();
+        config.run.build.override_configs = vec!["build.jobs=2".into()];
+        config.test.build.profile = "test".into();
+        assert!(!config.build.kernelet);
+        assert!(image_build(&config, ActionChoice::Run).kernelet);
+        assert_eq!(image_build(&config, ActionChoice::Run).profile, "release");
+        assert_eq!(
+            image_build(&config, ActionChoice::Run).override_configs,
+            ["build.jobs=2"]
+        );
+        assert!(!image_build(&config, ActionChoice::Test).kernelet);
+        assert_eq!(image_build(&config, ActionChoice::Test).profile, "test");
+        config.build.kernelet = true;
+        assert!(!image_build(&config, ActionChoice::Test).kernelet);
     }
 }

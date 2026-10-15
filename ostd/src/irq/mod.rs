@@ -78,8 +78,6 @@ mod top_half;
 
 pub use bottom_half::{register_bottom_half_handler_l1, register_bottom_half_handler_l2};
 pub use guard::{DisabledLocalIrqGuard, disable_local};
-#[cfg(not(feature = "kernelet"))]
-pub(crate) use level::INTERRUPT_LEVEL;
 pub use level::InterruptLevel;
 pub use top_half::{IrqCallbackFunction, IrqLine};
 
@@ -93,6 +91,10 @@ pub(crate) fn call_irq_callback_functions(
     hw_irq_line: &HwIrqLine,
     cpu_priv_at_irq: PrivilegeLevel,
 ) {
+    #[cfg(target_arch = "x86_64")]
+    if hw_irq_line.irq_num() == crate::arch::irq::SPURIOUS_VECTOR {
+        return;
+    }
     level::enter(
         move || {
             top_half::process(trap_frame, hw_irq_line);
@@ -102,17 +104,54 @@ pub(crate) fn call_irq_callback_functions(
     );
 }
 
-/// Runs counted virtual timer callbacks at the interrupted task's IRQ level.
+/// Runs a virtual timer interrupt, including its bottom half, at level one.
 #[cfg(feature = "kernelet")]
-pub(crate) fn with_virtual_interrupt_level(f: impl FnOnce(), privilege: PrivilegeLevel) {
-    level::enter(f, privilege);
+pub(crate) fn call_virtual_timer_callback_functions(
+    trap_frame: &TrapFrame,
+    privilege: PrivilegeLevel,
+) {
+    level::enter(|| process_virtual_timer(trap_frame), privilege);
 }
 
-/// Runs a deferred virtual timer callback at the nested interrupt level.
+/// Services queued IPIs while a Guest waits with preemption disabled.
+/// Like a native IPI, this remains independent of the preemption guard. Other
+/// virtual notices and bottom halves are left to their ordinary delivery gate.
 #[cfg(feature = "kernelet")]
-pub(crate) fn with_virtual_l2_level(f: impl FnOnce()) {
+pub(crate) fn call_virtual_ipi_callback_functions() {
+    let _irq = disable_local();
     level::enter(
-        || level::enter(f, PrivilegeLevel::Kernel),
+        crate::smp::do_virtual_inter_processor_call,
         PrivilegeLevel::Kernel,
     );
+}
+
+/// Runs a deferred virtual timer interrupt at the nested interrupt level.
+#[cfg(feature = "kernelet")]
+pub(crate) fn call_virtual_l2_timer_callback_functions(trap_frame: &TrapFrame) {
+    level::enter(
+        || level::enter(|| process_virtual_timer(trap_frame), PrivilegeLevel::Kernel),
+        PrivilegeLevel::Kernel,
+    );
+}
+
+/// Dispatches explicit-owner accounting without pretending it is the running
+/// Task or replaying unrelated timer callbacks on an outgoing Task's behalf.
+#[cfg(any(feature = "kernelet", ktest))]
+pub(crate) fn call_sampled_task_tick_callback_functions(
+    task: &crate::task::Task,
+    privilege: PrivilegeLevel,
+    ticks: u64,
+) {
+    level::enter(
+        || crate::timer::call_sampled_task_callbacks(task, privilege, ticks),
+        privilege,
+    );
+}
+
+#[cfg(feature = "kernelet")]
+fn process_virtual_timer(trap_frame: &TrapFrame) {
+    crate::timer::call_timer_callback_functions(trap_frame);
+    // Virtual line zero is reserved for the timer, independently of the
+    // physical timer vector used by the Host.
+    bottom_half::process(0);
 }

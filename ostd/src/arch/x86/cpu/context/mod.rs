@@ -3,29 +3,31 @@
 //! CPU execution context control.
 
 use alloc::boxed::Box;
-#[cfg(not(feature = "kernelet"))]
 use core::arch::x86_64::{_fxrstor64, _fxsave64, _xrstor64, _xsave64};
 
 use bitflags::bitflags;
 use ostd_pod::{FromZeros, IntoBytes};
 use spin::Once;
+use x86::bits64::segmentation::{rdfsbase, wrfsbase};
 #[cfg(not(feature = "kernelet"))]
-use x86::bits64::segmentation::{rdfsbase, rdgsbase, swapgs, wrfsbase, wrgsbase};
+use x86::bits64::segmentation::{rdgsbase, swapgs, wrgsbase};
+#[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+use x86::msr::{rdmsr, wrmsr};
+/// Saved processor status bits without exposing architecture instruction APIs.
+pub use x86_64::registers::rflags::RFlags;
 use x86_64::registers::{
     control::{Cr0, Cr0Flags},
-    rflags::RFlags,
     xcontrol::XCr0,
 };
 
+#[cfg(kernelet_getpid_profile)]
+use crate::kernelet::getpid_profile as profile;
 #[cfg(not(feature = "kernelet"))]
-use crate::debug;
+use crate::{arch::irq::HwIrqLine, cpu::PrivilegeLevel, irq::call_irq_callback_functions};
 use crate::{
-    arch::{
-        irq::HwIrqLine,
-        trap::{RawUserContext, TrapFrame},
-    },
-    cpu::PrivilegeLevel,
-    irq::{DisabledLocalIrqGuard, call_irq_callback_functions},
+    arch::trap::{RawUserContext, TrapFrame},
+    debug,
+    irq::DisabledLocalIrqGuard,
     mm::Vaddr,
     user::{ReturnReason, UserContextApi, UserContextApiInternal, UserModeHooks},
 };
@@ -59,8 +61,9 @@ pub const USER_MODIFIABLE_RFLAGS: usize = (RFlags::CARRY_FLAG.bits()
     | RFlags::ALIGNMENT_CHECK.bits()
     | RFlags::NESTED_TASK.bits()) as usize;
 
+#[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
 mod kernelet;
-#[cfg(not(feature = "kernelet"))]
+#[cfg(feature = "kernelet-host")]
 pub(crate) use kernelet::run_host_user;
 
 /// Userspace CPU context, including general-purpose registers and exception information.
@@ -85,6 +88,8 @@ impl Default for UserContext {
                 rflags: USER_MODE_INITIAL_RFLAGS,
                 trap_num: 0,
                 error_code: 0,
+                #[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+                fault_addr: 0,
             },
             exception: None,
         }
@@ -119,13 +124,6 @@ pub struct GeneralRegs {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct FsBase(usize);
 
-#[cfg(feature = "kernelet")]
-crate::cpu_local_cell! {
-    static KERNELET_USER_FS_BASE: usize = 0;
-    static KERNELET_USER_GS_BASE: usize = 0;
-    static KERNELET_USER_FAULT_ADDR: usize = 0;
-}
-
 impl FsBase {
     /// Creates a new `FsBase` with the given address.
     pub fn new(addr: usize) -> Self {
@@ -139,30 +137,14 @@ impl FsBase {
 
     /// Saves the current CPU FS base into this struct.
     pub fn save(&mut self) {
-        #[cfg(feature = "kernelet")]
-        {
-            self.0 = KERNELET_USER_FS_BASE.load();
-            return;
-        }
         // SAFETY: Reading the user FS base does not affect kernel code.
-        #[cfg(not(feature = "kernelet"))]
-        {
-            self.0 = unsafe { rdfsbase() as usize };
-        }
+        self.0 = unsafe { rdfsbase() as usize };
     }
 
     /// Loads this struct's FS base onto the CPU.
     pub fn load(&self) {
-        #[cfg(feature = "kernelet")]
-        {
-            KERNELET_USER_FS_BASE.store(self.0);
-            return;
-        }
         // SAFETY: Writing the user FS base does not affect kernel code.
-        #[cfg(not(feature = "kernelet"))]
-        {
-            unsafe { wrfsbase(self.0 as u64) }
-        }
+        unsafe { wrfsbase(self.0 as u64) }
     }
 }
 
@@ -185,8 +167,7 @@ impl GsBase {
     pub fn save(&mut self, _guard: &DisabledLocalIrqGuard) {
         #[cfg(feature = "kernelet")]
         {
-            self.0 = KERNELET_USER_GS_BASE.load();
-            return;
+            self.save_inactive();
         }
         // SAFETY:
         // 1. In these steps, we have disabled the IRQ and are not using the kernel GS base.
@@ -203,8 +184,7 @@ impl GsBase {
     pub fn load(&self, _guard: &DisabledLocalIrqGuard) {
         #[cfg(feature = "kernelet")]
         {
-            KERNELET_USER_GS_BASE.store(self.0);
-            return;
+            self.load_inactive();
         }
         // SAFETY:
         // 1. In these steps, we have disabled the IRQ and are not using the kernel GS base.
@@ -216,7 +196,27 @@ impl GsBase {
             swapgs();
         }
     }
+
+    /// Saves the inactive user GS base without changing the native GS base.
+    #[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+    pub(crate) fn save_inactive(&mut self) {
+        // SAFETY: At CPL 0, the fixed MSR holds the inactive user GS base.
+        // Reading it keeps the active native GS base valid for Host IRQs.
+        self.0 = unsafe { rdmsr(IA32_KERNEL_GS_BASE) as usize };
+    }
+
+    /// Loads the inactive user GS base without changing the native GS base.
+    #[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+    pub(crate) fn load_inactive(&self) {
+        // SAFETY: At CPL 0, writing this fixed MSR changes only the user base
+        // restored by the native entry stubs' next SWAPGS, not the active
+        // kernel GS base used for CPU-local accesses and Host interrupts.
+        unsafe { wrmsr(IA32_KERNEL_GS_BASE, self.0 as u64) };
+    }
 }
+
+#[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+const IA32_KERNEL_GS_BASE: u32 = 0xc000_0102;
 
 /// Architectural CPU exceptions (x86-64 vectors 0-31).
 ///
@@ -293,6 +293,18 @@ pub enum CpuException {
 
 impl CpuException {
     pub(in crate::arch) fn new(trap_num: usize, error_code: usize) -> Option<Self> {
+        Self::from_raw(
+            trap_num,
+            error_code,
+            if trap_num == 14 {
+                x86_64::registers::control::Cr2::read_raw() as usize
+            } else {
+                0
+            },
+        )
+    }
+
+    fn from_raw(trap_num: usize, error_code: usize, fault_addr: usize) -> Option<Self> {
         let exception = match trap_num {
             0 => Self::DivisionError,
             1 => Self::Debug,
@@ -319,16 +331,10 @@ impl CpuException {
                 };
                 Self::GeneralProtectionFault(error_code)
             }
-            14 => {
-                #[cfg(feature = "kernelet")]
-                let page_fault_addr = KERNELET_USER_FAULT_ADDR.load();
-                #[cfg(not(feature = "kernelet"))]
-                let page_fault_addr = x86_64::registers::control::Cr2::read_raw() as usize;
-                Self::PageFault(RawPageFaultInfo {
-                    error_code: PageFaultErrorCode::from_bits(error_code).unwrap(),
-                    addr: page_fault_addr,
-                })
-            }
+            14 => Self::PageFault(RawPageFaultInfo {
+                error_code: PageFaultErrorCode::from_bits(error_code).unwrap(),
+                addr: fault_addr,
+            }),
             // Reserved 15
             16 => Self::X87FloatingPointException,
             17 => Self::AlignmentCheck,
@@ -407,6 +413,7 @@ impl UserContext {
 
 impl UserContextApiInternal for UserContext {
     fn execute<T: UserModeHooks>(&mut self, hooks: &T) -> ReturnReason {
+        #[cfg(not(feature = "kernelet"))]
         const SYSCALL_TRAPNUM: usize = 0x100;
 
         // Return when it is syscall or cpu exception type is Fault or Trap.
@@ -414,52 +421,93 @@ impl UserContextApiInternal for UserContext {
             crate::task::scheduler::might_preempt();
 
             let guard = crate::irq::disable_local();
+            #[cfg(kernelet_getpid_profile)]
+            let hook_span = profile::span(if cfg!(feature = "kernelet") {
+                profile::stage::GUEST_PRE_USER_HOOK
+            } else {
+                profile::stage::NATIVE_PRE_USER_HOOK
+            });
             hooks.pre_user_run(&guard);
+            #[cfg(kernelet_getpid_profile)]
+            let _ = profile::end(hook_span);
             #[cfg(feature = "kernelet")]
-            let pending = kernelet::run_image_user(&mut self.user_context, guard);
-            #[cfg(not(feature = "kernelet"))]
-            self.user_context.run(guard);
+            {
+                use crate::kernelet::abi::{USER_RETURN_EXCEPTION, USER_RETURN_SYSCALL};
 
-            #[cfg(feature = "kernelet")]
-            if pending {
-                crate::arch::irq::enable_local();
-                return ReturnReason::KernelEvent;
+                let reason = kernelet::run_image_user(&mut self.user_context, &guard);
+                // Capture exception details before pending virtual interrupts
+                // can run another task and change this CPU's state.
+                let exception = (reason == USER_RETURN_EXCEPTION).then(|| {
+                    CpuException::from_raw(
+                        self.user_context.trap_num,
+                        self.user_context.error_code,
+                        self.user_context.fault_addr,
+                    )
+                    .expect("user_run returned an exception without a valid trap number")
+                });
+                drop(guard);
+                match reason {
+                    USER_RETURN_SYSCALL => return ReturnReason::UserSyscall,
+                    USER_RETURN_EXCEPTION => {
+                        self.exception = exception;
+                        return ReturnReason::UserException;
+                    }
+                    _ => {}
+                }
             }
 
-            let exception =
-                CpuException::new(self.user_context.trap_num, self.user_context.error_code);
-            match exception {
-                #[cfg(feature = "cvm_guest")]
-                Some(CpuException::VirtualizationException) => {
-                    let ve_handler = VirtualizationExceptionHandler::new();
-                    // Check out the doc of `VirtualizationExceptionHandler::new` to
-                    // see why IRQs must enabled _after_ instantiating a `VirtualizationExceptionHandler`.
-                    crate::arch::irq::enable_local();
-                    ve_handler.handle(self);
-                }
-                Some(exception) if exception.type_().is_fault_or_trap() => {
-                    crate::arch::irq::enable_local();
-                    self.exception = Some(exception);
-                    return ReturnReason::UserException;
-                }
-                Some(exception) => {
-                    panic!(
-                        "Cannot handle user CPU exception: {:?}; trapframe: {:?}",
-                        exception,
-                        self.as_trap_frame()
-                    );
-                }
-                None if self.user_context.trap_num == SYSCALL_TRAPNUM => {
-                    crate::arch::irq::enable_local();
-                    return ReturnReason::UserSyscall;
-                }
-                None => {
-                    call_irq_callback_functions(
-                        &self.as_trap_frame(),
-                        &HwIrqLine::new(self.as_trap_frame().trap_num as u8),
-                        PrivilegeLevel::User,
-                    );
-                    crate::arch::irq::enable_local();
+            #[cfg(not(feature = "kernelet"))]
+            {
+                self.user_context.run(guard);
+                #[cfg(feature = "kernelet-host")]
+                let exception = CpuException::from_raw(
+                    self.user_context.trap_num,
+                    self.user_context.error_code,
+                    self.user_context.fault_addr,
+                );
+                #[cfg(not(feature = "kernelet-host"))]
+                let exception =
+                    CpuException::new(self.user_context.trap_num, self.user_context.error_code);
+                match exception {
+                    #[cfg(feature = "cvm_guest")]
+                    Some(CpuException::VirtualizationException) => {
+                        let ve_handler = VirtualizationExceptionHandler::new();
+                        // Check out the doc of `VirtualizationExceptionHandler::new` to
+                        // see why IRQs must enabled _after_ instantiating a `VirtualizationExceptionHandler`.
+                        crate::arch::irq::enable_local();
+                        ve_handler.handle(self);
+                    }
+                    Some(exception) if exception.type_().is_fault_or_trap() => {
+                        crate::arch::irq::enable_local();
+                        self.exception = Some(exception);
+                        return ReturnReason::UserException;
+                    }
+                    Some(exception) => {
+                        panic!(
+                            "Cannot handle user CPU exception: {:?}; trapframe: {:?}",
+                            exception,
+                            self.as_trap_frame()
+                        );
+                    }
+                    None if self.user_context.trap_num == SYSCALL_TRAPNUM => {
+                        crate::arch::irq::enable_local();
+                        return ReturnReason::UserSyscall;
+                    }
+                    None => {
+                        #[cfg(all(kernelet_getpid_profile, not(feature = "kernelet")))]
+                        let irq_span = {
+                            profile::event(profile::event_id::PHYSICAL_IRQ);
+                            profile::span(profile::stage::HOST_IRQ)
+                        };
+                        call_irq_callback_functions(
+                            &self.as_trap_frame(),
+                            &HwIrqLine::new(self.as_trap_frame().trap_num as u8),
+                            PrivilegeLevel::User,
+                        );
+                        #[cfg(all(kernelet_getpid_profile, not(feature = "kernelet")))]
+                        let _ = profile::end(irq_span);
+                        crate::arch::irq::enable_local();
+                    }
                 }
             }
 
@@ -470,28 +518,34 @@ impl UserContextApiInternal for UserContext {
     }
 
     fn as_trap_frame(&self) -> TrapFrame {
+        self.user_context.as_trap_frame()
+    }
+}
+
+impl RawUserContext {
+    pub(crate) fn as_trap_frame(&self) -> TrapFrame {
         TrapFrame {
-            rax: self.user_context.general.rax,
-            rbx: self.user_context.general.rbx,
-            rcx: self.user_context.general.rcx,
-            rdx: self.user_context.general.rdx,
-            rsi: self.user_context.general.rsi,
-            rdi: self.user_context.general.rdi,
-            rbp: self.user_context.general.rbp,
-            r8: self.user_context.general.r8,
-            r9: self.user_context.general.r9,
-            r10: self.user_context.general.r10,
-            r11: self.user_context.general.r11,
-            r12: self.user_context.general.r12,
-            r13: self.user_context.general.r13,
-            r14: self.user_context.general.r14,
-            r15: self.user_context.general.r15,
-            trap_num: self.user_context.trap_num,
-            error_code: self.user_context.error_code,
-            rip: self.user_context.general.rip,
+            rax: self.general.rax,
+            rbx: self.general.rbx,
+            rcx: self.general.rcx,
+            rdx: self.general.rdx,
+            rsi: self.general.rsi,
+            rdi: self.general.rdi,
+            rbp: self.general.rbp,
+            r8: self.general.r8,
+            r9: self.general.r9,
+            r10: self.general.r10,
+            r11: self.general.r11,
+            r12: self.general.r12,
+            r13: self.general.r13,
+            r14: self.general.r14,
+            r15: self.general.r15,
+            trap_num: self.trap_num,
+            error_code: self.error_code,
+            rip: self.general.rip,
             cs: 0,
-            rflags: self.user_context.rflags,
-            rsp: self.user_context.general.rsp,
+            rflags: self.rflags,
+            rsp: self.general.rsp,
             ss: 0,
         }
     }
@@ -655,54 +709,46 @@ impl FpuContext {
 
     /// Saves CPU's current FPU context to this instance.
     pub fn save(&mut self) {
-        #[cfg(feature = "kernelet")]
-        {
-            let bytes = self.as_bytes_mut();
-            let result = (crate::kernelet::entry::services().fpu_save)(
-                bytes.as_mut_ptr(),
-                bytes.len() as u32,
-            );
-            assert_eq!(result, 0, "kernelet fpu_save failed: {result}");
-            return;
-        }
-        #[cfg(not(feature = "kernelet"))]
-        {
-            let mem_addr = self.as_bytes_mut().as_mut_ptr();
+        let mem_addr = self.as_bytes_mut().as_mut_ptr();
 
-            if XSTATE_MAX_FEATURES.is_completed() {
-                unsafe { _xsave64(mem_addr, XFEATURE_MASK_USER_RESTORE) };
-            } else {
-                unsafe { _fxsave64(mem_addr) };
-            }
-
-            debug!("Save FPU context");
+        #[cfg(kernelet_getpid_profile)]
+        profile::event(profile::event_id::FPU_SAVE);
+        // SAFETY: XSaveArea has the required alignment and size. CPU feature
+        // initialization records whether the Host has enabled XSAVE.
+        if XSTATE_MAX_FEATURES.is_completed() {
+            unsafe { _xsave64(mem_addr, XFEATURE_MASK_USER_RESTORE) };
+            #[cfg(kernelet_rq1_diagnostics)]
+            crate::kernelet::fpu_profile::event(crate::kernelet::fpu_profile::Event::Xsave);
+        } else {
+            unsafe { _fxsave64(mem_addr) };
+            #[cfg(kernelet_rq1_diagnostics)]
+            crate::kernelet::fpu_profile::event(crate::kernelet::fpu_profile::Event::Fxsave);
         }
+
+        debug!("Save FPU context");
     }
 
     /// Loads CPU's FPU context from this instance.
     pub fn load(&self) {
-        #[cfg(feature = "kernelet")]
-        {
-            let bytes = self.as_bytes();
-            let result =
-                (crate::kernelet::entry::services().fpu_load)(bytes.as_ptr(), bytes.len() as u32);
-            assert_eq!(result, 0, "kernelet fpu_load failed: {result}");
-            return;
+        let mem_addr = self.as_bytes().as_ptr();
+
+        #[cfg(kernelet_getpid_profile)]
+        profile::event(profile::event_id::FPU_LOAD);
+        // SAFETY: XSaveArea has the required alignment and size. CPU feature
+        // initialization records the supported state restored by this path.
+        if let Some(xstate_max_features) = XSTATE_MAX_FEATURES.get() {
+            let rs_mask = XFEATURE_MASK_USER_RESTORE & *xstate_max_features;
+
+            unsafe { _xrstor64(mem_addr, rs_mask) };
+            #[cfg(kernelet_rq1_diagnostics)]
+            crate::kernelet::fpu_profile::event(crate::kernelet::fpu_profile::Event::Xrstor);
+        } else {
+            unsafe { _fxrstor64(mem_addr) };
+            #[cfg(kernelet_rq1_diagnostics)]
+            crate::kernelet::fpu_profile::event(crate::kernelet::fpu_profile::Event::Fxrstor);
         }
-        #[cfg(not(feature = "kernelet"))]
-        {
-            let mem_addr = self.as_bytes().as_ptr();
 
-            if let Some(xstate_max_features) = XSTATE_MAX_FEATURES.get() {
-                let rs_mask = XFEATURE_MASK_USER_RESTORE & *xstate_max_features;
-
-                unsafe { _xrstor64(mem_addr, rs_mask) };
-            } else {
-                unsafe { _fxrstor64(mem_addr) };
-            }
-
-            debug!("Load FPU context");
-        }
+        debug!("Load FPU context");
     }
 
     /// Returns the FPU context as a byte slice.
@@ -734,6 +780,8 @@ impl Clone for FpuContext {
                 .copy_from_slice(&self.xsave_area.extended_state_area[..len]);
         }
 
+        #[cfg(kernelet_rq1_diagnostics)]
+        crate::kernelet::fpu_profile::event(crate::kernelet::fpu_profile::Event::Clone);
         Self {
             xsave_area,
             area_size: self.area_size,
@@ -807,7 +855,6 @@ static XSTATE_MAX_FEATURES: Once<u64> = Once::new();
 /// Mask features which are restored when returning to user space.
 ///
 /// X87 | SSE | AVX | OPMASK | ZMM_HI256 | HI16_ZMM
-#[cfg(not(feature = "kernelet"))]
 const XFEATURE_MASK_USER_RESTORE: u64 = 0b1110_0111;
 
 /// The real size in bytes of the XSAVE area containing all states enabled by XCRO | IA32_XSS.
@@ -829,6 +876,7 @@ pub(in crate::arch) fn record_fpu_features() {
     }
 }
 
+#[cfg(feature = "kernelet-host")]
 pub(crate) fn fpu_area_bytes() -> usize {
     XSAVE_AREA_SIZE
         .get()

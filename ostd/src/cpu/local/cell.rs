@@ -82,6 +82,7 @@ pub struct CpuLocalCell<T: 'static>(UnsafeCell<T>);
 
 impl<T: 'static> CpuLocalCell<T> {
     /// Returns this static cell's offset from the architecture CPU-local base.
+    #[cfg(feature = "kernelet-host")]
     pub(crate) fn static_offset(&'static self) -> usize {
         self as *const _ as usize - __cpu_local_start as *const () as usize
     }

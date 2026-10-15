@@ -1,8 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use std::fs;
+use std::{fs, path::Path};
 
-use super::{build::do_cached_build, util::DEFAULT_TARGET_RELPATH};
+use super::{
+    build::do_cached_build,
+    util::{lock_build_directory, resolve_output_directory},
+};
 use crate::{
     base_crate::{BaseCrateType, new_base_crate},
     bundle::{QemuExit, classify_qemu_exit_status},
@@ -14,12 +17,24 @@ use crate::{
 };
 
 pub fn execute_test_command(config: &Config, args: &TestArgs) {
+    let cargo_target_directory = get_target_directory();
+    let osdk_output_directory =
+        resolve_output_directory(args.output_args.output.as_deref(), &cargo_target_directory)
+            .unwrap_or_else(|error| {
+                error_msg!("Failed to resolve the OSDK output directory: {error}");
+                std::process::exit(Errno::Cli as _);
+            });
     let crates = get_current_crates();
     let mut exit_code = 0;
 
     for crate_info in crates {
         std::env::set_current_dir(crate_info.path).unwrap();
-        let qemu_exit = test_current_crate(config, args);
+        let qemu_exit = test_current_crate(
+            config,
+            args,
+            &cargo_target_directory,
+            &osdk_output_directory,
+        );
         exit_code = exit_code.max(match qemu_exit {
             QemuExit::Success => 0,
             QemuExit::Failed => 1,
@@ -32,16 +47,18 @@ pub fn execute_test_command(config: &Config, args: &TestArgs) {
     }
 }
 
-pub fn test_current_crate(config: &Config, args: &TestArgs) -> QemuExit {
+fn test_current_crate(
+    config: &Config,
+    args: &TestArgs,
+    cargo_target_directory: &Path,
+    osdk_output_directory: &Path,
+) -> QemuExit {
     let current_crates = get_current_crates();
     if current_crates.len() != 1 {
         error_msg!("The current directory contains more than one crate");
         std::process::exit(Errno::TooManyCrates as _);
     }
     let current_crate = get_current_crates().remove(0);
-
-    let cargo_target_directory = get_target_directory();
-    let osdk_output_directory = cargo_target_directory.join(DEFAULT_TARGET_RELPATH);
 
     // A special case is that we use OSDK to test the OSDK test runner crate
     // itself. We check it by name.
@@ -56,6 +73,13 @@ pub fn test_current_crate(config: &Config, args: &TestArgs) -> QemuExit {
         false
     };
 
+    let build_lock = lock_build_directory(cargo_target_directory).unwrap_or_else(|error| {
+        error_msg!(
+            "Failed to lock the Cargo target directory {} for the OSDK build: {error}",
+            cargo_target_directory.display()
+        );
+        std::process::exit(Errno::BuildCrate as _);
+    });
     let target_crate_dir = new_base_crate(
         BaseCrateType::Test,
         osdk_output_directory.join(&current_crate.name),
@@ -108,8 +132,8 @@ pub static KTEST_CRATE_WHITELIST: Option<&[&str]> = Some(&{:#?});
     let dir_guard = DirGuard::change_dir(&target_crate_dir);
     let bundle = do_cached_build(
         default_bundle_directory,
-        &osdk_output_directory,
-        &cargo_target_directory,
+        osdk_output_directory,
+        cargo_target_directory,
         config,
         ActionChoice::Test,
         &["--cfg ktest", "-C panic=unwind"],
@@ -119,6 +143,7 @@ pub static KTEST_CRATE_WHITELIST: Option<&[&str]> = Some(&{:#?});
         None,
     );
     drop(dir_guard);
+    drop(build_lock);
 
     let exit_status = bundle.run_qemu_and_wait(config, ActionChoice::Test);
     classify_qemu_exit_status(exit_status)

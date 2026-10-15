@@ -3,6 +3,8 @@
 //! Configure the Global Descriptor Table (GDT).
 
 #[cfg(not(feature = "kernelet"))]
+use alloc::boxed::Box;
+#[cfg(not(feature = "kernelet"))]
 use core::{cell::UnsafeCell, sync::atomic::Ordering};
 use core::{mem::offset_of, sync::atomic::AtomicU64};
 
@@ -43,6 +45,18 @@ pub(super) unsafe fn init_on_cpu() {
     let gdt = GDT.get_on_cpu(CpuId::current_racy());
 
     let tss_ptr = UnsafeCell::raw_get(LOCAL_TSS.as_ptr());
+    // Double fault must be able to enter even when the interrupted stack has
+    // reached its guard page. This CPU owns the stack for its whole lifetime.
+    let stack = Box::leak(alloc::vec![0u8; 32 * 1024].into_boxed_slice());
+    let top = stack.as_mut_ptr().wrapping_add(stack.len()) as u64;
+    let tss = tss_ptr;
+    // SAFETY: Initialization runs once on this CPU before its IDT is loaded.
+    // The packed TSS field is written without creating an unaligned reference.
+    unsafe {
+        core::ptr::addr_of_mut!((*tss).interrupt_stack_table)
+            .cast::<VirtAddr>()
+            .write_unaligned(VirtAddr::new(top));
+    }
 
     // FIXME: The segment limit in the descriptor created by `tss_segment_unchecked` does not
     // include the I/O port bitmap.
@@ -143,23 +157,6 @@ cpu_local! {
         tss0: AtomicU64::new(0), // To be set in `init_on_cpu`.
         tss1: AtomicU64::new(0), // To be set in `init_on_cpu`.
     };
-}
-
-/// Installs the five landing stacks reserved by the image-only IDT.
-///
-/// # Safety
-/// IRQs and preemption must be disabled. Each nonzero top must name a writable
-/// Host-owned stack that remains mapped while the image IDT can be active.
-#[cfg(not(feature = "kernelet"))]
-pub(crate) unsafe fn set_carrier_stacks(tops: [usize; 5]) {
-    let tss = UnsafeCell::raw_get(LOCAL_TSS.as_ptr());
-    // SAFETY: This CPU exclusively owns its packed TSS, and no references to
-    // these hardware IST slots coexist with the unaligned writes.
-    let slots = unsafe { core::ptr::addr_of_mut!((*tss).interrupt_stack_table) }.cast::<VirtAddr>();
-    for (index, top) in tops.into_iter().enumerate() {
-        // SAFETY: Five reserved slots are within the architectural seven-slot array.
-        unsafe { slots.add(index).write_unaligned(VirtAddr::new(top as u64)) };
-    }
 }
 
 // ========= Descriptors =========

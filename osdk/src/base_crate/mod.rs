@@ -57,19 +57,30 @@ fn are_files_identical(file1: &PathBuf, file2: &PathBuf) -> Result<bool> {
 }
 
 fn are_base_crate_reuse_inputs_identical(
+    base_type: BaseCrateType,
     existing_base_crate_path: &Path,
     candidate_base_crate_path: &Path,
 ) -> bool {
-    ["Cargo.toml", "Cargo.lock.source", "src/main.rs"]
+    let are_files_identical_fn = |file_name: &str| {
+        are_files_identical(
+            &existing_base_crate_path.join(file_name),
+            &candidate_base_crate_path.join(file_name),
+        )
+        .is_ok_and(|is_identical| is_identical)
+    };
+    if !["Cargo.toml", "Cargo.lock.source", "src/main.rs"]
         .into_iter()
-        .chain(LINKER_SCRIPTS.iter().map(|(file_name, _)| *file_name))
-        .all(|file_name| {
-            are_files_identical(
-                &existing_base_crate_path.join(file_name),
-                &candidate_base_crate_path.join(file_name),
-            )
-            .is_ok_and(|is_identical| is_identical)
-        })
+        .all(are_files_identical_fn)
+    {
+        return false;
+    }
+
+    match base_type {
+        BaseCrateType::Kernelet { .. } => are_files_identical_fn(KERNELET_LINKER_SCRIPT),
+        _ => LINKER_SCRIPTS
+            .iter()
+            .all(|(file_name, _)| are_files_identical_fn(file_name)),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -152,7 +163,11 @@ pub fn new_base_crate(
         .to_string(),
     );
     // Check if the existing crate base is reusable.
-    if base_type == BaseCrateType::Run && base_crate_path.exists() {
+    if matches!(
+        base_type,
+        BaseCrateType::Run | BaseCrateType::Kernelet { .. }
+    ) && base_crate_path.exists()
+    {
         // Reuse the existing base crate if it is identical to the new one.
         let base_crate_tmp_path = base_crate_path.join("tmp");
         do_new_base_crate(
@@ -162,8 +177,11 @@ pub fn new_base_crate(
             &dep_crate_path,
             link_unit_test_kernel,
         );
-        let is_reusable =
-            are_base_crate_reuse_inputs_identical(&base_crate_path, &base_crate_tmp_path);
+        let is_reusable = are_base_crate_reuse_inputs_identical(
+            base_type,
+            &base_crate_path,
+            &base_crate_tmp_path,
+        );
         std::fs::remove_dir_all(&base_crate_tmp_path).unwrap();
         if is_reusable {
             info!("Reusing existing base crate");
@@ -520,6 +538,115 @@ mod tests {
     }
 
     #[test]
+    fn unchanged_kernelet_base_crate_preserves_generated_files() {
+        let _guard = BASE_CRATE_TEST_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_crate_path_stem = temp_dir.path().join("generated");
+        let base_type = BaseCrateType::Kernelet {
+            source_hash: [0xab; 32],
+        };
+        let base_crate_path = new_base_crate(
+            base_type,
+            &base_crate_path_stem,
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_MANIFEST_DIR"),
+            false,
+        );
+        let generated_files = [
+            "Cargo.toml",
+            "Cargo.lock",
+            "Cargo.lock.source",
+            "src/main.rs",
+            KERNELET_LINKER_SCRIPT,
+        ];
+        let modified = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1);
+        for file_name in generated_files {
+            fs::File::open(base_crate_path.join(file_name))
+                .unwrap()
+                .set_modified(modified)
+                .unwrap();
+        }
+
+        new_base_crate(
+            base_type,
+            &base_crate_path_stem,
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_MANIFEST_DIR"),
+            false,
+        );
+
+        for file_name in generated_files {
+            assert_eq!(
+                fs::metadata(base_crate_path.join(file_name))
+                    .unwrap()
+                    .modified()
+                    .unwrap(),
+                modified,
+                "unchanged generated file was rewritten: {file_name}"
+            );
+        }
+    }
+
+    #[test]
+    fn changed_kernelet_source_hash_prevents_base_crate_reuse() {
+        let _guard = BASE_CRATE_TEST_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_crate_path_stem = temp_dir.path().join("generated");
+        for source_hash in [[0; 32], [0xab; 32]] {
+            let base_crate_path = new_base_crate(
+                BaseCrateType::Kernelet { source_hash },
+                &base_crate_path_stem,
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_MANIFEST_DIR"),
+                false,
+            );
+
+            assert_eq!(
+                fs::read_to_string(base_crate_path.join(KERNELET_LINKER_SCRIPT)).unwrap(),
+                render_kernelet_linker_script(&source_hash)
+            );
+        }
+    }
+
+    #[test]
+    fn changed_kernelet_inputs_prevent_base_crate_reuse() {
+        let _guard = BASE_CRATE_TEST_LOCK.lock().unwrap();
+        let temp_dir = tempfile::tempdir().unwrap();
+        let base_crate_path_stem = temp_dir.path().join("generated");
+        let base_type = BaseCrateType::Kernelet {
+            source_hash: [0; 32],
+        };
+        let base_crate_path = new_base_crate(
+            base_type,
+            &base_crate_path_stem,
+            env!("CARGO_PKG_NAME"),
+            env!("CARGO_MANIFEST_DIR"),
+            false,
+        );
+
+        for file_name in [
+            "Cargo.toml",
+            "Cargo.lock.source",
+            "src/main.rs",
+            KERNELET_LINKER_SCRIPT,
+        ] {
+            let file_path = base_crate_path.join(file_name);
+            let expected = fs::read(&file_path).unwrap();
+            fs::write(&file_path, "stale contents").unwrap();
+
+            new_base_crate(
+                base_type,
+                &base_crate_path_stem,
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_MANIFEST_DIR"),
+                false,
+            );
+
+            assert_eq!(fs::read(file_path).unwrap(), expected, "{file_name}");
+        }
+    }
+
+    #[test]
     fn changed_workspace_lockfile_prevents_base_crate_reuse() {
         let temp_dir = tempfile::tempdir().unwrap();
         let workspace_root = temp_dir.path().join("workspace");
@@ -541,12 +668,18 @@ mod tests {
         // Cargo's generated package may change its own lockfile without changing
         // the source dependency selection that controls reuse.
         fs::write(existing.join("Cargo.lock"), "resolved generated package").unwrap();
-        assert!(are_base_crate_reuse_inputs_identical(&existing, &candidate));
+        assert!(are_base_crate_reuse_inputs_identical(
+            BaseCrateType::Run,
+            &existing,
+            &candidate
+        ));
 
         fs::write(workspace_root.join("Cargo.lock"), "new reviewed versions").unwrap();
         copy_workspace_lockfile(&workspace_root, &candidate).unwrap();
         assert!(!are_base_crate_reuse_inputs_identical(
-            &existing, &candidate
+            BaseCrateType::Run,
+            &existing,
+            &candidate
         ));
     }
 

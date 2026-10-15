@@ -7,12 +7,16 @@ pub(crate) mod misc;
 mod model;
 mod pty;
 pub mod registry;
+#[cfg(all(kernelet_rq1, not(feature = "kernelet")))]
+pub(crate) mod rq1_ram;
 pub(crate) mod tty;
 
 use device_id::DeviceId;
 pub(crate) use mem::{getrandom, geturandom};
 pub(crate) use pty::{PtyMaster, PtySlave, new_pty_pair};
-#[cfg(not(feature = "kernelet"))]
+#[cfg(feature = "kernelet-host")]
+pub(crate) use registry::block_device_from_file;
+#[cfg(feature = "kernelet-host")]
 pub(crate) use registry::char::register as register_char_device;
 pub(crate) use registry::lookup;
 
@@ -56,6 +60,8 @@ pub enum DeviceType {
 
 pub(crate) fn init_in_first_kthread() {
     model::init_in_first_kthread();
+    #[cfg(all(kernelet_rq1, not(feature = "kernelet")))]
+    rq1_ram::init_in_first_kthread().expect("RQ1 RAM block fixture initialization failed");
     registry::init_in_first_kthread();
     mem::init_in_first_kthread();
     misc::init_in_first_kthread();

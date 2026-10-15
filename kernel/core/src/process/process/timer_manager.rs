@@ -7,9 +7,13 @@ use alloc::{
 };
 
 use id_alloc::IdAlloc;
-use ostd::{cpu::PrivilegeLevel, irq::InterruptLevel, sync::Mutex, timer};
+#[cfg(not(feature = "kernelet"))]
+use ostd::irq::InterruptLevel;
+use ostd::{cpu::PrivilegeLevel, sync::Mutex, timer};
 
 use super::Process;
+#[cfg(feature = "kernelet")]
+use crate::thread::AsThread;
 use crate::{
     fs::cgroupfs::{CpuStatKind, charge_cpu_time},
     process::{
@@ -37,6 +41,7 @@ use crate::{
 /// This function will be invoked at the system timer interrupt, and
 /// invoke the callbacks of expired timers which are based on the updated
 /// CPU clock.
+#[cfg(not(feature = "kernelet"))]
 fn update_cpu_time() {
     // Retrieve some info about the timer interrupt
     let is_kernel_interrupted = {
@@ -54,7 +59,11 @@ fn update_cpu_time() {
     let Some(current_thread) = Thread::current() else {
         return;
     };
-    let Some(posix_thread) = current_thread.as_posix_thread() else {
+    update_thread_cpu_time(&current_thread, is_kernel_interrupted);
+}
+
+fn update_thread_cpu_time(thread: &Thread, is_kernel_interrupted: bool) {
+    let Some(posix_thread) = thread.as_posix_thread() else {
         return;
     };
     let Some(process) = posix_thread.weak_process().upgrade() else {
@@ -87,10 +96,24 @@ fn update_cpu_time() {
     posix_thread.process_expired_timers();
 }
 
+#[cfg(feature = "kernelet")]
+fn update_sampled_cpu_time(task: &ostd::task::Task, privilege: PrivilegeLevel, ticks: u64) {
+    let Some(thread) = task.as_thread() else {
+        // Bootstrap has no POSIX Thread/Process clock to charge.
+        return;
+    };
+    for _ in 0..ticks {
+        update_thread_cpu_time(thread, privilege == PrivilegeLevel::Kernel);
+    }
+}
+
 /// Registers a function to update the CPU clock in processes and
 /// threads during the system timer interrupt.
 pub(super) fn init_on_each_cpu() {
+    #[cfg(not(feature = "kernelet"))]
     timer::register_callback_on_cpu(update_cpu_time);
+    #[cfg(feature = "kernelet")]
+    timer::register_sampled_task_callback_on_cpu(update_sampled_cpu_time);
 }
 
 /// Represents timer resources and utilities for a POSIX process.

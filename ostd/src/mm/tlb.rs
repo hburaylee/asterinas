@@ -3,6 +3,8 @@
 //! TLB flush operations.
 
 use alloc::vec::Vec;
+#[cfg(feature = "kernelet")]
+use core::sync::atomic::fence;
 use core::{mem::MaybeUninit, ops::Range, sync::atomic::Ordering};
 
 use super::{
@@ -25,6 +27,8 @@ pub struct TlbFlusher<'a, G: PinCurrentCpu> {
     pending_ipis: PendingIpis,
     ops_stack: OpsStack,
     ipi_sender: Option<&'static IpiSender>,
+    #[cfg(feature = "kernelet")]
+    user_root: Option<&'a super::VmSpace>,
     _pin_current: G,
 }
 
@@ -42,8 +46,22 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
             pending_ipis: PendingIpis::new_empty(),
             ops_stack: OpsStack::new(),
             ipi_sender: crate::smp::IPI_SENDER.get(),
+            #[cfg(feature = "kernelet")]
+            user_root: None,
             _pin_current: pin_current_guard,
         }
+    }
+
+    /// Creates an image-side flusher for a Host-managed user page-table root.
+    #[cfg(feature = "kernelet")]
+    pub(crate) fn for_user_root(
+        target_cpus: &'a AtomicCpuSet,
+        pin_current_guard: G,
+        vmspace: &'a super::VmSpace,
+    ) -> Self {
+        let mut flusher = Self::new(target_cpus, pin_current_guard);
+        flusher.user_root = Some(vmspace);
+        flusher
     }
 
     /// Issues a pending TLB flush request.
@@ -80,11 +98,37 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
     /// function. But it may not be synchronous. Upon the return of this
     /// function, the TLB entries may not be coherent.
     pub fn dispatch_tlb_flush(&mut self) {
-        let irq_guard = crate::irq::disable_local();
-
         if self.ops_stack.is_empty() {
             return;
         }
+
+        #[cfg(feature = "kernelet")]
+        if let Some(vmspace) = self.user_root {
+            // Register even a previously inactive root: a concurrent first
+            // activation must observe this shootdown's generation or join its
+            // active set. An image vCPU bitmap cannot track either Host CPUs
+            // or carriers entering and leaving the root during a service.
+            let root = vmspace.register_kernelet_root();
+            // Publish the PTE writes before the Host advances the root's
+            // generation and invalidates its active physical CPUs.
+            fence(Ordering::Release);
+            let (start, len) = self.ops_stack.shootdown_range().unwrap();
+            let status = (crate::kernelet::entry::services().tlb_shootdown)(root, start, len);
+            if status != 0 {
+                // Do not unwind and retire frames while stale translations
+                // remain usable by another carrier.
+                crate::kernelet::entry::stop_panic(format_args!(
+                    "Host refused a user-root TLB shootdown: {status}"
+                ));
+            }
+            // The Host service waits for remote acknowledgements and the
+            // current carrier reloads CR3 on return. Retire frames only after
+            // this synchronous invalidation, retaining the RCU grace period.
+            self.ops_stack.clear_without_flush();
+            return;
+        }
+
+        let irq_guard = crate::irq::disable_local();
 
         // `Release` to make sure our modification on the PT is visible to CPUs
         // that are going to activate the PT.
@@ -248,6 +292,26 @@ cpu_local! {
     static FLUSH_OPS: SpinLock<OpsStack, LocalIrqDisabled> = SpinLock::new(OpsStack::new());
 }
 
+/// Queues one operation on each physical CPU and dispatches the callbacks.
+#[cfg(feature = "kernelet-host")]
+pub(crate) fn dispatch_tlb_flush_on_cpus(
+    targets: &crate::cpu::CpuSet,
+    op: TlbFlushOp,
+    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))] request: Option<
+        &crate::kernelet::tlb_profile::Request,
+    >,
+) -> PendingIpis {
+    for cpu in targets.iter() {
+        let mut queue = FLUSH_OPS.get_on_cpu(cpu).lock();
+        queue.push(op.clone(), None);
+        #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
+        if let Some(request) = request {
+            queue.flush_tokens.push(request.token());
+        }
+    }
+    crate::smp::inter_processor_call(targets, do_remote_flush)
+}
+
 fn do_remote_flush() {
     // No races because we are in IRQs or have disabled preemption.
     let current_cpu = crate::cpu::CpuId::current_racy();
@@ -259,7 +323,22 @@ fn do_remote_flush() {
         core::mem::swap(&mut *op_queue, &mut new_op_queue);
     }
     // Unlock the locks quickly to avoid contention.
+    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
+    let tokens = core::mem::replace(
+        &mut new_op_queue.flush_tokens,
+        crate::kernelet::tlb_profile::FlushTokens::new(),
+    );
+    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
+    let kind = if new_op_queue.is_empty() {
+        None
+    } else if new_op_queue.need_flush_all() {
+        Some(crate::kernelet::tlb_profile::BatchFlushKind::FullNonGlobal)
+    } else {
+        Some(crate::kernelet::tlb_profile::BatchFlushKind::Ranges)
+    };
     new_op_queue.flush_all();
+    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
+    tokens.complete(current_cpu, kind);
 }
 
 /// If the number of pending pages to flush exceeds this threshold, we flush all the
@@ -280,6 +359,9 @@ struct OpsStack {
     /// The elements cannot be modified after being pushed. And they must be
     /// dropped after the RCU grace period and the TLB flushes.
     frame_keeper: Vec<Frame<dyn AnyFrameMeta>>,
+    // Only physical queues receive tokens; native source batches have none.
+    #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
+    flush_tokens: crate::kernelet::tlb_profile::FlushTokens,
 }
 
 impl OpsStack {
@@ -289,6 +371,8 @@ impl OpsStack {
             num_ops: 0,
             num_pages_to_flush: 0,
             frame_keeper: Vec::new(),
+            #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
+            flush_tokens: crate::kernelet::tlb_profile::FlushTokens::new(),
         }
     }
 
@@ -298,6 +382,32 @@ impl OpsStack {
 
     fn need_flush_all(&self) -> bool {
         self.num_pages_to_flush == u32::MAX
+    }
+
+    /// Encodes a batch as at most one Host request. Small batches use their
+    /// covering range; fragmented or large batches flush all non-global entries.
+    #[cfg(any(feature = "kernelet", ktest))]
+    fn shootdown_range(&self) -> Option<(u64, u64)> {
+        if self.is_empty() {
+            return None;
+        }
+        if self.need_flush_all() || self.num_ops > 4 {
+            return Some((0, u64::MAX));
+        }
+
+        let mut start = Vaddr::MAX;
+        let mut end = 0;
+        for op in self.ops_iter() {
+            let op_start = op.0 & !TlbFlushOp::FLUSH_RANGE_NPAGES_MASK;
+            let op_end = op_start + op.num_pages() as usize * PAGE_SIZE;
+            start = start.min(op_start);
+            end = end.max(op_end);
+        }
+        if (end - start) / PAGE_SIZE >= FLUSH_ALL_PAGES_THRESHOLD {
+            Some((0, u64::MAX))
+        } else {
+            Some((start as u64, (end - start) as u64))
+        }
     }
 
     fn push(&mut self, op: TlbFlushOp, drop_after_flush: Option<RcuDrop<Frame<dyn AnyFrameMeta>>>) {
@@ -382,5 +492,65 @@ impl Drop for OpsStack {
         if !self.frame_keeper.is_empty() {
             let _ = RcuDrop::new(core::mem::take(&mut self.frame_keeper));
         }
+    }
+}
+
+#[cfg(ktest)]
+mod test {
+    use super::{FLUSH_ALL_PAGES_THRESHOLD, OpsStack, PAGE_SIZE, TlbFlushOp};
+    use crate::prelude::ktest;
+
+    #[ktest]
+    fn shootdown_preserves_empty_and_single_range() {
+        let mut ops = OpsStack::new();
+        assert_eq!(ops.shootdown_range(), None);
+
+        let start = 3 * PAGE_SIZE;
+        ops.push(TlbFlushOp::for_range(start..start + 2 * PAGE_SIZE), None);
+        assert_eq!(
+            ops.shootdown_range(),
+            Some((start as u64, 2 * PAGE_SIZE as u64))
+        );
+
+        ops.clear_without_flush();
+        assert_eq!(ops.shootdown_range(), None);
+    }
+
+    #[ktest]
+    fn shootdown_batches_up_to_four_operations() {
+        let mut ops = OpsStack::new();
+        for page in [5, 1, 3, 2] {
+            ops.push(TlbFlushOp::for_single(page * PAGE_SIZE), None);
+        }
+        assert_eq!(
+            ops.shootdown_range(),
+            Some((PAGE_SIZE as u64, 5 * PAGE_SIZE as u64))
+        );
+
+        ops.push(TlbFlushOp::for_single(4 * PAGE_SIZE), None);
+        assert_eq!(ops.shootdown_range(), Some((0, u64::MAX)));
+    }
+
+    #[ktest]
+    fn shootdown_caps_sparse_and_large_ranges() {
+        let mut ops = OpsStack::new();
+        ops.push(TlbFlushOp::for_single(0), None);
+        ops.push(
+            TlbFlushOp::for_single((FLUSH_ALL_PAGES_THRESHOLD - 1) * PAGE_SIZE),
+            None,
+        );
+        assert_eq!(ops.shootdown_range(), Some((0, u64::MAX)));
+
+        ops.clear_without_flush();
+        let range_end = (FLUSH_ALL_PAGES_THRESHOLD - 1) * PAGE_SIZE;
+        ops.push(TlbFlushOp::for_range(0..range_end), None);
+        assert_eq!(ops.shootdown_range(), Some((0, range_end as u64)));
+
+        ops.push(TlbFlushOp::for_single(range_end), None);
+        assert_eq!(ops.shootdown_range(), Some((0, u64::MAX)));
+
+        ops.clear_without_flush();
+        ops.push(TlbFlushOp::for_all(), None);
+        assert_eq!(ops.shootdown_range(), Some((0, u64::MAX)));
     }
 }

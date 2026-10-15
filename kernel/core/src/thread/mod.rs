@@ -51,14 +51,15 @@ fn post_schedule_handler() {
     if let Some(thread_local) = task.as_thread_local() {
         let vmar = thread_local.vmar().borrow();
         if let Some(vmar) = vmar.as_ref() {
-            vmar.vm_space().activate()
+            vmar.vm_space().activate();
+            return;
         }
-    } else if let Some(vmar) = task
-        .as_kernel_thread()
-        .and_then(|kernel_thread| kernel_thread.vmar())
-    {
-        vmar.vm_space().activate();
     }
+    if let Some(vmar) = task.as_kernel_thread().and_then(|thread| thread.vmar()) {
+        vmar.vm_space().activate();
+        return;
+    }
+    ostd::mm::VmSpace::deactivate();
 }
 
 pub(super) fn init() {

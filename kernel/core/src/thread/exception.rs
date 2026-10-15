@@ -89,3 +89,19 @@ pub(super) fn page_fault_handler(info: &CpuException) -> Result<(), ()> {
         handle_page_fault_from_vmar(vmar, &page_fault_info)
     }
 }
+
+/// Shares OSTD's one-shot fault resolver across Native core ktests.
+#[cfg(all(ktest, not(feature = "kernelet")))]
+pub(crate) mod fault_test {
+    use core::sync::atomic::{AtomicUsize, Ordering};
+
+    static PAGE_FAULTS: AtomicUsize = AtomicUsize::new(0);
+
+    pub(crate) fn count() -> usize {
+        ostd::mm::fault::inject_user_page_fault_handler(|_| {
+            PAGE_FAULTS.fetch_add(1, Ordering::Relaxed);
+            Err(())
+        });
+        PAGE_FAULTS.load(Ordering::Relaxed)
+    }
+}

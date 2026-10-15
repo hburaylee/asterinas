@@ -117,6 +117,10 @@ fn bsp_idle_loop() {
         ostd::task::halt_cpu();
     }
 
+    #[cfg(feature = "kernelet")]
+    ostd::power::exit_with_code(init_process.status().exit_code());
+
+    #[cfg(not(feature = "kernelet"))]
     panic!(
         "The init process terminates with code {:?}",
         init_process.status().exit_code()

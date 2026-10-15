@@ -7,12 +7,17 @@
 
 extern crate alloc;
 
+#[cfg(not(feature = "kernelet"))]
 use alloc::sync::Arc;
+#[cfg(not(feature = "kernelet"))]
 use core::time::Duration;
 
 pub use clocksource::{ClockSource, Instant};
+#[cfg(not(feature = "kernelet"))]
 use component::{ComponentInitError, init_component};
+#[cfg(not(feature = "kernelet"))]
 use rtc::Driver;
+#[cfg(not(feature = "kernelet"))]
 use spin::Once;
 
 // Set this crate's log prefix for `ostd::log`.
@@ -23,19 +28,33 @@ macro_rules! __log_prefix {
 }
 
 mod clocksource;
+#[cfg(not(feature = "kernelet"))]
 mod rtc;
+#[cfg(not(feature = "kernelet"))]
 mod tsc;
 
+#[cfg(not(feature = "kernelet"))]
 pub static VDSO_DATA_HIGH_RES_UPDATE_FN: Once<fn(Instant, u64)> = Once::new();
 
+#[cfg(not(feature = "kernelet"))]
 static RTC_DRIVER: Once<Arc<dyn Driver + Send + Sync>> = Once::new();
 
+#[cfg(not(feature = "kernelet"))]
 #[init_component]
 fn time_init() -> Result<(), ComponentInitError> {
     let rtc = rtc::init_rtc_driver();
     RTC_DRIVER.call_once(|| rtc);
     tsc::init();
     Ok(())
+}
+
+/// Initializes the real RTC and TSC clocksource once for Host kernel tests.
+///
+/// The OSDK test runner initializes OSTD but does not run component bootstrap.
+#[cfg(all(ktest, not(feature = "kernelet")))]
+pub fn init_for_ktest() {
+    static INIT: Once<()> = Once::new();
+    INIT.call_once(|| time_init().expect("cannot initialize the time component for ktests"));
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -66,20 +85,24 @@ impl From<chrono::NaiveDateTime> for SystemTime {
     }
 }
 
+#[cfg(not(feature = "kernelet"))]
 static START_TIME: Once<SystemTime> = Once::new();
 
 /// Returns the `START_TIME`, which is the system time when calibrating.
+#[cfg(not(feature = "kernelet"))]
 pub fn read_start_time() -> SystemTime {
     *START_TIME.get().unwrap()
 }
 
 /// Returns the monotonic time from the TSC clocksource.
+#[cfg(not(feature = "kernelet"))]
 pub fn read_monotonic_time() -> Duration {
     let instant = tsc::read_instant();
     Duration::new(instant.secs(), instant.nanos())
 }
 
 /// Returns the default (TSC) clocksource.
+#[cfg(not(feature = "kernelet"))]
 pub fn default_clocksource() -> Arc<ClockSource> {
     tsc::CLOCK.get().unwrap().clone()
 }

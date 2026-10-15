@@ -173,7 +173,7 @@ impl Bundle {
 
         // Compare the manifest with the run configuration except the initramfs and the boot method.
         if self_action.grub != config_action.grub
-            || self_action.qemu != config_action.qemu
+            || !self_action.qemu.is_bundle_compatible(&config_action.qemu)
             || self_action.build != config_action.build
             || self_action.boot.kcmdline != config_action.boot.kcmdline
         {

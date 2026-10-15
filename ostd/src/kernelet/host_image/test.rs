@@ -18,9 +18,9 @@ use crate::{mm::kspace::MappedItemRef, prelude::*, task::disable_preempt};
 /// Image offsets used by the synthetic image below.
 const TEXT_VADDR: u64 = ENTRY_TABLE_OFFSET;
 const CODE_VADDR: u64 = TEXT_VADDR + ENTRY_TABLE_SIZE;
-const RELA_VADDR: u64 = CODE_VADDR + 8;
+const RELA_VADDR: u64 = CODE_VADDR + 16;
 const DYN_VADDR: u64 = RELA_VADDR + RELA_ENTRY_SIZE;
-const TEXT_FILE_BYTES: u64 = HUGE_PAGE_SIZE_U64 + 184;
+const TEXT_FILE_BYTES: u64 = HUGE_PAGE_SIZE_U64 + ENTRY_TABLE_SIZE + 104;
 const RODATA_VADDR: u64 = 3 * HUGE_PAGE_SIZE_U64;
 const DATA_VADDR: u64 = 5 * HUGE_PAGE_SIZE_U64;
 
@@ -126,8 +126,14 @@ fn test_image(reloc_info: u64, reloc_target: u64) -> Vec<u8> {
     bytes.extend_from_slice(&[0u8; 32]); // source_hash
     push_u64(&mut bytes, 0); // ex_table_start_offset
     push_u64(&mut bytes, 0); // ex_table_end_offset
+    push_u64(&mut bytes, CODE_VADDR); // yield_entry_offset
+    push_u64(&mut bytes, CODE_VADDR); // exit_entry_offset
+    push_u64(&mut bytes, CODE_VADDR); // stub_range_start_offset
+    push_u64(&mut bytes, CODE_VADDR + 8); // stub_range_end_offset
+    push_u64(&mut bytes, CODE_VADDR + 8); // cpu_access_start_offset
+    push_u64(&mut bytes, CODE_VADDR + 16); // cpu_access_end_offset
     assert_eq!(bytes.len() as u64, text_offset + ENTRY_TABLE_SIZE);
-    bytes.extend_from_slice(&[0x90; 8]); // code
+    bytes.extend_from_slice(&[0x90; 16]); // trap stub and CPU-local access code
     assert_eq!(bytes.len() as u64, text_offset + RELA_VADDR - TEXT_VADDR);
     push_u64(&mut bytes, reloc_target); // r_offset
     push_u64(&mut bytes, reloc_info); // r_info
@@ -142,7 +148,7 @@ fn test_image(reloc_info: u64, reloc_target: u64) -> Vec<u8> {
     push_u64(&mut bytes, DT_NULL);
     push_u64(&mut bytes, 0);
 
-    assert_eq!(bytes.len() as u64, text_offset + 184);
+    assert_eq!(bytes.len() as u64, text_offset + ENTRY_TABLE_SIZE + 104);
     bytes.resize((text_offset + TEXT_FILE_BYTES) as usize, 0x90);
     bytes.resize(rodata_offset as usize, 0);
     push_u64(&mut bytes, 0x1234_5678_9abc_def0); // read-only data
@@ -165,8 +171,7 @@ fn test_boot_args(num_vcpus: u16) -> BootArgs {
         kernelet: 1,
         num_vcpus,
         vcpu_host_cpu: [0; MAX_VCPUS],
-        cpu_slot_gs_offset: 0,
-        host_preempt_gs_offset: crate::task::carrier_preempt::gs_offset(),
+        cpu_slot_gs_offset: crate::kernelet::vcpu_slot::gs_offset(),
         cpu_local_replica_bytes: 0,
         linear_map_base: crate::mm::kspace::LINEAR_MAPPING_BASE_VADDR as u64,
         kernel_half_entries: [0; 256],
@@ -174,6 +179,7 @@ fn test_boot_args(num_vcpus: u16) -> BootArgs {
         grant_table: 0,
         meta_section_index: 0,
         meta_block_sections: 0,
+        meta_grain_bitmap: 0,
         max_meta_sections: 1,
         clock_page: 0,
         info_page: 0,
@@ -199,11 +205,18 @@ fn instance_relocation_and_sharing() {
     assert_eq!(entry_table.size, ENTRY_TABLE_SIZE);
     assert_eq!(entry_table.vcpu_entry_offset, CODE_VADDR);
     assert_eq!(entry_table.virq_entry_offset, CODE_VADDR);
+    assert_eq!(entry_table.yield_entry_offset, CODE_VADDR);
+    assert_eq!(entry_table.exit_entry_offset, CODE_VADDR);
+    assert_eq!(entry_table.stub_range_start_offset, CODE_VADDR);
+    assert_eq!(entry_table.stub_range_end_offset, CODE_VADDR + 8);
+    assert_eq!(entry_table.cpu_access_start_offset, CODE_VADDR + 8);
+    assert_eq!(entry_table.cpu_access_end_offset, CODE_VADDR + 16);
     assert_eq!(entry_table.source_hash, [0u8; 32]);
     assert_eq!(kind.text_frames.len(), 2);
     let mut prefix = [0xffu8; 8];
     kind.text_frames[0]
         .slice(&(0..PAGE_SIZE))
+        .into_iter()
         .next()
         .unwrap()
         .read_bytes(0, &mut prefix)
@@ -211,6 +224,7 @@ fn instance_relocation_and_sharing() {
     assert_eq!(prefix, [0; 8]);
     kind.text_frames[0]
         .slice(&(PAGE_SIZE..2 * PAGE_SIZE))
+        .into_iter()
         .next()
         .unwrap()
         .read_bytes(0, &mut prefix)
@@ -228,8 +242,10 @@ fn instance_relocation_and_sharing() {
         monotonic_base_ns: first_boot.monotonic_base_ns + 1_000_000_000,
         ..first_boot
     };
-    let first_grant = Grant::new(1, 1, 1).unwrap();
-    let second_grant = Grant::new(1, 1, 1).unwrap();
+    let first_identity = super::super::control::identity::Registration::new().unwrap();
+    let first_grant = Grant::new(first_identity.owner(), 1, 1, 1).unwrap();
+    let second_identity = super::super::control::identity::Registration::new().unwrap();
+    let second_grant = Grant::new(second_identity.owner(), 1, 1, 1).unwrap();
     let first = kind
         .instantiate(&first_boot, "", &[], &first_grant)
         .unwrap();
@@ -238,18 +254,18 @@ fn instance_relocation_and_sharing() {
         .unwrap();
     assert_ne!(first.base_vaddr(), second.base_vaddr());
     // The image uses this published GS offset, not the Host's source object.
-    // Forgetting it in boot-page serialization would write an unrelated cell.
-    let mut preempt_offset = [0u8; 4];
+    // Forgetting it in boot-page serialization would read an unrelated cell.
+    let mut cpu_slot_offset = [0u8; 4];
     first
         ._boot_frame
         .read_bytes(
-            offset_of!(BootArgs, host_preempt_gs_offset),
-            &mut preempt_offset,
+            offset_of!(BootArgs, cpu_slot_gs_offset),
+            &mut cpu_slot_offset,
         )
         .unwrap();
     assert_eq!(
-        u32::from_le_bytes(preempt_offset),
-        first_boot.host_preempt_gs_offset
+        u32::from_le_bytes(cpu_slot_offset),
+        first_boot.cpu_slot_gs_offset
     );
     // The virtual RTC needs both anchors from this instance's boot page.
     for (instance, boot) in [(&first, &first_boot), (&second, &second_boot)] {
@@ -281,6 +297,7 @@ fn instance_relocation_and_sharing() {
             .as_ref()
             .unwrap()
             .slice(&(0..PAGE_SIZE))
+            .into_iter()
             .next()
             .unwrap()
             .read_bytes(0, &mut word)
@@ -288,62 +305,73 @@ fn instance_relocation_and_sharing() {
         assert_eq!(u64::from_le_bytes(word), base as u64 + TEXT_VADDR);
     }
 
-    // Text and rodata frames are shared tracked pages, while each
-    // instance's data pages are private. The gaps are shared read-only
-    // filler pages.
+    // The image uses real 2 MiB leaves, with shared text/rodata, private
+    // writable data, and shared read-only filler for the gaps.
     let guard = disable_preempt();
-    assert!(first.base_vaddr().is_multiple_of(PAGE_SIZE));
-    assert!(second.base_vaddr().is_multiple_of(PAGE_SIZE));
+    assert!(first.base_vaddr().is_multiple_of(HUGE_PAGE_SIZE));
+    assert!(second.base_vaddr().is_multiple_of(HUGE_PAGE_SIZE));
     let text_prop = match first
         .kvirt
         .query(&guard, first.base_vaddr() + TEXT_VADDR as usize)
     {
-        Some(MappedItemRef::Tracked(text_frame, prop)) => {
-            assert_eq!(text_frame.paddr(), kind.text_frames[0].paddr() + PAGE_SIZE);
-            assert_eq!(text_frame.paddr(), {
+        Some(MappedItemRef::Untracked(text_paddr, 2, prop)) => {
+            assert_eq!(text_paddr, kind.text_frames[0].paddr());
+            assert!(text_paddr.is_multiple_of(HUGE_PAGE_SIZE));
+            assert_eq!(text_paddr, {
                 match second
                     .kvirt
                     .query(&guard, second.base_vaddr() + TEXT_VADDR as usize)
                 {
-                    Some(MappedItemRef::Tracked(shared_frame, _)) => shared_frame.paddr(),
-                    _ => panic!("the second instance must map the text"),
+                    Some(MappedItemRef::Untracked(shared_paddr, 2, _)) => shared_paddr,
+                    _ => panic!("the second instance must map a huge text page"),
                 }
             });
             prop
         }
-        _ => panic!("the first instance must map the text"),
+        _ => panic!("the first instance must map a huge text page"),
     };
     assert_eq!(text_prop.flags, PageFlags::RX);
     match first
         .kvirt
         .query(&guard, first.base_vaddr() + HUGE_PAGE_SIZE + PAGE_SIZE)
     {
-        Some(MappedItemRef::Tracked(frame, prop)) => {
-            assert_eq!(frame.paddr(), kind.text_frames[1].paddr() + PAGE_SIZE);
+        Some(MappedItemRef::Untracked(paddr, 2, prop)) => {
+            assert_eq!(paddr, kind.text_frames[1].paddr());
+            assert!(paddr.is_multiple_of(HUGE_PAGE_SIZE));
             assert_eq!(prop.flags, PageFlags::RX);
         }
-        _ => panic!("the interior text chunk must be tracked"),
+        _ => panic!("the interior text chunk must use a huge PTE"),
+    }
+    match first
+        .kvirt
+        .query(&guard, first.base_vaddr() + HUGE_PAGE_SIZE - PAGE_SIZE)
+    {
+        Some(MappedItemRef::Untracked(paddr, 2, _)) => {
+            assert_eq!(paddr, kind.text_frames[0].paddr());
+        }
+        _ => panic!("the last base page of the first text leaf must remain huge"),
     }
 
     let rodata_prop = match first
         .kvirt
         .query(&guard, first.base_vaddr() + RODATA_VADDR as usize)
     {
-        Some(MappedItemRef::Tracked(rodata_frame, prop)) => {
-            assert_eq!(rodata_frame.paddr(), kind.rodata_frames[0].paddr());
+        Some(MappedItemRef::Untracked(rodata_paddr, 2, prop)) => {
+            assert_eq!(rodata_paddr, kind.rodata_frames[0].paddr());
+            assert!(rodata_paddr.is_multiple_of(HUGE_PAGE_SIZE));
             match second
                 .kvirt
                 .query(&guard, second.base_vaddr() + RODATA_VADDR as usize)
             {
-                Some(MappedItemRef::Tracked(shared_frame, shared_prop)) => {
-                    assert_eq!(shared_frame.paddr(), rodata_frame.paddr());
+                Some(MappedItemRef::Untracked(shared_paddr, 2, shared_prop)) => {
+                    assert_eq!(shared_paddr, rodata_paddr);
                     assert_eq!(shared_prop, prop);
                 }
                 _ => panic!("the second instance must share rodata"),
             }
             prop
         }
-        _ => panic!("the read-only segment must be tracked"),
+        _ => panic!("the read-only segment must use a huge PTE"),
     };
     assert_eq!(rodata_prop.flags, PageFlags::R);
 
@@ -351,11 +379,20 @@ fn instance_relocation_and_sharing() {
         .kvirt
         .query(&guard, first.base_vaddr() + DATA_VADDR as usize)
     {
-        Some(MappedItemRef::Tracked(data_frame, prop)) => {
-            assert_ne!(
-                data_frame.paddr(),
-                second._data_segment.as_ref().unwrap().paddr()
-            );
+        Some(MappedItemRef::Untracked(data_paddr, 2, prop)) => {
+            assert_eq!(data_paddr, first._data_segment.as_ref().unwrap().paddr());
+            assert!(data_paddr.is_multiple_of(HUGE_PAGE_SIZE));
+            match second
+                .kvirt
+                .query(&guard, second.base_vaddr() + DATA_VADDR as usize)
+            {
+                Some(MappedItemRef::Untracked(second_paddr, 2, second_prop)) => {
+                    assert_eq!(second_paddr, second._data_segment.as_ref().unwrap().paddr());
+                    assert_ne!(data_paddr, second_paddr);
+                    assert_eq!(second_prop, prop);
+                }
+                _ => panic!("the second instance must map a private huge data page"),
+            }
             prop
         }
         _ => panic!("the first instance must map its data"),
@@ -415,14 +452,43 @@ fn instance_relocation_and_sharing() {
     };
     assert_eq!(first_clock, second_clock);
 
-    let filler_prop = match first
-        .kvirt
-        .query(&guard, first.base_vaddr() + 2 * HUGE_PAGE_SIZE)
-    {
-        Some(MappedItemRef::Tracked(_, prop)) => prop,
-        _ => panic!("the gap must be mapped read-only"),
-    };
-    assert_eq!(filler_prop.flags, PageFlags::R);
+    for offset in [2 * HUGE_PAGE_SIZE, 4 * HUGE_PAGE_SIZE] {
+        match first.kvirt.query(&guard, first.base_vaddr() + offset) {
+            Some(MappedItemRef::Untracked(paddr, 2, prop)) => {
+                assert_eq!(paddr, kind.filler.as_ref().unwrap().paddr());
+                assert!(paddr.is_multiple_of(HUGE_PAGE_SIZE));
+                assert_eq!(prop.flags, PageFlags::R);
+            }
+            _ => panic!("the gap must be mapped by a read-only huge PTE"),
+        }
+    }
+    drop(guard);
+
+    // The registration can disappear before either instance. Each mapping
+    // owns a segment reference independently of the registration and of the
+    // other instance, and releases it after its acknowledged shootdown.
+    let text_frame = kind.text_frames[0]
+        .slice(&(0..PAGE_SIZE))
+        .into_iter()
+        .next()
+        .unwrap();
+    let data_frame = first
+        ._data_segment
+        .as_ref()
+        .unwrap()
+        .slice(&(0..PAGE_SIZE))
+        .into_iter()
+        .next()
+        .unwrap();
+    let text_refs = text_frame.reference_count();
+    assert_eq!(text_refs, 4);
+    drop(kind);
+    assert_eq!(text_frame.reference_count(), text_refs - 1);
+    drop(first);
+    assert_eq!(text_frame.reference_count(), text_refs - 2);
+    assert_eq!(data_frame.reference_count(), 1);
+    drop(second);
+    assert_eq!(text_frame.reference_count(), 1);
 }
 
 #[ktest]
@@ -439,7 +505,8 @@ fn cpu_local_replicas_precede_shared_pages() {
     image[data_file_offset + 16..data_file_offset + 48].copy_from_slice(&seed);
 
     let kind = RegisteredImage::register(&image, [0; 32]).unwrap();
-    let grant = Grant::new(1, 1, 1).unwrap();
+    let identity = super::super::control::identity::Registration::new().unwrap();
+    let grant = Grant::new(identity.owner(), 1, 1, 1).unwrap();
     let instance = kind
         .instantiate(&test_boot_args(2), "", &[], &grant)
         .unwrap();
@@ -479,10 +546,64 @@ fn cpu_local_replicas_precede_shared_pages() {
 }
 
 #[ktest]
+fn invalid_cpu_access_ranges_are_rejected() {
+    for (start, end) in [
+        (0, 0),
+        (CODE_VADDR + 8, CODE_VADDR + 8),
+        (CODE_VADDR + 16, CODE_VADDR + 8),
+        (DATA_VADDR, DATA_VADDR + 8),
+        (CODE_VADDR, CODE_VADDR + 8),
+    ] {
+        let mut image = fixture_image();
+        let table = ENTRY_TABLE_OFFSET as usize;
+        let first = table + offset_of!(EntryTable, cpu_access_start_offset);
+        let last = table + offset_of!(EntryTable, cpu_access_end_offset);
+        image[first..first + 8].copy_from_slice(&start.to_le_bytes());
+        image[last..last + 8].copy_from_slice(&end.to_le_bytes());
+        assert!(matches!(
+            RegisteredImage::register(&image, [0; 32]),
+            Err(Error::InvalidArgs)
+        ));
+    }
+}
+
+#[ktest]
+fn invalid_trap_stub_ranges_are_rejected() {
+    for (start, end) in [
+        (CODE_VADDR, CODE_VADDR),
+        (CODE_VADDR + 1, CODE_VADDR + 8),
+        (CODE_VADDR, DATA_VADDR),
+        (CODE_VADDR + 8, CODE_VADDR),
+    ] {
+        let mut image = test_image(R_X86_64_RELATIVE, DATA_VADDR);
+        let table = ENTRY_TABLE_OFFSET as usize;
+        let start_field = table + offset_of!(EntryTable, stub_range_start_offset);
+        let end_field = table + offset_of!(EntryTable, stub_range_end_offset);
+        image[start_field..start_field + 8].copy_from_slice(&start.to_le_bytes());
+        image[end_field..end_field + 8].copy_from_slice(&end.to_le_bytes());
+        assert_rejected(image);
+    }
+}
+
+#[ktest]
+fn non_executable_redirect_target_is_rejected() {
+    for field in [
+        offset_of!(EntryTable, yield_entry_offset),
+        offset_of!(EntryTable, exit_entry_offset),
+    ] {
+        let mut image = test_image(R_X86_64_RELATIVE, DATA_VADDR);
+        let field = ENTRY_TABLE_OFFSET as usize + field;
+        image[field..field + 8].copy_from_slice(&DATA_VADDR.to_le_bytes());
+        assert_rejected(image);
+    }
+}
+
+#[ktest]
 fn empty_cpu_local_template_needs_no_replica_pages() {
     let image = test_image(R_X86_64_RELATIVE, DATA_VADDR);
     let kind = RegisteredImage::register(&image, [0; 32]).unwrap();
-    let grant = Grant::new(1, 1, 1).unwrap();
+    let identity = super::super::control::identity::Registration::new().unwrap();
+    let grant = Grant::new(identity.owner(), 1, 1, 1).unwrap();
     let instance = kind
         .instantiate(&test_boot_args(2), "", &[], &grant)
         .unwrap();
@@ -493,15 +614,15 @@ fn empty_cpu_local_template_needs_no_replica_pages() {
     );
 }
 
+fn assert_rejected(image: Vec<u8>) {
+    assert!(matches!(
+        RegisteredImage::register(&image, [0; 32]),
+        Err(Error::InvalidArgs)
+    ));
+}
+
 #[ktest]
 fn rejects_malformed_images() {
-    let assert_rejected = |image: Vec<u8>| {
-        assert!(matches!(
-            RegisteredImage::register(&image, [0; 32]),
-            Err(Error::InvalidArgs)
-        ));
-    };
-
     // A wrong ELF magic.
     let mut image = test_image(R_X86_64_RELATIVE, DATA_VADDR);
     image[0] = 0;

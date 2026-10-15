@@ -284,6 +284,12 @@ fn parse_entry_table(
         source_hash,
         ex_table_start_offset: read_field(72)?,
         ex_table_end_offset: read_field(80)?,
+        yield_entry_offset: read_field(88)?,
+        exit_entry_offset: read_field(96)?,
+        stub_range_start_offset: read_field(104)?,
+        stub_range_end_offset: read_field(112)?,
+        cpu_access_start_offset: read_field(120)?,
+        cpu_access_end_offset: read_field(128)?,
     };
 
     if entry_table.size != ENTRY_TABLE_SIZE {
@@ -291,10 +297,47 @@ fn parse_entry_table(
     }
 
     // The fixed entries are code addresses inside the executable segment.
-    for entry in [entry_table.vcpu_entry_offset, entry_table.virq_entry_offset] {
+    for entry in [
+        entry_table.vcpu_entry_offset,
+        entry_table.virq_entry_offset,
+        entry_table.yield_entry_offset,
+        entry_table.exit_entry_offset,
+    ] {
         if text.file_offset_of(entry, 1).is_none() {
             return Err(Error::InvalidArgs);
         }
+    }
+
+    let stub_range = entry_table.stub_range_start_offset..entry_table.stub_range_end_offset;
+    let stub_bytes = stub_range
+        .end
+        .checked_sub(stub_range.start)
+        .filter(|len| *len != 0)
+        .ok_or(Error::InvalidArgs)?;
+    if text.file_offset_of(stub_range.start, stub_bytes).is_none()
+        || [
+            entry_table.virq_entry_offset,
+            entry_table.yield_entry_offset,
+            entry_table.exit_entry_offset,
+        ]
+        .iter()
+        .any(|entry| !stub_range.contains(entry))
+    {
+        return Err(Error::InvalidArgs);
+    }
+
+    let cpu_access = entry_table.cpu_access_start_offset..entry_table.cpu_access_end_offset;
+    let cpu_access_bytes = cpu_access
+        .end
+        .checked_sub(cpu_access.start)
+        .filter(|len| *len != 0)
+        .ok_or(Error::InvalidArgs)?;
+    if text
+        .file_offset_of(cpu_access.start, cpu_access_bytes)
+        .is_none()
+        || (cpu_access.start < stub_range.end && stub_range.start < cpu_access.end)
+    {
+        return Err(Error::InvalidArgs);
     }
 
     // The CPU-local template lives in the private writable segment, inside

@@ -2,16 +2,14 @@
 
 //! The image-side view of Host-published frame grants and metadata.
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use alloc::vec::Vec;
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use super::{
     abi::{GRAIN_SIZE, InfoPage, META_SECTION_BYTES, NO_META_BLOCK, RunDesc},
     entry,
 };
-use crate::{
-    boot::memory_region::{MemoryRegion, MemoryRegionArray, MemoryRegionType},
-    mm::PAGE_SIZE,
-};
+use crate::{boot::memory_region::MemoryRegion, mm::PAGE_SIZE};
 
 const META_SLOT_BYTES: usize = 64;
 
@@ -37,33 +35,24 @@ pub(crate) fn is_dying() -> bool {
     info().dying.load(Ordering::Acquire) != 0
 }
 
-/// Publishes the initial grant and returns its boot-visible memory regions.
-pub(crate) fn init_initial_grant() -> MemoryRegionArray {
+/// Imports the initial grant and returns its boot-visible memory regions.
+pub(crate) fn init_initial_grant() -> Vec<MemoryRegion> {
     let boot = entry::boot_args();
     let info = info();
     let runs = info.runs.load(Ordering::Acquire) as usize;
     assert!(runs <= boot.max_meta_sections as usize * META_SECTION_BYTES / GRAIN_SIZE);
     let ceiling = info.max_paddr.load(Ordering::Acquire) as usize;
     crate::mm::frame::init_kernelet_max_paddr(ceiling);
-    let mut regions = MemoryRegionArray::new();
-
-    for index in 0..runs {
-        let addr =
-            boot as *const _ as usize + boot.grant_table as usize + index * size_of::<RunDesc>();
-        // SAFETY: `runs` is bounded by the one mapped run-table page, and
-        // the Host publishes each initialized descriptor before its count.
-        let run = unsafe { &*(addr as *const RunDesc) };
-        let paddr = run.paddr as usize;
-        let bytes = run.grains as usize * GRAIN_SIZE;
-        assert!(paddr.is_multiple_of(GRAIN_SIZE) && bytes != 0);
-        assert!(paddr.checked_add(bytes).is_some_and(|end| end <= ceiling));
-        crate::mm::frame::allocator::add_kernelet_grant(paddr, bytes);
-        regions
-            .push(MemoryRegion::new(paddr, bytes, MemoryRegionType::Usable))
-            .expect("the grant table exceeds boot memory-region capacity");
-    }
-    *IMPORTED_RUNS.lock() = runs as u32;
-    regions
+    let table = (boot as *const _ as usize + boot.grant_table as usize) as *const RunDesc;
+    // SAFETY: The acquire count covers immutable initialized descriptors, and
+    // the bound above covers the run-table pages pinned by the Host.
+    let runs = unsafe { core::slice::from_raw_parts(table, runs) };
+    super::initial_grant::import(
+        runs,
+        ceiling,
+        crate::mm::frame::allocator::add_kernelet_grant,
+        |count| *IMPORTED_RUNS.lock() = count,
+    )
 }
 
 /// Imports newly published runs once, before exposing them to allocation.
@@ -95,7 +84,7 @@ pub(crate) fn request_grains(bytes: usize) -> bool {
     if grains > super::abi::MAX_GRAINS_PER_REQUEST as usize || is_dying() {
         return false;
     }
-    let result = (entry::services().grains_request)(grains as u32, grains as u32);
+    let result = (entry::services().grains_request)(grains as u32, 1);
     if result > 0 {
         rescan_grants();
         true
@@ -128,28 +117,15 @@ pub(crate) fn has_meta(paddr: usize) -> bool {
     if paddr >= info().max_paddr.load(Ordering::Acquire) as usize {
         return false;
     }
-    let mut granted = false;
-    for run_index in 0..info().runs.load(Ordering::Acquire) as usize {
-        let addr = boot as *const _ as usize
-            + boot.grant_table as usize
-            + run_index * size_of::<RunDesc>();
-        // SAFETY: `runs` is published only after the Host initialized the
-        // pinned descriptor page; entry validation bounds that shared page.
-        let run = unsafe { &*(addr as *const RunDesc) };
-        let start = run.paddr as usize;
-        let end = start + run.grains as usize * GRAIN_SIZE;
-        if (start..end).contains(&paddr) {
-            granted = true;
-            break;
-        }
-    }
-    if !granted {
-        return false;
-    }
     let section = paddr / META_SECTION_BYTES;
     let index = shared_at::<AtomicU32>(boot.meta_section_index + (section * 4) as u32);
     let block = index.load(Ordering::Acquire);
-    block != NO_META_BLOCK && block < info().meta_blocks.load(Ordering::Acquire)
+    if block == NO_META_BLOCK || block >= info().meta_blocks.load(Ordering::Acquire) {
+        return false;
+    }
+    let bitmap = shared_at::<AtomicU64>(boot.meta_grain_bitmap + block * size_of::<u64>() as u32);
+    let grain = (paddr % META_SECTION_BYTES) / GRAIN_SIZE;
+    bitmap.load(Ordering::Acquire) & (1u64 << grain) != 0
 }
 
 /// Recovers a frame address from a slot in the compact metadata window.

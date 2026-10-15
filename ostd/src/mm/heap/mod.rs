@@ -81,7 +81,10 @@ fn slot_size_from_layout(layout: Layout) -> Option<SlotInfo> {
 macro_rules! abort_with_message {
     ($($arg:tt)*) => {
         #[cfg(feature = "kernelet")]
-        crate::kernelet::entry::stop_panic(format_args!($($arg)*));
+        {
+            crate::panic::__stash_message(format_args!($($arg)*));
+            crate::panic::abort();
+        }
         #[cfg(not(feature = "kernelet"))]
         {
             crate::error!($($arg)*);

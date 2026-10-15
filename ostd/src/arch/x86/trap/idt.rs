@@ -13,7 +13,7 @@ use x86_64::{
 
 use crate::mm::Vaddr;
 
-global_asm!(include_str!("trap.S"), interrupt_level = sym crate::irq::INTERRUPT_LEVEL);
+global_asm!(include_str!("trap.S"));
 
 const NUM_INTERRUPTS: usize = 256;
 
@@ -23,14 +23,13 @@ unsafe extern "C" {
 }
 
 static GLOBAL_IDT: Once<[Entry<()>; NUM_INTERRUPTS]> = Once::new();
-static IMAGE_IDT: Once<[Entry<()>; NUM_INTERRUPTS]> = Once::new();
 
 /// Returns the IDT base address.
 pub(in crate::arch) fn idt_base() -> Vaddr {
     GLOBAL_IDT.get().unwrap().as_ptr() as Vaddr
 }
 
-fn build_idt(image: bool) -> [Entry<()>; NUM_INTERRUPTS] {
+fn build_idt() -> [Entry<()>; NUM_INTERRUPTS] {
     let mut idt = [const { Entry::missing() }; NUM_INTERRUPTS];
     // SAFETY: The assembly vector array is immutable and has one entry per vector.
     let vectors = unsafe { &VECTORS };
@@ -40,19 +39,10 @@ fn build_idt(image: bool) -> [Entry<()>; NUM_INTERRUPTS] {
         if intr_no == 3 || intr_no == 4 {
             options.set_privilege_level(PrivilegeLevel::Ring3);
         }
-        if image {
-            let stack = match intr_no {
-                2 => 1,
-                8 => 2,
-                18 => 3,
-                1 => 4,
-                _ => 0,
-            };
-            // SAFETY: The image IDT is installed only after this carrier's five
-            // private TSS landing stacks are populated. NMI, double fault,
-            // machine check and debug have distinct stacks. The entry adapter
-            // restores the native IDT before handlers can enable interrupts.
-            unsafe { options.set_stack_index(stack) };
+        if intr_no == 8 {
+            // SAFETY: Each CPU installs its permanent double-fault stack in
+            // TSS IST slot zero before loading this shared Host IDT.
+            unsafe { options.set_stack_index(0) };
         }
     }
     idt
@@ -65,18 +55,9 @@ fn pointer(idt: &[Entry<()>]) -> DescriptorTablePointer {
     }
 }
 
-/// Returns the native and protected-image IDT descriptors after boot setup.
-pub(crate) fn carrier_idtrs() -> (DescriptorTablePointer, DescriptorTablePointer) {
-    (
-        pointer(GLOBAL_IDT.get().unwrap()),
-        pointer(IMAGE_IDT.get().unwrap()),
-    )
-}
-
-/// Initializes the native IDT and prepares the image-only IST variant.
+/// Initializes the shared Host IDT. Only double fault selects an IST stack.
 pub(super) fn init_on_cpu() {
-    let idt = GLOBAL_IDT.call_once(|| build_idt(false));
-    IMAGE_IDT.call_once(|| build_idt(true));
+    let idt = GLOBAL_IDT.call_once(build_idt);
     // SAFETY: The table is immutable, permanent, and contains the audited handlers.
     unsafe { lidt(&pointer(idt)) };
 }

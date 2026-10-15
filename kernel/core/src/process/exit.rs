@@ -33,6 +33,10 @@ pub(super) fn exit_process(current_process: &Process) {
     //
     // This must happen after `move_children_to_reaper_process`. See the comments in
     // `find_reaper_process` for details.
+    // Deferred physical samples belong to this exiting Task. Settle those
+    // already accumulated before a parent can observe/reap the zombie clock.
+    #[cfg(feature = "kernelet")]
+    ostd::task::Task::current().unwrap().flush_sampled_ticks();
     current_process.status().set_zombie();
 
     current_process.pidfile_pollee.notify(IoEvents::IN);

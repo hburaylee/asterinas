@@ -464,12 +464,13 @@ fn clone_child_task(
         }
 
         // Deal with SETTID/CLEARTID flags
-        clone_parent_settid(child_tid, clone_args.parent_tid, clone_flags)?;
         thread_builder = clone_child_cleartid(thread_builder, clone_args.child_tid, clone_flags);
         thread_builder = clone_child_settid(thread_builder, clone_args.child_tid, clone_flags);
 
-        thread_builder.build()
+        thread_builder.build()?
     };
+    // A quota/allocation failure must leave the parent's TID output untouched.
+    clone_parent_settid(child_tid, clone_args.parent_tid, clone_flags)?;
 
     process
         .tasks()
@@ -602,7 +603,6 @@ fn clone_child_process(
         }
 
         // Deal with SETTID/CLEARTID flags
-        clone_parent_settid(child_tid, clone_args.parent_tid, clone_flags)?;
         child_thread_builder =
             clone_child_cleartid(child_thread_builder, clone_args.child_tid, clone_flags);
         child_thread_builder =
@@ -617,9 +617,11 @@ fn clone_child_process(
             child_sig_dispositions,
             child_user_ns,
             child_thread_builder,
-        )
+        )?
     };
 
+    // The child is still private; a failed TID copy drops its complete Task.
+    clone_parent_settid(child_tid, clone_args.parent_tid, clone_flags)?;
     clone_pidfd(ctx, &child, clone_flags, clone_args.pidfd)?;
 
     if let Some(sig) = clone_args.exit_signal {
@@ -840,7 +842,7 @@ fn create_child_process(
     sig_dispositions: Arc<Mutex<SigDispositions>>,
     user_ns: Arc<UserNamespace>,
     thread_builder: PosixThreadBuilder,
-) -> Arc<Process> {
+) -> Result<Arc<Process>> {
     let child_proc = Process::new(
         pid,
         vmar,
@@ -851,10 +853,12 @@ fn create_child_process(
         user_ns,
     );
 
-    let child_task = thread_builder.process(Arc::downgrade(&child_proc)).build();
+    let child_task = thread_builder
+        .process(Arc::downgrade(&child_proc))
+        .build()?;
     child_proc.tasks().lock().insert(child_task).unwrap();
 
-    child_proc
+    Ok(child_proc)
 }
 
 fn set_parent_and_group(clone_flags: CloneFlags, parent: &Arc<Process>, child: &Arc<Process>) {

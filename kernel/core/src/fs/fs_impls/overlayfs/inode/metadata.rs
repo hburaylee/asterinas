@@ -2,7 +2,7 @@
 
 //! The metadata-mutation entries.
 //!
-//! This module hosts the six metadata setters: `set_mode`/`set_owner`/
+//! This module hosts the metadata setters: `set_mode`/`set_owner`/
 //! `set_group` (chmod/chown) and `set_atime`/`set_mtime`/`set_ctime`
 //! (utimes). Every entry ends in the writable take point
 //! ([`OverlayInode::writable_real_object`]): the read-only gate, the copy-up
@@ -29,6 +29,19 @@ use crate::{
 };
 
 impl OverlayInode {
+    pub(super) fn set_times_impl(
+        &self,
+        self_dentry: &Dentry,
+        atime: Option<Duration>,
+        mtime: Option<Duration>,
+        ctime: Duration,
+    ) -> Result<()> {
+        let upper = self.writable_real_object(self_dentry)?;
+        upper
+            .real_inode()
+            .set_times(upper.dentry(), atime, mtime, ctime)
+    }
+
     pub(super) fn set_mode_impl(&self, self_dentry: &Dentry, mode: InodeMode) -> Result<()> {
         let upper = self.writable_real_object(self_dentry)?;
         upper.real_inode().set_mode(upper.dentry(), mode)

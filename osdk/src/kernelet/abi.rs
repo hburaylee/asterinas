@@ -16,7 +16,7 @@ pub(crate) const ENTRY_TABLE_OFFSET: u64 = 0x1000;
 /// `ostd::kernelet::abi::EntryTable`.
 pub(crate) mod entry_table {
     /// The table size in bytes that the OSTD ABI fixes.
-    pub(crate) const SIZE: u64 = 88;
+    pub(crate) const SIZE: u64 = 136;
 
     /// The byte offset of the `size` field.
     pub(crate) const SIZE_FIELD_OFFSET: usize = 0;
@@ -34,6 +34,18 @@ pub(crate) mod entry_table {
     pub(crate) const EX_TABLE_START_OFFSET: usize = 72;
     /// The byte offset of the `ex_table_end_offset` field.
     pub(crate) const EX_TABLE_END_OFFSET: usize = 80;
+    /// The byte offset of the `yield_entry_offset` field.
+    pub(crate) const YIELD_ENTRY_OFFSET: usize = 88;
+    /// The byte offset of the `exit_entry_offset` field.
+    pub(crate) const EXIT_ENTRY_OFFSET: usize = 96;
+    /// The byte offset of the `stub_range_start_offset` field.
+    pub(crate) const STUB_RANGE_START_OFFSET: usize = 104;
+    /// The byte offset of the `stub_range_end_offset` field.
+    pub(crate) const STUB_RANGE_END_OFFSET: usize = 112;
+    /// The byte offset of the `cpu_access_start_offset` field.
+    pub(crate) const CPU_ACCESS_START_OFFSET: usize = 120;
+    /// The byte offset of the `cpu_access_end_offset` field.
+    pub(crate) const CPU_ACCESS_END_OFFSET: usize = 128;
 }
 
 #[cfg(test)]
@@ -53,6 +65,12 @@ mod tests {
             (entry_table::SOURCE_HASH_OFFSET, 32),
             (entry_table::EX_TABLE_START_OFFSET, 8),
             (entry_table::EX_TABLE_END_OFFSET, 8),
+            (entry_table::YIELD_ENTRY_OFFSET, 8),
+            (entry_table::EXIT_ENTRY_OFFSET, 8),
+            (entry_table::STUB_RANGE_START_OFFSET, 8),
+            (entry_table::STUB_RANGE_END_OFFSET, 8),
+            (entry_table::CPU_ACCESS_START_OFFSET, 8),
+            (entry_table::CPU_ACCESS_END_OFFSET, 8),
         ];
         for pair in fields.windows(2) {
             assert_eq!(

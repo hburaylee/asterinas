@@ -3,7 +3,7 @@
 use super::{allocator::FrameAllocOptions, *};
 use crate::{
     impl_frame_meta_for, impl_untyped_frame_meta_for,
-    mm::{HasPaddrRange, Split, io::util::HasVmReaderWriter},
+    mm::{HasPaddrRange, Split, frame::segment::USegment, io::util::HasVmReaderWriter},
     prelude::*,
 };
 
@@ -20,6 +20,28 @@ struct MockUFrameMeta {
     value: u32,
 }
 impl_untyped_frame_meta_for!(MockUFrameMeta);
+
+#[ktest]
+fn exhausted_segment_iterator_keeps_owned_metadata_valid() {
+    let segment = FrameAllocOptions::new()
+        .alloc_segment_with(1, |_| MockFrameMeta { value: 42 })
+        .unwrap();
+    let retained = segment.clone().into_iter().next().unwrap();
+    let erased: Segment<dyn AnyFrameMeta> = segment.into();
+    // Exhaustion belongs to the consuming iterator, never to a Segment handle.
+    let mut consumed = erased.into_iter();
+    assert_eq!(consumed.len(), 1);
+    let frame = consumed.next().unwrap();
+    assert_eq!(frame.paddr(), retained.paddr());
+    assert_eq!(retained.reference_count(), 2);
+    assert_eq!(consumed.len(), 0);
+    assert!(consumed.next().is_none());
+    drop(consumed);
+    assert_eq!(retained.reference_count(), 2);
+    drop(frame);
+    assert_eq!(retained.reference_count(), 1);
+    assert_eq!(retained.meta().value, 42);
+}
 
 // Frame allocation and management tests
 mod frame {
@@ -307,11 +329,11 @@ mod segment {
     }
 
     #[ktest]
-    #[should_panic]
     fn max_segment_creation() {
-        // Upstream FrameAllocator panics when attempting to allocate a segment with usize::MAX frames
-        let max_frames = usize::MAX;
-        let _ = FrameAllocOptions::new().alloc_segment(max_frames);
+        assert!(matches!(
+            FrameAllocOptions::new().alloc_segment(usize::MAX),
+            Err(Error::Overflow)
+        ));
     }
 
     #[ktest]

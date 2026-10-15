@@ -45,7 +45,11 @@ pub(super) struct ProgramHeader {
 
 impl ProgramHeader {
     pub fn covers_vaddr_range(&self, start: u64, end: u64) -> bool {
-        self.vaddr <= start && end <= self.vaddr.saturating_add(self.memsz)
+        self.vaddr <= start
+            && self
+                .vaddr
+                .checked_add(self.memsz)
+                .is_some_and(|limit| end <= limit)
     }
 }
 
@@ -141,8 +145,11 @@ impl<'a> ElfImage<'a> {
     }
 
     fn slice(&self, offset: usize, len: usize) -> Result<&'a [u8], String> {
+        let end = offset
+            .checked_add(len)
+            .ok_or_else(|| format!("file range overflows at offset {offset:#x}"))?;
         self.bytes
-            .get(offset..offset + len)
+            .get(offset..end)
             .ok_or_else(|| format!("the file is truncated at offset {offset:#x}"))
     }
 
@@ -159,7 +166,7 @@ impl<'a> ElfImage<'a> {
     }
 
     fn e_phoff(&self) -> Result<usize, String> {
-        Ok(self.u64(32)? as usize)
+        usize::try_from(self.u64(32)?).map_err(|_| "program header offset exceeds usize".into())
     }
 
     fn e_phnum(&self) -> Result<usize, String> {
@@ -167,7 +174,7 @@ impl<'a> ElfImage<'a> {
     }
 
     fn e_shoff(&self) -> Result<usize, String> {
-        Ok(self.u64(40)? as usize)
+        usize::try_from(self.u64(40)?).map_err(|_| "section header offset exceeds usize".into())
     }
 
     fn e_shnum(&self) -> Result<usize, String> {
@@ -182,17 +189,18 @@ impl<'a> ElfImage<'a> {
         const ENTRY_SIZE: usize = 56;
         let phoff = self.e_phoff()?;
         let phnum = self.e_phnum()?;
+        let table = self.table(phoff, phnum, ENTRY_SIZE)?;
         let mut headers = Vec::with_capacity(phnum);
-        for i in 0..phnum {
-            let base = phoff + i * ENTRY_SIZE;
+        for bytes in table.chunks_exact(ENTRY_SIZE) {
+            let entry = Self { bytes };
             headers.push(ProgramHeader {
-                typ: self.u32(base)?,
-                flags: self.u32(base + 4)?,
-                offset: self.u64(base + 8)?,
-                vaddr: self.u64(base + 16)?,
-                filesz: self.u64(base + 32)?,
-                memsz: self.u64(base + 40)?,
-                align: self.u64(base + 48)?,
+                typ: entry.u32(0)?,
+                flags: entry.u32(4)?,
+                offset: entry.u64(8)?,
+                vaddr: entry.u64(16)?,
+                filesz: entry.u64(32)?,
+                memsz: entry.u64(40)?,
+                align: entry.u64(48)?,
             });
         }
         Ok(headers)
@@ -205,17 +213,18 @@ impl<'a> ElfImage<'a> {
             return Err("the image has no section headers".to_string());
         }
         let shnum = self.e_shnum()?;
+        let table = self.table(shoff, shnum, ENTRY_SIZE)?;
         let mut headers = Vec::with_capacity(shnum);
-        for i in 0..shnum {
-            let base = shoff + i * ENTRY_SIZE;
+        for bytes in table.chunks_exact(ENTRY_SIZE) {
+            let entry = Self { bytes };
             headers.push(SectionHeader {
-                name_offset: self.u32(base)?,
-                typ: self.u32(base + 4)?,
-                addr: self.u64(base + 16)?,
-                offset: self.u64(base + 24)?,
-                size: self.u64(base + 32)?,
-                link: self.u32(base + 40)?,
-                entsize: self.u64(base + 56)?,
+                name_offset: entry.u32(0)?,
+                typ: entry.u32(4)?,
+                addr: entry.u64(16)?,
+                offset: entry.u64(24)?,
+                size: entry.u64(32)?,
+                link: entry.u32(40)?,
+                entsize: entry.u64(56)?,
             });
         }
         Ok(headers)
@@ -232,10 +241,9 @@ impl<'a> ElfImage<'a> {
             .get(index)
             .ok_or_else(|| format!("section index {index} is out of range"))?
             .name_offset as usize;
-        let start = strtab.offset as usize + name_offset;
-        let rest = self
-            .bytes
-            .get(start..)
+        let table = self.file_range(strtab.offset, strtab.size)?;
+        let rest = table
+            .get(name_offset..)
             .ok_or_else(|| "the section header string table is truncated".to_string())?;
         let end = rest
             .iter()
@@ -257,23 +265,26 @@ impl<'a> ElfImage<'a> {
                 symtab.link
             )
         })?;
-        let strtab_bytes = self.slice(strtab.offset as usize, strtab.size as usize)?;
+        let strtab_bytes = self.file_range(strtab.offset, strtab.size)?;
 
-        let entry_size = symtab.entsize as usize;
+        let entry_size = symtab.entsize;
         if entry_size != 24 {
             return Err(format!(
                 "symbol table entries are {entry_size} bytes, expected 24"
             ));
         }
-        let count = symtab.size as usize / entry_size;
-        let mut symbols = Vec::with_capacity(count);
-        for i in 0..count {
-            let base = symtab.offset as usize + i * entry_size;
-            let name_offset = self.u32(base)?;
-            let info = self.slice(base + 4, 1)?[0];
-            let shndx = self.u16(base + 6)?;
-            let value = self.u64(base + 8)?;
-            let size = self.u64(base + 16)?;
+        let table = self.file_range(symtab.offset, symtab.size)?;
+        if table.len() % 24 != 0 {
+            return Err("the symbol table has an incomplete entry".into());
+        }
+        let mut symbols = Vec::with_capacity(table.len() / 24);
+        for (i, bytes) in table.chunks_exact(24).enumerate() {
+            let entry = Self { bytes };
+            let name_offset = entry.u32(0)?;
+            let info = entry.slice(4, 1)?[0];
+            let shndx = entry.u16(6)?;
+            let value = entry.u64(8)?;
+            let size = entry.u64(16)?;
             // Bounds-check the name so that consumers can slice it safely.
             if name_offset as usize >= strtab_bytes.len() && name_offset != 0 {
                 return Err(format!("symbol {i} has an out-of-range name offset"));
@@ -319,9 +330,7 @@ impl<'a> ElfImage<'a> {
                 symtab.link
             )
         })?;
-        Ok(self
-            .slice(strtab.offset as usize, strtab.size as usize)?
-            .to_vec())
+        Ok(self.file_range(strtab.offset, strtab.size)?.to_vec())
     }
 
     /// Returns the entries of the dynamic table located through `PT_DYNAMIC`,
@@ -388,19 +397,104 @@ impl<'a> ElfImage<'a> {
     /// Returns the `len` file bytes backing the virtual address range
     /// `[vaddr, vaddr + len)`, which must lie within one `PT_LOAD` segment.
     pub fn bytes_at_vaddr(&self, vaddr: u64, len: u64) -> Result<&'a [u8], String> {
+        let end = vaddr
+            .checked_add(len)
+            .ok_or("virtual address range overflows")?;
         for ph in self.program_headers()? {
             if ph.typ != PT_LOAD {
                 continue;
             }
-            if vaddr >= ph.vaddr && len <= ph.memsz && vaddr + len <= ph.vaddr + ph.filesz {
-                let file_offset = ph.offset as usize + (vaddr - ph.vaddr) as usize;
-                return self.slice(file_offset, len as usize);
+            let file_end = ph
+                .vaddr
+                .checked_add(ph.filesz)
+                .ok_or("segment virtual range overflows")?;
+            if vaddr >= ph.vaddr && len <= ph.memsz && end <= file_end {
+                let file_offset = ph
+                    .offset
+                    .checked_add(vaddr - ph.vaddr)
+                    .ok_or("segment file offset overflows")?;
+                return self.file_range(file_offset, len);
             }
         }
         Err(format!(
-            "the virtual address range [{:#x}, {:#x}) is not file-backed in any PT_LOAD segment",
-            vaddr,
-            vaddr + len
+            "the virtual address range [{vaddr:#x}, {end:#x}) is not file-backed in any PT_LOAD segment"
         ))
+    }
+
+    fn file_range(&self, offset: u64, len: u64) -> Result<&'a [u8], String> {
+        let offset = usize::try_from(offset).map_err(|_| "file offset exceeds usize")?;
+        let len = usize::try_from(len).map_err(|_| "file size exceeds usize")?;
+        self.slice(offset, len)
+    }
+
+    fn table(&self, offset: usize, count: usize, entry_size: usize) -> Result<&'a [u8], String> {
+        let len = count
+            .checked_mul(entry_size)
+            .ok_or("ELF table size overflows")?;
+        self.slice(offset, len)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn header() -> Vec<u8> {
+        let mut bytes = vec![0; 120];
+        bytes[..6].copy_from_slice(b"\x7fELF\x02\x01");
+        bytes[32..40].copy_from_slice(&64u64.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1u16.to_le_bytes());
+        bytes
+    }
+
+    #[test]
+    fn malformed_file_ranges_return_errors_without_panicking() {
+        for field in [32, 40] {
+            let mut bytes = header();
+            bytes[field..field + 8].copy_from_slice(&(u64::MAX - 3).to_le_bytes());
+            bytes[60..62].copy_from_slice(&1u16.to_le_bytes());
+            let image = ElfImage::parse(&bytes).unwrap();
+            assert!(if field == 32 {
+                image.program_headers().is_err()
+            } else {
+                image.section_headers().is_err()
+            });
+        }
+        let bytes = header();
+        let image = ElfImage::parse(&bytes).unwrap();
+        assert!(image.slice(usize::MAX, 2).is_err());
+        assert!(image.table(64, usize::MAX, 24).is_err());
+        assert!(image.bytes_at_vaddr(u64::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn malformed_load_and_symbol_tables_return_errors_before_allocation() {
+        let mut bytes = header();
+        bytes[64..68].copy_from_slice(&PT_LOAD.to_le_bytes());
+        bytes[80..88].copy_from_slice(&(u64::MAX - 8).to_le_bytes());
+        bytes[96..104].copy_from_slice(&32u64.to_le_bytes());
+        let image = ElfImage::parse(&bytes).unwrap();
+        assert!(image.bytes_at_vaddr(u64::MAX - 7, 1).is_err());
+        let sections = [
+            SectionHeader {
+                name_offset: 0,
+                typ: SHT_SYMTAB,
+                addr: 0,
+                offset: u64::MAX - 8,
+                size: u64::MAX,
+                link: 1,
+                entsize: 24,
+            },
+            SectionHeader {
+                name_offset: 0,
+                typ: 3,
+                addr: 0,
+                offset: 0,
+                size: 1,
+                link: 0,
+                entsize: 0,
+            },
+        ];
+        assert!(image.symbols(&sections).is_err());
     }
 }

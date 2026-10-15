@@ -97,9 +97,60 @@ pub(in crate::arch) fn query_xstate_max_features() -> Option<u64> {
     Some(xcr_bits | xss_bits)
 }
 
-/// Queries the size in bytes of the XSAVE area containing states enabled by `XCRO` and `IA32_XSS`.
+/// Queries the standard XSAVE layout size for the states enabled in `XCR0`.
+///
+/// XSAVE/XRSTOR use subleaf zero's size. Subleaf one's size describes the
+/// compacted XSAVEC/XSAVES layout and cannot size or copy a standard area.
 pub(in crate::arch) fn query_xsave_area_size() -> Option<u32> {
-    cpuid(Leaf::Xstate as u32, 1).map(|res| res.ebx)
+    cpuid(Leaf::Xstate as u32, 0).map(|res| res.ebx)
+}
+
+#[cfg(ktest)]
+mod test {
+    use super::*;
+    use crate::prelude::ktest;
+
+    #[ktest]
+    fn xsave_size_covers_the_standard_format() {
+        let _guard = crate::task::disable_preempt();
+        let Some(features) = cpuid(1, 0) else {
+            return;
+        };
+        const XSAVE_AND_OSXSAVE: u32 = (1 << 26) | (1 << 27);
+        if features.ecx & XSAVE_AND_OSXSAVE != XSAVE_AND_OSXSAVE {
+            return;
+        }
+        // SAFETY: CPUID confirms XSAVE support and CR4.OSXSAVE is enabled.
+        // XCR0 is the architectural XGETBV index0; the CPU is pinned above.
+        let enabled = unsafe { core::arch::x86_64::_xgetbv(0) };
+        let area_size = query_xsave_area_size().unwrap();
+        // Standard XSAVE always includes the 512-byte legacy area followed
+        // by its 64-byte header, independently of extended components.
+        assert!(area_size >= 512 + 64);
+        for component in 2..64 {
+            if enabled & (1u64 << component) == 0 {
+                continue;
+            }
+            let layout = cpuid(Leaf::Xstate as u32, component).unwrap();
+            assert_ne!(
+                layout.eax, 0,
+                "enabled xstate component {component} has no storage"
+            );
+            assert_eq!(
+                layout.ecx & 1,
+                0,
+                "XCR0 component {component} must be user state"
+            );
+            // EAX gives this component's bytes and EBX its standard-layout
+            // offset. Bits5/6/7 cover AVX-512 opmask/ZMM_Hi256/Hi16_ZMM;
+            // bit7 therefore checks the tail containing ZMM16 through ZMM31.
+            let required_end = layout.ebx.checked_add(layout.eax).unwrap();
+            assert!(
+                area_size >= required_end,
+                "XSAVE area {area_size} truncates enabled component {component} ending at {required_end}"
+            );
+        }
+    }
 }
 
 /// Queries whether the system is running in QEMU.

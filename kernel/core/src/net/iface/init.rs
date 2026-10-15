@@ -49,6 +49,14 @@ pub(in crate::net) fn init() {
     poll_ifaces();
 }
 
+/// Initializes the real loopback interface without hardware components for kernel tests.
+#[cfg(ktest)]
+pub(crate) fn init_loopback_for_ktest() {
+    IFACES.call_once(|| vec![new_loopback()]);
+    broadcast::init();
+    poll_ifaces();
+}
+
 fn new_loopback() -> Arc<Iface> {
     use aster_bigtcp::{
         device::Loopback,
@@ -102,6 +110,18 @@ fn new_virtio() -> Option<Arc<Iface>> {
         wire::{Ipv4Address, Ipv4Cidr},
     };
 
+    // Benchmark Hosts use .16 so images can address Host port mappings.
+    // The explicit network flag also supports builds without timing probes.
+    // Images and unconfigured Hosts keep the normal .15 address.
+    #[cfg(all(
+        any(kernelet_rq1, kernelet_bench_host_network),
+        not(feature = "kernelet")
+    ))]
+    const VIRTIO_ADDRESS: Ipv4Address = Ipv4Address::new(10, 0, 2, 16);
+    #[cfg(not(all(
+        any(kernelet_rq1, kernelet_bench_host_network),
+        not(feature = "kernelet")
+    )))]
     const VIRTIO_ADDRESS: Ipv4Address = Ipv4Address::new(10, 0, 2, 15);
     const VIRTIO_ADDRESS_PREFIX_LEN: u8 = 24; // mask: 255.255.255.0
     const VIRTIO_GATEWAY: Ipv4Address = Ipv4Address::new(10, 0, 2, 2);

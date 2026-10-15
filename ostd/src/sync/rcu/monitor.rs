@@ -36,6 +36,12 @@ impl RcuMonitor {
         }
 
         let callbacks = {
+            // Restoring IRQs below must not reenter a scheduler that is still
+            // reporting this quiescent state. Keep the mark until the IRQ
+            // guard is dropped, but release it before running callbacks,
+            // whose destructors may sleep or yield.
+            let _scheduling_guard =
+                (!crate::task::scheduling_in_progress()).then(crate::task::SchedulingGuard::new);
             let mut state = self.state.disable_irq().lock();
             let cpu = state.as_atomic_mode_guard().current_cpu();
             state.report_quiescent_state(cpu);
@@ -104,6 +110,7 @@ struct State {
     next_callbacks: Callbacks,
     ready_callbacks: Callbacks,
     /// A Host pause never changes this set. Only the inner idle path does.
+    #[cfg(feature = "kernelet")]
     idle_cpus: CpuSet,
 }
 
@@ -113,6 +120,7 @@ impl State {
             current_gp: GracePeriod::new(),
             next_callbacks: VecDeque::new(),
             ready_callbacks: VecDeque::new(),
+            #[cfg(feature = "kernelet")]
             idle_cpus: CpuSet::new_empty(),
         }
     }
@@ -123,7 +131,7 @@ impl State {
             || !self.ready_callbacks.is_empty()
     }
 
-    #[cfg(any(feature = "kernelet", ktest))]
+    #[cfg(feature = "kernelet")]
     fn can_park_idle(&mut self, cpu: CpuId) -> bool {
         if self.ready_callbacks.is_empty() {
             return true;
@@ -149,7 +157,11 @@ impl State {
             let callbacks = core::mem::take(&mut self.next_callbacks);
             // An idle vCPU has had no reader since it entered idle. It also
             // satisfies a grace period that starts while it remains idle.
-            self.current_gp.restart(callbacks, &self.idle_cpus);
+            self.current_gp.restart(
+                callbacks,
+                #[cfg(feature = "kernelet")]
+                &self.idle_cpus,
+            );
         }
     }
 }
@@ -187,14 +199,22 @@ impl GracePeriod {
         core::mem::take(&mut self.callbacks)
     }
 
-    fn restart(&mut self, callbacks: Callbacks, idle_cpus: &CpuSet) {
-        self.cpu_mask.store(idle_cpus, Relaxed);
-        self.is_complete = self.cpu_mask.load(Relaxed).is_full();
+    fn restart(&mut self, callbacks: Callbacks, #[cfg(feature = "kernelet")] idle_cpus: &CpuSet) {
+        #[cfg(feature = "kernelet")]
+        {
+            self.cpu_mask.store(idle_cpus, Relaxed);
+            self.is_complete = self.cpu_mask.load(Relaxed).is_full();
+        }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            self.cpu_mask.store(&CpuSet::new_empty(), Relaxed);
+            self.is_complete = false;
+        }
         self.callbacks = callbacks;
     }
 }
 
-#[cfg(ktest)]
+#[cfg(all(ktest, feature = "kernelet"))]
 mod test {
     use super::*;
     use crate::{cpu::all_cpus, prelude::ktest};

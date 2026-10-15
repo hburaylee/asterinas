@@ -3,15 +3,15 @@
 //! Image memory-provisioning services: grant growth and kernel-stack
 //! allocation.
 //!
-//! Grant growth may wait on the instance growth mutex and consult the Host
-//! grant-exhaustion hooks; stack allocation maps on-demand pool slots.
+//! Grant growth and its Host policy hooks do not sleep, including when the
+//! image holds a preemption guard. Stack allocation maps on-demand pool slots.
 
 use core::sync::atomic::Ordering;
 
 use super::{RETURNING, current_carrier_state, resources::STACK_BYTES};
-use crate::kernelet::abi::{INVALID, LIMIT, STATE, VcpuRecord};
+use crate::kernelet::abi::{INVALID, LIMIT, STATE};
 
-// SAFETY: The entry stub authenticates and switches to the carrier's Host stack.
+// SAFETY: The entry stub authenticates the carrier and validates its shared stack.
 #[unsafe(no_mangle)]
 extern "C" fn kernelet_host_grains_request_impl(count: u32, contiguous: u32) -> i64 {
     let Some(state) = (unsafe { current_carrier_state() }) else {
@@ -20,17 +20,11 @@ extern "C" fn kernelet_host_grains_request_impl(count: u32, contiguous: u32) -> 
     let Some(_admission) = state.admit_service() else {
         return -STATE;
     };
-    state.enter_schedulable_service();
-    // SAFETY: The current instance retains this shared record throughout the service.
-    let record = unsafe { &*(state.vcpu_record as *const VcpuRecord) };
-    if record.irq_level.load(Ordering::Acquire) != 0 {
-        state.set_phase(RETURNING);
-        return -STATE;
-    }
-    // Growth may wait for the instance growth mutex. Physical IRQs and native
-    // preemption remain enabled while zeroing and mapping bounded memory.
+    // Keep the image's virtual guard ownership intact. Allocation and policy
+    // hooks must not sleep; physical IRQs can still run during bounded zeroing.
+    let _preempt_guard = crate::task::disable_preempt();
     crate::arch::irq::enable_local();
-    let mut result = state.grant.grow(count, contiguous, false);
+    let mut result = state.grant.grow_within_ceiling(count, contiguous);
     if matches!(result, Err(crate::Error::AccessDenied))
         && state.control.account.policy.ask_before_oom
     {
@@ -62,11 +56,6 @@ extern "C" fn kernelet_host_grains_request_impl(count: u32, contiguous: u32) -> 
         state
             .control
             .account
-            .ceiling
-            .fetch_max(state.grant.ceiling(), Ordering::Release);
-        state
-            .control
-            .account
             .grant_overhead
             .fetch_max(state.grant.overhead_bytes(), Ordering::Relaxed);
     }
@@ -79,8 +68,8 @@ extern "C" fn kernelet_host_grains_request_impl(count: u32, contiguous: u32) -> 
         Err(_) => -LIMIT,
     }
 }
-// SAFETY: The assembly stub has switched to the native Host stack and
-// authenticated the service phase before calling this function.
+// SAFETY: The assembly stub has authenticated the carrier and service phase,
+// and validated its shared stack and reserve before calling this function.
 #[unsafe(no_mangle)]
 extern "C" fn kernelet_host_kstack_alloc_impl() -> u64 {
     let Some(state) = (unsafe { current_carrier_state() }) else {
@@ -107,8 +96,8 @@ extern "C" fn kernelet_host_kstack_alloc_impl() -> u64 {
     result.0
 }
 
-// SAFETY: The assembly stub has switched to the native Host stack and
-// authenticated the service phase before calling this function.
+// SAFETY: The assembly stub has authenticated the carrier and service phase,
+// and validated its shared stack and reserve before calling this function.
 #[unsafe(no_mangle)]
 extern "C" fn kernelet_host_kstack_free_impl(base: u64) -> i64 {
     let Some(state) = (unsafe { current_carrier_state() }) else {
@@ -117,14 +106,15 @@ extern "C" fn kernelet_host_kstack_free_impl(base: u64) -> i64 {
     let Some(_admission) = state.admit_service() else {
         return -STATE;
     };
-    let result = state
-        .execution
-        .stacks
-        .lock()
-        .free(base as usize, state.image_rsp);
-    if result == 0 {
-        state.control.account.stacks.fetch_sub(1, Ordering::Relaxed);
-    }
+    let result = state.execution.release_stack(
+        base as usize,
+        state.image_rsp,
+        state.vcpu as usize,
+        &state.control.account.stacks,
+    );
     state.set_phase(RETURNING);
-    result
+    match result {
+        Ok(()) => 0,
+        Err(error) => error,
+    }
 }

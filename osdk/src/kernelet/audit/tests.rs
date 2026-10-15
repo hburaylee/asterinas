@@ -3,10 +3,16 @@
 //! Tests for the kernelet image audit, built on a synthetic ELF64 image that
 //! mirrors the layout the kernelet linker script produces.
 
-use super::prefixes::{CONTEXT_SAVE, VIRQ_AFTER_CALL, VIRQ_BEFORE_CALL};
-use super::{EX_TABLE_ITEM_SIZE, audit_kernelet_image};
-use crate::kernelet::abi;
-use crate::kernelet::elf::{PF_R, PF_W, PF_X};
+use super::{
+    EX_TABLE_ITEM_SIZE, audit_kernelet_image,
+    prefixes::{
+        CONTEXT_SAVE, EXIT_AFTER_LOAD, EXIT_BEFORE_LOAD, VIRQ_AFTER_CALL, VIRQ_BEFORE_CALL,
+    },
+};
+use crate::kernelet::{
+    abi,
+    elf::{PF_R, PF_W, PF_X},
+};
 
 const EHDR_SIZE: usize = 64;
 const PHDR_SIZE: usize = 56;
@@ -20,6 +26,12 @@ const DYN_SIZE: usize = 16;
 // produces them.
 const ENTRY_TABLE_VADDR: u64 = 0x1000;
 const TEXT_VADDR: u64 = 0x2000;
+const RETURNING_STUB_SIZE: usize = VIRQ_BEFORE_CALL.len() + 4 + VIRQ_AFTER_CALL.len();
+const EXIT_STUB_SIZE: usize = EXIT_BEFORE_LOAD.len() + 4 + EXIT_AFTER_LOAD.len();
+const STUB_RANGE_START: u64 = TEXT_VADDR + 0x100;
+const STUB_RANGE_END: u64 = TEXT_VADDR + 0x3c0 + EXIT_STUB_SIZE as u64;
+const CPU_ACCESS_START: u64 = TEXT_VADDR + 0x400;
+const CPU_ACCESS_END: u64 = CPU_ACCESS_START + 0x10;
 const RODATA_VADDR: u64 = 0x40_0000;
 const RODATA_FILE_OFFSET: u64 = 0x3000;
 const DATA_VADDR: u64 = 0x60_0000;
@@ -48,6 +60,29 @@ const DATA_PHDR_MEMSZ_OFFSET: usize = EHDR_SIZE + 2 * PHDR_SIZE + 40;
 
 const SOURCE_HASH: [u8; 32] = [0x5a; 32];
 
+/// Re-audit actual linked artifacts after audit-policy-only changes. All paths
+/// and the independently computed OSTD hash are required explicitly; ordinary
+/// unit tests never substitute the synthetic fixture for this integration check.
+#[test]
+#[ignore = "requires linked Guest/Host artifacts and an independently computed source hash"]
+fn actual_linked_artifacts_pass_production_audits() {
+    let guest = std::env::var_os("OSDK_AUDIT_GUEST_ELF").expect("explicit Guest ELF required");
+    let host = std::env::var_os("OSDK_AUDIT_HOST_ELF").expect("explicit Host ELF required");
+    let source =
+        std::env::var("OSDK_AUDIT_SOURCE_HASH").expect("independent OSTD source hash required");
+    assert_eq!(source.len(), 64);
+    let mut expected = [0; 32];
+    for (index, byte) in expected.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&source[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    let bytes = std::fs::read(guest).expect("Guest ELF readable");
+    assert_eq!(audit_kernelet_image(&bytes, &expected), Ok(()));
+    assert_eq!(
+        crate::kernelet::audit_host_services(std::path::Path::new(&host)),
+        Ok(())
+    );
+}
+
 /// A mutable byte position inside the fixture image.
 struct Mutation {
     offset: usize,
@@ -70,7 +105,7 @@ fn image_with(mutations: &[Mutation]) -> Vec<u8> {
 fn fixture() -> Vec<u8> {
     let mut bytes = vec![0u8; SHDR_FILE_OFFSET + SHDR_COUNT * SHDR_SIZE];
 
-    let text_segment_size = TEXT_VADDR + 0x400 - ENTRY_TABLE_VADDR;
+    let text_segment_size = TEXT_VADDR + 0x600 - ENTRY_TABLE_VADDR;
     let rodata_size: u64 = 0x90;
     let data_filesz: u64 = 0x20;
     let data_memsz: u64 = 0x120;
@@ -79,11 +114,14 @@ fn fixture() -> Vec<u8> {
     bytes[0..4].copy_from_slice(b"\x7fELF");
     bytes[4] = 2; // ELFCLASS64
     bytes[5] = 1; // ELFDATA2LSB
+    bytes[6] = 1; // EI_VERSION = EV_CURRENT
     bytes[16..18].copy_from_slice(&3u16.to_le_bytes()); // ET_DYN
     bytes[18..20].copy_from_slice(&62u16.to_le_bytes()); // EM_X86_64
+    bytes[20..24].copy_from_slice(&1u32.to_le_bytes()); // e_version = EV_CURRENT
     bytes[24..32].copy_from_slice(&TEXT_VADDR.to_le_bytes()); // e_entry
     bytes[32..40].copy_from_slice(&(EHDR_SIZE as u64).to_le_bytes()); // e_phoff
     bytes[40..48].copy_from_slice(&(SHDR_FILE_OFFSET as u64).to_le_bytes()); // e_shoff
+    bytes[52..54].copy_from_slice(&(EHDR_SIZE as u16).to_le_bytes()); // e_ehsize
     bytes[54..56].copy_from_slice(&(PHDR_SIZE as u16).to_le_bytes()); // e_phentsize
     bytes[56..58].copy_from_slice(&4u16.to_le_bytes()); // e_phnum
     bytes[58..60].copy_from_slice(&(SHDR_SIZE as u16).to_le_bytes()); // e_shentsize
@@ -161,6 +199,12 @@ fn fixture() -> Vec<u8> {
     write_entry_table_field(abi::entry_table::SIZE_FIELD_OFFSET, abi::entry_table::SIZE);
     write_entry_table_field(abi::entry_table::VCPU_ENTRY_OFFSET, TEXT_VADDR + 0x20);
     write_entry_table_field(abi::entry_table::VIRQ_ENTRY_OFFSET, TEXT_VADDR + 0x100);
+    write_entry_table_field(abi::entry_table::YIELD_ENTRY_OFFSET, TEXT_VADDR + 0x300);
+    write_entry_table_field(abi::entry_table::EXIT_ENTRY_OFFSET, TEXT_VADDR + 0x3c0);
+    write_entry_table_field(abi::entry_table::STUB_RANGE_START_OFFSET, STUB_RANGE_START);
+    write_entry_table_field(abi::entry_table::STUB_RANGE_END_OFFSET, STUB_RANGE_END);
+    write_entry_table_field(abi::entry_table::CPU_ACCESS_START_OFFSET, CPU_ACCESS_START);
+    write_entry_table_field(abi::entry_table::CPU_ACCESS_END_OFFSET, CPU_ACCESS_END);
     write_entry_table_field(abi::entry_table::CPU_LOCAL_START_OFFSET, CPU_LOCAL_VADDR);
     write_entry_table_field(abi::entry_table::CPU_LOCAL_END_OFFSET, BSS_VADDR);
     write_entry_table_field(abi::entry_table::EX_TABLE_START_OFFSET, EX_TABLE_VADDR);
@@ -204,18 +248,25 @@ fn fixture() -> Vec<u8> {
     bytes[DATA_FILE_OFFSET as usize + 0x10..DATA_FILE_OFFSET as usize + 0x18].fill(0);
 
     // ---- The code --------------------------------------------------------------
-    bytes[TEXT_VADDR as usize..TEXT_VADDR as usize + 0x400].fill(0x90);
+    bytes[TEXT_VADDR as usize..TEXT_VADDR as usize + 0x600].fill(0x90);
     // Compiler-generated fixed entries retain the indirect-branch marker.
     for offset in [0, 0x20] {
         bytes[TEXT_VADDR as usize + offset..TEXT_VADDR as usize + offset + 4]
             .copy_from_slice(&[0xf3, 0x0f, 0x1e, 0xfa]); // ENDBR64
     }
-    let virq = TEXT_VADDR as usize + 0x100;
-    bytes[virq..virq + VIRQ_BEFORE_CALL.len()].copy_from_slice(VIRQ_BEFORE_CALL);
-    let call_end = virq + VIRQ_BEFORE_CALL.len() + 4;
-    bytes[virq + VIRQ_BEFORE_CALL.len()..call_end]
-        .copy_from_slice(&((TEXT_VADDR + 0x20) as i64 - call_end as i64).to_le_bytes()[..4]);
-    bytes[call_end..call_end + VIRQ_AFTER_CALL.len()].copy_from_slice(VIRQ_AFTER_CALL);
+    for stub in [TEXT_VADDR as usize + 0x100, TEXT_VADDR as usize + 0x300] {
+        bytes[stub..stub + VIRQ_BEFORE_CALL.len()].copy_from_slice(VIRQ_BEFORE_CALL);
+        let call_end = stub + VIRQ_BEFORE_CALL.len() + 4;
+        bytes[stub + VIRQ_BEFORE_CALL.len()..call_end]
+            .copy_from_slice(&((TEXT_VADDR + 0x20) as i64 - call_end as i64).to_le_bytes()[..4]);
+        bytes[call_end..call_end + VIRQ_AFTER_CALL.len()].copy_from_slice(VIRQ_AFTER_CALL);
+    }
+    let exit = TEXT_VADDR as usize + 0x3c0;
+    bytes[exit..exit + EXIT_BEFORE_LOAD.len()].copy_from_slice(EXIT_BEFORE_LOAD);
+    let load_end = exit + EXIT_BEFORE_LOAD.len() + 4;
+    bytes[exit + EXIT_BEFORE_LOAD.len()..load_end]
+        .copy_from_slice(&(DATA_VADDR as i64 - load_end as i64).to_le_bytes()[..4]);
+    bytes[load_end..load_end + EXIT_AFTER_LOAD.len()].copy_from_slice(EXIT_AFTER_LOAD);
     let context = TEXT_VADDR as usize + 0x200;
     bytes[context..context + CONTEXT_SAVE.len()].copy_from_slice(CONTEXT_SAVE);
     let wrapper = TEXT_VADDR as usize + 0x260;
@@ -229,18 +280,37 @@ fn fixture() -> Vec<u8> {
     for (name, info, shndx, value, size) in [
         ("_kernelet_entry", 0x12u8, 2u16, TEXT_VADDR, 4),
         ("vcpu_entry", 0x12, 2, TEXT_VADDR + 0x20, 0),
-        ("virq_entry", 0x12, 2, TEXT_VADDR + 0x100, 77),
+        (
+            "virq_entry",
+            0x12,
+            2,
+            TEXT_VADDR + 0x100,
+            RETURNING_STUB_SIZE,
+        ),
+        (
+            "yield_entry",
+            0x12,
+            2,
+            TEXT_VADDR + 0x300,
+            RETURNING_STUB_SIZE,
+        ),
+        ("exit_entry", 0x12, 2, TEXT_VADDR + 0x3c0, EXIT_STUB_SIZE),
+        ("__kernelet_stubs_start", 0x10, 2, STUB_RANGE_START, 0),
+        ("__kernelet_stubs_end", 0x10, 2, STUB_RANGE_END, 0),
+        ("__kernelet_cpu_access_start", 0x10, 2, CPU_ACCESS_START, 0),
+        ("__kernelet_cpu_access_end", 0x10, 2, CPU_ACCESS_END, 0),
+        ("KERNELET_SERVICES", 0x10, 8, DATA_VADDR, 8),
         ("context_switch", 0x12, 2, TEXT_VADDR + 0x200, 81),
         ("first_context_switch", 0x12, 2, TEXT_VADDR + 0x229, 40),
         ("kernel_task_entry_wrapper", 0x12, 2, TEXT_VADDR + 0x260, 13),
         ("kernel_task_entry", 0x12, 2, TEXT_VADDR + 0x20, 0),
         ("__cpu_local_start", 0x10, 9, CPU_LOCAL_VADDR, 0),
         ("__cpu_local_end", 0x10, 10, BSS_VADDR, 0),
-        ("__ex_table", 0x10, 4, EX_TABLE_VADDR, 0),
+        ("__ex_table", 0x10, 3, EX_TABLE_VADDR, 0),
         (
             "__ex_table_end",
             0x10,
-            4,
+            3,
             EX_TABLE_VADDR + EX_TABLE_ITEM_SIZE,
             0,
         ),
@@ -272,10 +342,23 @@ fn fixture() -> Vec<u8> {
         let base = SHDR_FILE_OFFSET + index * SHDR_SIZE;
         bytes[base..base + 4].copy_from_slice(&(shstrtab.offset_of(name) as u32).to_le_bytes());
         bytes[base + 4..base + 8].copy_from_slice(&typ.to_le_bytes());
+        let flags: u64 = match index {
+            2 => 0x6,         // SHF_ALLOC | SHF_EXECINSTR
+            1 | 3..=7 => 0x2, // SHF_ALLOC
+            8..=10 => 0x3,    // SHF_ALLOC | SHF_WRITE
+            _ => 0,
+        };
+        bytes[base + 8..base + 16].copy_from_slice(&flags.to_le_bytes());
         bytes[base + 16..base + 24].copy_from_slice(&addr.to_le_bytes());
         bytes[base + 24..base + 32].copy_from_slice(&offset.to_le_bytes());
         bytes[base + 32..base + 40].copy_from_slice(&size.to_le_bytes());
         bytes[base + 40..base + 44].copy_from_slice(&link.to_le_bytes());
+        if matches!(index, 5 | 11) {
+            // Only the null symbol is local; the remaining symbols are global.
+            bytes[base + 44..base + 48].copy_from_slice(&1u32.to_le_bytes());
+        }
+        let alignment = if typ == 3 { 1u64 } else { 8u64 };
+        bytes[base + 48..base + 56].copy_from_slice(&alignment.to_le_bytes());
         bytes[base + 56..base + 64].copy_from_slice(&entsize.to_le_bytes());
     };
     shdr(
@@ -288,7 +371,7 @@ fn fixture() -> Vec<u8> {
         0,
         0,
     );
-    shdr(2, ".text", 1, TEXT_VADDR, TEXT_VADDR, 0x400, 0, 0);
+    shdr(2, ".text", 1, TEXT_VADDR, TEXT_VADDR, 0x600, 0, 0);
     shdr(
         3,
         ".ex_table",
@@ -306,8 +389,8 @@ fn fixture() -> Vec<u8> {
         RELA_VADDR,
         RODATA_FILE_OFFSET + 0x10,
         RELA_SIZE as u64,
-        6,
-        0,
+        5,
+        RELA_SIZE as u64,
     );
     shdr(
         5,
@@ -316,7 +399,7 @@ fn fixture() -> Vec<u8> {
         DYNSYM_VADDR,
         RODATA_FILE_OFFSET + 0x40,
         SYM_SIZE as u64,
-        12,
+        6,
         SYM_SIZE as u64,
     );
     shdr(
@@ -336,7 +419,7 @@ fn fixture() -> Vec<u8> {
         DYNAMIC_VADDR,
         RODATA_FILE_OFFSET + 0x60,
         3 * DYN_SIZE as u64,
-        5,
+        6,
         DYN_SIZE as u64,
     );
     shdr(8, ".got", 1, GOT_VADDR, DATA_FILE_OFFSET, 0x10, 0, 0);
@@ -426,6 +509,13 @@ fn build_string_table() -> StringTable {
         "_kernelet_entry",
         "vcpu_entry",
         "virq_entry",
+        "yield_entry",
+        "exit_entry",
+        "__kernelet_stubs_start",
+        "__kernelet_stubs_end",
+        "__kernelet_cpu_access_start",
+        "__kernelet_cpu_access_end",
+        "KERNELET_SERVICES",
         "context_switch",
         "first_context_switch",
         "kernel_task_entry_wrapper",
@@ -479,6 +569,359 @@ fn set_e_type(value: u16) -> Mutation {
 fn valid_image_passes() {
     let bytes = fixture();
     assert_eq!(audit(&bytes), Ok(()));
+}
+
+#[test]
+fn ordinary_floating_point_and_vector_instructions_fail() {
+    for code in [
+        &[0x0f, 0x57, 0xc0][..],               // XORPS xmm0,xmm0
+        &[0xd9, 0xe8],                         // FLD1 (implicit x87 stack)
+        &[0x0f, 0xef, 0xc0],                   // PXOR mm0,mm0
+        &[0xc5, 0xf8, 0x77],                   // VZEROUPPER (implicit vector clobber)
+        &[0x62, 0xf1, 0x7d, 0x48, 0xef, 0xc0], // VPXORD zmm0,zmm0,zmm0
+        &[0x48, 0x0f, 0xae, 0x2f],             // XRSTOR64 (%rdi), outside its wrapper
+    ] {
+        let bytes = image_with(&[Mutation {
+            offset: TEXT_VADDR as usize + 0x80,
+            bytes: code.to_vec(),
+        }]);
+        assert_fp_violation(&bytes, "forbidden");
+    }
+}
+
+#[test]
+fn floating_point_opcode_bytes_inside_an_immediate_pass() {
+    let bytes = image_with(&[Mutation {
+        offset: TEXT_VADDR as usize + 0x80,
+        // MOVABS immediate contains XORPS, FLD1 and VZEROUPPER byte sequences.
+        bytes: vec![0x48, 0xb8, 0x0f, 0x57, 0xc0, 0xd9, 0xe8, 0xc5, 0xf8, 0x77],
+    }]);
+    assert_eq!(audit(&bytes), Ok(()));
+}
+
+#[test]
+fn physical_control_in_ordinary_image_code_fails_artifact_admission() {
+    for code in [
+        &[0xfa, 0xf3, 0x90, 0xeb, 0xfc][..], // safe CLI followed by an infinite pause loop
+        &[0xfb][..],                         // STI
+        &[0xf4][..],                         // HLT
+        &[0x48, 0xcf][..],                   // IRETQ
+        &[0x0f, 0x01, 0xf8][..],             // SWAPGS
+        &[0x0f, 0x01, 0xc1][..],             // VMCALL
+        &[0x9d][..],                         // POPFQ can restore physical IF
+        &[0x0f, 0x05][..],                   // SYSCALL bypasses the service gate
+    ] {
+        let bytes = image_with(&[Mutation {
+            offset: TEXT_VADDR as usize + 0x80,
+            bytes: code.to_vec(),
+        }]);
+        assert_fp_violation(&bytes, "forbidden");
+    }
+    // Physical-control opcode bytes in scalar data are not instructions.
+    let bytes = image_with(&[Mutation {
+        offset: TEXT_VADDR as usize + 0x80,
+        bytes: vec![0x48, 0xb8, 0xfa, 0xfb, 0xf4, 0x48, 0xcf, 0x0f, 0x01, 0xf8],
+    }]);
+    assert_eq!(audit(&bytes), Ok(()));
+}
+
+#[test]
+fn executable_padding_cannot_hide_floating_point_or_other_code() {
+    for code in [&[0x0f, 0x57, 0xc0][..], &[0x0f, 0x0b]] {
+        let bytes = image_with(&[Mutation {
+            offset: ENTRY_TABLE_FILE_OFFSET + 0x100,
+            bytes: code.to_vec(),
+        }]);
+        assert_fp_violation(&bytes, "padding");
+    }
+    let bytes = image_with(&[Mutation {
+        offset: ENTRY_TABLE_FILE_OFFSET + 0x100,
+        bytes: vec![0x0f, 0x1f, 0x40, 0x00], // four-byte NOP among zero padding
+    }]);
+    assert_eq!(audit(&bytes), Ok(()));
+}
+
+#[test]
+fn invalid_x86_64_instruction_fails_closed() {
+    let bytes = image_with(&[Mutation {
+        offset: TEXT_VADDR as usize + 0x80,
+        bytes: vec![0x06], // PUSH ES has no encoding in 64-bit mode.
+    }]);
+    assert_fp_violation(&bytes, "invalid instruction");
+}
+
+#[test]
+fn another_executable_segment_cannot_escape_decoder_coverage() {
+    let bytes = image_with(&[Mutation {
+        offset: EHDR_SIZE + PHDR_SIZE + 4, // the read-only PT_LOAD's flags
+        bytes: (PF_R | PF_X).to_le_bytes().to_vec(),
+    }]);
+    assert_fp_violation(&bytes, "exactly one executable PT_LOAD");
+}
+
+#[test]
+fn missing_or_failed_decoder_fails_closed() {
+    use std::ffi::OsStr;
+
+    use crate::kernelet::elf::ElfImage;
+
+    let bytes = fixture();
+    let image = ElfImage::parse(&bytes).unwrap();
+    let headers = image.program_headers().unwrap();
+    let sections = image.section_headers().unwrap();
+    let names = (0..sections.len())
+        .map(|index| image.section_name(&sections, index).unwrap().to_string())
+        .collect::<Vec<_>>();
+    let symbols = image.symbols(&sections).unwrap();
+    for (decoder, expected) in [
+        ("/nonexistent-kernelet-objdump", "cannot run required"),
+        ("/bin/false", "decoder failed"),
+    ] {
+        let error = super::floating_point::audit_with_decoder(
+            &bytes,
+            &headers,
+            &sections,
+            &names,
+            &symbols,
+            OsStr::new(decoder),
+        )
+        .unwrap_err();
+        assert!(error.contains(expected), "{error}");
+    }
+}
+
+#[test]
+fn user_state_operations_require_the_exact_function_and_whole_instruction_bounds() {
+    let xsave = [0x48, 0x0f, 0xae, 0x27]; // XSAVE64 (%rdi)
+    let name = "core::core_arch::x86_64::xsave::_xsave64";
+    let mut bytes = fixture();
+    add_text_function(&mut bytes, name, &xsave, xsave.len() as u64);
+    assert_eq!(audit(&bytes), Ok(()));
+
+    let mut bytes = fixture();
+    add_text_function(&mut bytes, "unrelated::save", &xsave, xsave.len() as u64);
+    assert_fp_violation(&bytes, "outside a state wrapper");
+
+    let mut bytes = fixture();
+    add_text_function(&mut bytes, name, &xsave, 1);
+    assert_fp_violation(&bytes, "outside a state wrapper");
+
+    let mut bytes = fixture();
+    let code = [0x48, 0x0f, 0xae, 0x27, 0x0f, 0x57, 0xc0];
+    add_text_function(&mut bytes, name, &code, code.len() as u64);
+    assert_fp_violation(&bytes, "forbidden xorps");
+
+    let mut bytes = fixture();
+    let xrstor = [0x48, 0x0f, 0xae, 0x2f];
+    add_text_function(&mut bytes, name, &xrstor, xrstor.len() as u64);
+    assert_fp_violation(&bytes, "forbidden xrstor64");
+}
+
+#[test]
+fn unwinder_control_words_have_no_state_wrapper_exception() {
+    let save = "unwinding::unwinder::arch::x86_64::save_context";
+    let pair = [
+        0x0f, 0xae, 0x9c, 0x24, 0x88, 0, 0, 0, // STMXCSR 0x88(%rsp)
+        0xd9, 0xbc, 0x24, 0x90, 0, 0, 0, // FNSTCW 0x90(%rsp)
+    ];
+    let restore = [
+        0x0f, 0xae, 0x97, 0x88, 0, 0, 0, // LDMXCSR 0x88(%rdi)
+        0xd9, 0xaf, 0x90, 0, 0, 0, // FLDCW 0x90(%rdi)
+    ];
+    for name in [
+        save,
+        "unwinding::unwinder::with_context::delegate::<unwinding::abi::UnwindReasonCode, unwinding::unwinder::_Unwind_RaiseException::{closure#0}>",
+        "unwinding::unwinder::_Unwind_Resume::{closure#0}",
+    ] {
+        for code in [pair.as_slice(), restore.as_slice()] {
+            let mut bytes = fixture();
+            add_text_function(&mut bytes, name, code, code.len() as u64);
+            assert_fp_violation(&bytes, "outside a state wrapper");
+        }
+    }
+
+    // A FPU-state wrapper is not permission to change just its control word.
+    for name in [
+        "<ostd::arch::cpu::context::FpuContext>::save",
+        "<ostd::arch::cpu::context::FpuContext>::load",
+    ] {
+        for code in [pair.as_slice(), restore.as_slice()] {
+            let mut bytes = fixture();
+            add_text_function(&mut bytes, name, code, code.len() as u64);
+            assert_fp_violation(&bytes, "forbidden");
+        }
+    }
+}
+
+#[test]
+fn oversized_state_wrapper_cannot_claim_another_function() {
+    let mut bytes = fixture();
+    add_text_function(
+        &mut bytes,
+        "core::core_arch::x86_64::xsave::_xsave64",
+        &[0x48, 0x0f, 0xae, 0x27],
+        0x100, // extends into the separate virq_entry STT_FUNC
+    );
+    assert_fp_violation(&bytes, "overlaps another STT_FUNC");
+}
+
+fn assert_fp_violation(bytes: &[u8], expected: &str) {
+    let violations = audit(bytes).unwrap_err();
+    assert!(
+        violations.iter().any(|violation| {
+            violation.contains("audit item 11 (FP/SIMD)") && violation.contains(expected)
+        }),
+        "expected {expected}, got {violations:#?}"
+    );
+}
+
+/// Adds real STT_FUNC metadata to exercise the decoder's exception ownership.
+fn add_text_function(bytes: &mut Vec<u8>, name: &str, code: &[u8], size: u64) {
+    let address = TEXT_VADDR + 0x80;
+    assert!(code.len() < 0x80);
+    bytes[address as usize..address as usize + code.len()].copy_from_slice(code);
+    let strtab_header = SHDR_FILE_OFFSET + 12 * SHDR_SIZE;
+    let old_offset = u64::from_le_bytes(
+        bytes[strtab_header + 24..strtab_header + 32]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let old_size = u64::from_le_bytes(
+        bytes[strtab_header + 32..strtab_header + 40]
+            .try_into()
+            .unwrap(),
+    ) as usize;
+    let mut strings = bytes[old_offset..old_offset + old_size].to_vec();
+    let name_offset = strings.len() as u32;
+    strings.extend_from_slice(name.as_bytes());
+    strings.push(0);
+    let new_offset = bytes.len() as u64;
+    bytes.extend_from_slice(&strings);
+    bytes[strtab_header + 24..strtab_header + 32].copy_from_slice(&new_offset.to_le_bytes());
+    bytes[strtab_header + 32..strtab_header + 40]
+        .copy_from_slice(&(strings.len() as u64).to_le_bytes());
+
+    let symtab_header = SHDR_FILE_OFFSET + 11 * SHDR_SIZE;
+    let old_size = u64::from_le_bytes(
+        bytes[symtab_header + 32..symtab_header + 40]
+            .try_into()
+            .unwrap(),
+    );
+    let base = SYMTAB_FILE_OFFSET as usize + old_size as usize;
+    assert!(base + SYM_SIZE <= STRTAB_FILE_OFFSET as usize);
+    bytes[base..base + 4].copy_from_slice(&name_offset.to_le_bytes());
+    bytes[base + 4] = 0x12; // STB_GLOBAL | STT_FUNC
+    bytes[base + 6..base + 8].copy_from_slice(&2u16.to_le_bytes());
+    bytes[base + 8..base + 16].copy_from_slice(&address.to_le_bytes());
+    bytes[base + 16..base + 24].copy_from_slice(&size.to_le_bytes());
+    bytes[symtab_header + 32..symtab_header + 40]
+        .copy_from_slice(&(old_size + SYM_SIZE as u64).to_le_bytes());
+}
+
+#[test]
+fn empty_stub_range_fails() {
+    let bytes = image_with(&[Mutation {
+        offset: ENTRY_TABLE_FILE_OFFSET + abi::entry_table::STUB_RANGE_END_OFFSET,
+        bytes: STUB_RANGE_START.to_le_bytes().to_vec(),
+    }]);
+    let violations = audit(&bytes).unwrap_err();
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("audit item 4") && v.contains("stub range")),
+        "expected an invalid stub range, got: {violations:#?}"
+    );
+}
+
+#[test]
+fn cpu_access_range_must_be_nonempty_text_disjoint_from_stubs() {
+    for (start, end) in [
+        (CPU_ACCESS_START, CPU_ACCESS_START),
+        (CPU_ACCESS_START + 1, CPU_ACCESS_START),
+        (STUB_RANGE_START, STUB_RANGE_END),
+        (RODATA_VADDR, RODATA_VADDR + 1),
+    ] {
+        let bytes = image_with(&[
+            Mutation {
+                offset: ENTRY_TABLE_FILE_OFFSET + abi::entry_table::CPU_ACCESS_START_OFFSET,
+                bytes: start.to_le_bytes().to_vec(),
+            },
+            Mutation {
+                offset: ENTRY_TABLE_FILE_OFFSET + abi::entry_table::CPU_ACCESS_END_OFFSET,
+                bytes: end.to_le_bytes().to_vec(),
+            },
+        ]);
+        assert!(
+            audit(&bytes)
+                .unwrap_err()
+                .iter()
+                .any(|v| v.contains("audit item 4") && v.contains("CPU-access range"))
+        );
+    }
+}
+
+#[test]
+fn cpu_access_table_bounds_must_match_linker_symbols() {
+    let bytes = image_with(&[Mutation {
+        offset: ENTRY_TABLE_FILE_OFFSET + abi::entry_table::CPU_ACCESS_END_OFFSET,
+        bytes: (CPU_ACCESS_END + 1).to_le_bytes().to_vec(),
+    }]);
+    assert!(
+        audit(&bytes)
+            .unwrap_err()
+            .iter()
+            .any(|v| v.contains("CPU-access range disagrees"))
+    );
+}
+
+#[test]
+fn stub_range_must_include_the_complete_exit_prefix() {
+    let bytes = image_with(&[Mutation {
+        offset: ENTRY_TABLE_FILE_OFFSET + abi::entry_table::STUB_RANGE_END_OFFSET,
+        bytes: (STUB_RANGE_END - 1).to_le_bytes().to_vec(),
+    }]);
+    let violations = audit(&bytes).unwrap_err();
+    assert!(
+        violations.iter().any(|v| v.contains("audit item 11")),
+        "expected the incomplete stub range to fail the linked-prefix audit, got: {violations:#?}"
+    );
+}
+
+#[test]
+fn non_executable_yield_target_fails() {
+    let bytes = image_with(&[Mutation {
+        offset: ENTRY_TABLE_FILE_OFFSET + abi::entry_table::YIELD_ENTRY_OFFSET,
+        bytes: DATA_VADDR.to_le_bytes().to_vec(),
+    }]);
+    let violations = audit(&bytes).unwrap_err();
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("audit item 4") && v.contains("yield_entry")),
+        "expected a non-executable yield target violation, got: {violations:#?}"
+    );
+}
+
+#[test]
+fn returning_stub_cannot_restore_flags_from_pushfq() {
+    // PUSHFQ clears RF in the pushed image. Loading that word would silently
+    // lose a flag even though the final IRET restores every other register.
+    let hardware_flags_load = [0x48, 0x8b, 0x94, 0x24, 0xa0, 0x00, 0x00, 0x00];
+    let load_offset = VIRQ_AFTER_CALL
+        .windows(hardware_flags_load.len())
+        .position(|code| code == hardware_flags_load)
+        .unwrap();
+    let bytes = image_with(&[Mutation {
+        offset: TEXT_VADDR as usize + 0x100 + VIRQ_BEFORE_CALL.len() + 4 + load_offset,
+        bytes: vec![0x48, 0x8b, 0x54, 0x24, 0x78, 0x90, 0x90, 0x90],
+    }]);
+    let violations = audit(&bytes).unwrap_err();
+    assert!(
+        violations
+            .iter()
+            .any(|v| v.contains("audit item 11") && v.contains("returning prefix")),
+        "expected the flag-losing prefix to be rejected, got: {violations:#?}"
+    );
 }
 
 #[test]
@@ -689,6 +1132,9 @@ fn file_backed_section_inside_cpu_local_bounds_fails() {
     let tss_name_offset = names.offset_of(".cpu_local_tss");
     bytes[SHSTRTAB_FILE_OFFSET as usize..SHSTRTAB_FILE_OFFSET as usize + names.bytes.len()]
         .copy_from_slice(&names.bytes);
+    let shstrtab_header = SHDR_FILE_OFFSET + 13 * SHDR_SIZE;
+    bytes[shstrtab_header + 32..shstrtab_header + 40]
+        .copy_from_slice(&(names.bytes.len() as u64).to_le_bytes());
     let base = SHDR_FILE_OFFSET + 14 * SHDR_SIZE;
     bytes[base..base + 4].copy_from_slice(&(tss_name_offset as u32).to_le_bytes());
     bytes[base + 4..base + 8].copy_from_slice(&1u32.to_le_bytes()); // PROGBITS

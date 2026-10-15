@@ -11,6 +11,10 @@ extern crate ostd_pod;
 pub const MAGIC: u32 = 0xc7;
 /// Bytes in one physical-memory grain, the unit of the memory ioctls and stats.
 pub const GRAIN_SIZE_BYTES: u64 = 2 * 1024 * 1024;
+/// Lowest Linux nice value accepted by the scheduling ioctls.
+pub const MIN_NICE: i8 = -20;
+/// Highest Linux nice value accepted by the scheduling ioctls.
+pub const MAX_NICE: i8 = 19;
 pub const BLOCK: u16 = 1;
 pub const CONSOLE: u16 = 2;
 pub const RNG: u16 = 3;
@@ -134,6 +138,15 @@ pub struct BudgetArgs {
     pub cpu_period_us: u32,
 }
 
+/// Value of an optional observation not collected by the running kernel.
+///
+/// Consumers must display unavailable observations distinctly from zero.
+/// This applies to the diagnostic fields documented in [`StatsRaw`].
+pub const STATS_UNAVAILABLE: u64 = u64::MAX;
+
+/// An instance snapshot with always-available quota and resource accounting.
+///
+/// The diagnostic observations are unavailable in ordinary kernel builds.
 #[repr(C)]
 #[derive(Clone, Copy, Default, Pod)]
 pub struct StatsRaw {
@@ -149,10 +162,15 @@ pub struct StatsRaw {
     pub host_overhead_bytes: u64,
     pub cpu_time_ns: u64,
     pub throttled_ns: u64,
+    /// Device completion CPU attribution in ns, or [`STATS_UNAVAILABLE`].
     pub completion_cpu_ns: u64,
+    /// Receive-copy CPU attribution in ns, or [`STATS_UNAVAILABLE`].
     pub ingress_copy_cpu_ns: u64,
+    /// Admitted service count, available in every kernel build.
     pub service_calls: u64,
+    /// Validated MMIO request count, available in every kernel build.
     pub mmio_accesses: u64,
+    /// Accepted IRQ publication count, available in every kernel build.
     pub irqs_raised: u64,
     pub log_bytes: u64,
     pub log_records_dropped: u64,

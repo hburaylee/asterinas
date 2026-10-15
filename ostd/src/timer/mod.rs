@@ -32,6 +32,10 @@ const TICK_NS: u64 = 1_000_000_000 / TIMER_FREQ;
 
 type InterruptCallback = Box<dyn Fn() + Sync + Send>;
 
+#[cfg(any(feature = "kernelet", ktest))]
+type SampledTaskCallback =
+    Box<dyn Fn(&crate::task::Task, crate::cpu::PrivilegeLevel, u64) + Sync + Send>;
+
 static NEXT_EXPIRY: Once<fn(CpuId) -> Option<u64>> = Once::new();
 static DEADLINE_CALLBACK: Once<fn()> = Once::new();
 static IDLE_ELAPSED_CALLBACK: Once<fn(u64)> = Once::new();
@@ -45,6 +49,11 @@ cpu_local! {
     static INTERRUPT_CALLBACKS: RefCell<Vec<InterruptCallback>> = RefCell::new(Vec::new());
 }
 
+#[cfg(any(feature = "kernelet", ktest))]
+cpu_local! {
+    static SAMPLED_TASK_CALLBACKS: RefCell<Vec<SampledTaskCallback>> = RefCell::new(Vec::new());
+}
+
 /// Registers a function that will be executed during the timer interrupt on the current CPU.
 pub fn register_callback_on_cpu<F>(func: F)
 where
@@ -55,6 +64,40 @@ where
         .get_with(&irq_guard)
         .borrow_mut()
         .push(Box::new(func));
+}
+
+/// Registers accounting for physical samples of an explicitly identified Task.
+///
+/// In a kernelet, ordinary timer callbacks can run after the sampled Task has
+/// switched out. These callbacks instead receive its retained execution owner
+/// and sampled privilege, once per nonempty count. They run at L1 with virtual
+/// IRQs disabled, on the sampling vCPU, before an outgoing Task can migrate or
+/// free its stack. They must not sleep or infer the sample owner from the
+/// current Task, current Thread, or its local data. Timer actions must retain
+/// their own targets. The count is not a new global timer advance.
+#[cfg(any(feature = "kernelet", ktest))]
+pub fn register_sampled_task_callback_on_cpu<F>(func: F)
+where
+    F: Fn(&crate::task::Task, crate::cpu::PrivilegeLevel, u64) + Sync + Send + 'static,
+{
+    let irq_guard = irq::disable_local();
+    SAMPLED_TASK_CALLBACKS
+        .get_with(&irq_guard)
+        .borrow_mut()
+        .push(Box::new(func));
+}
+
+#[cfg(any(feature = "kernelet", ktest))]
+pub(crate) fn call_sampled_task_callbacks(
+    task: &crate::task::Task,
+    privilege: crate::cpu::PrivilegeLevel,
+    ticks: u64,
+) {
+    let irq_guard = irq::disable_local();
+    let callbacks = SAMPLED_TASK_CALLBACKS.get_with(&irq_guard);
+    for callback in callbacks.borrow().iter() {
+        callback(task, privilege, ticks);
+    }
 }
 
 /// Registers the next timer expiry, as an absolute elapsed jiffy, for an idle CPU.
@@ -160,15 +203,18 @@ pub(crate) fn enable_local_and_halt() {
 }
 
 pub(crate) fn call_timer_callback_functions(_: &TrapFrame) {
+    #[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
     crate::task::scheduler::runtime_ticks();
+    #[cfg(feature = "kernelet-host")]
+    crate::kernelet::host_run::on_host_tick();
     let irq_guard = irq::disable_local();
 
     if irq_guard.current_cpu() == CpuId::bsp() {
         #[cfg(not(feature = "kernelet"))]
         jiffies::ELAPSED.fetch_add(1, Ordering::Relaxed);
-        #[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+        #[cfg(feature = "kernelet-host")]
         crate::kernelet::account::on_timer_tick();
-        #[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+        #[cfg(feature = "kernelet-host")]
         crate::kernelet::clock::publish();
     }
 
@@ -177,4 +223,72 @@ pub(crate) fn call_timer_callback_functions(_: &TrapFrame) {
         (callback)();
     }
     drop(callbacks_guard);
+}
+
+#[cfg(ktest)]
+mod sampled_task_tests {
+    use alloc::sync::Arc;
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    use crate::{
+        cpu::PrivilegeLevel,
+        prelude::*,
+        task::{Task, TaskOptions},
+    };
+
+    struct SampleCounts {
+        user: AtomicU64,
+        kernel: AtomicU64,
+    }
+
+    #[ktest]
+    fn accounting_uses_explicit_task_without_changing_current() {
+        let counts = || {
+            Arc::new(SampleCounts {
+                user: AtomicU64::new(0),
+                kernel: AtomicU64::new(0),
+            })
+        };
+        let first_counts = counts();
+        let second_counts = counts();
+        let first = TaskOptions::new(|| {})
+            .data(first_counts.clone())
+            .build()
+            .unwrap();
+        let second = TaskOptions::new(|| {})
+            .data(second_counts.clone())
+            .build()
+            .unwrap();
+        let current = Task::current().map(|task| task.cloned());
+        let expected_current = current.as_ref().map(Arc::downgrade);
+        super::register_sampled_task_callback_on_cpu(move |task, privilege, ticks| {
+            let Some(counts) = task.data().downcast_ref::<Arc<SampleCounts>>() else {
+                return;
+            };
+            let current = Task::current();
+            if let Some(expected) = expected_current.as_ref() {
+                let expected = expected.upgrade().unwrap();
+                assert!(core::ptr::eq(&**current.as_ref().unwrap(), &*expected));
+            } else {
+                assert!(current.is_none());
+            }
+            assert!(current.is_none_or(|current| !core::ptr::eq(&*current, task)));
+            let counter = match privilege {
+                PrivilegeLevel::User => &counts.user,
+                PrivilegeLevel::Kernel => &counts.kernel,
+            };
+            counter.fetch_add(ticks, Ordering::Relaxed);
+        });
+        crate::irq::call_sampled_task_tick_callback_functions(&first, PrivilegeLevel::User, 3);
+        crate::irq::call_sampled_task_tick_callback_functions(&first, PrivilegeLevel::Kernel, 2);
+        crate::irq::call_sampled_task_tick_callback_functions(&second, PrivilegeLevel::User, 1);
+        assert_eq!(first_counts.user.load(Ordering::Relaxed), 3);
+        assert_eq!(first_counts.kernel.load(Ordering::Relaxed), 2);
+        assert_eq!(second_counts.user.load(Ordering::Relaxed), 1);
+        assert_eq!(second_counts.kernel.load(Ordering::Relaxed), 0);
+        match current {
+            Some(current) => assert!(Arc::ptr_eq(&Task::current().unwrap().cloned(), &current)),
+            None => assert!(Task::current().is_none()),
+        }
+    }
 }

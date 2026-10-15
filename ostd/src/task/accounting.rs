@@ -3,9 +3,12 @@
 //! Optional runtime accounting attached to a native Task.
 
 use alloc::sync::Arc;
+#[cfg(any(feature = "kernelet-host", ktest))]
+use core::fmt::Debug;
+#[cfg(feature = "kernelet-host")]
+use core::sync::atomic::AtomicUsize;
 use core::{
-    fmt::Debug,
-    sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    sync::atomic::{AtomicBool, Ordering},
     time::Duration,
 };
 
@@ -13,6 +16,7 @@ use crate::sync::{LocalIrqDisabled, SpinLock};
 
 /// An account receives only time that its Task actually executes on a CPU.
 /// The callback runs with IRQs disabled and must not sleep or schedule.
+#[cfg(any(feature = "kernelet-host", ktest))]
 pub(crate) trait CpuTimeAccount: Send + Sync + Debug {
     fn charge(&self, nanoseconds: u64);
     fn owner(&self) -> usize;
@@ -20,6 +24,7 @@ pub(crate) trait CpuTimeAccount: Send + Sync + Debug {
 
 #[derive(Debug)]
 struct State {
+    #[cfg(any(feature = "kernelet-host", ktest))]
     account: Option<Arc<dyn CpuTimeAccount>>,
     started: Option<u64>,
     elapsed_ns: u64,
@@ -31,6 +36,7 @@ impl State {
         if let Some(previous) = self.started.take() {
             let elapsed = now.saturating_sub(previous);
             self.elapsed_ns = self.elapsed_ns.saturating_add(elapsed);
+            #[cfg(any(feature = "kernelet-host", ktest))]
             if let Some(account) = &self.account {
                 account.charge(elapsed);
             }
@@ -38,7 +44,11 @@ impl State {
     }
 
     fn enabled(&self) -> bool {
-        self.account.is_some() || self.measurements != 0
+        #[cfg(any(feature = "kernelet-host", ktest))]
+        if self.account.is_some() {
+            return true;
+        }
+        self.measurements != 0
     }
 }
 
@@ -80,6 +90,7 @@ impl Drop for CpuTimeMeasurement {
 #[derive(Debug)]
 pub(super) struct TaskAccounting {
     enabled: AtomicBool,
+    #[cfg(feature = "kernelet-host")]
     carrier_context: AtomicUsize,
     state: SpinLock<State, LocalIrqDisabled>,
 }
@@ -88,8 +99,10 @@ impl TaskAccounting {
     pub(super) fn new() -> Self {
         Self {
             enabled: AtomicBool::new(false),
+            #[cfg(feature = "kernelet-host")]
             carrier_context: AtomicUsize::new(0),
             state: SpinLock::new(State {
+                #[cfg(any(feature = "kernelet-host", ktest))]
                 account: None,
                 started: None,
                 elapsed_ns: 0,
@@ -98,6 +111,7 @@ impl TaskAccounting {
         }
     }
 
+    #[cfg(any(feature = "kernelet-host", ktest))]
     pub(super) fn attach(&self, account: Arc<dyn CpuTimeAccount>) -> crate::Result<()> {
         let mut state = self.state.lock();
         if state.account.is_some() {
@@ -111,6 +125,7 @@ impl TaskAccounting {
         Ok(())
     }
 
+    #[cfg(any(feature = "kernelet-host", ktest))]
     pub(super) fn detach(&self, owner: Option<usize>) -> crate::Result<()> {
         let _ = self.sample(false);
         let account = {
@@ -149,16 +164,35 @@ impl TaskAccounting {
         state.sample(now);
         if running {
             state.started = Some(now);
-        } else {
-            #[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
-            // SAFETY: The context belongs to the outgoing current Task and stays pinned.
-            unsafe {
-                crate::kernelet::host_run::pause_carrier_context(
-                    self.carrier_context.load(Ordering::Acquire),
-                )
-            };
         }
         Some(ticks)
+    }
+
+    #[cfg(any(feature = "kernelet-host", ktest))]
+    pub(super) fn sample_owned(&self, owner: usize) -> crate::Result<()> {
+        let mut state = self.state.lock();
+        if state
+            .account
+            .as_ref()
+            .is_none_or(|account| account.owner() != owner)
+        {
+            return Err(crate::Error::AccessDenied);
+        }
+        let now = runtime_ns();
+        state.sample(now);
+        state.started = Some(now);
+        Ok(())
+    }
+
+    #[cfg(feature = "kernelet-host")]
+    pub(super) fn pause(&self) {
+        // SAFETY: The scheduler masks IRQs and retains the outgoing current
+        // Task's pinned context until the native switch has completed.
+        unsafe {
+            crate::kernelet::host_run::pause_carrier_context(
+                self.carrier_context.load(Ordering::Acquire),
+            )
+        };
     }
 
     fn begin_measurement(&self) -> u64 {
@@ -182,17 +216,15 @@ impl TaskAccounting {
         self.enabled.store(state.enabled(), Ordering::Release);
     }
 
+    #[cfg(feature = "kernelet-host")]
     pub(super) unsafe fn set_carrier_context(&self, address: usize) {
         self.carrier_context.store(address, Ordering::Release);
-        #[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
         // SAFETY: The caller retains this Task's pinned context until it clears the slot.
-        unsafe {
-            crate::kernelet::host_run::restore_carrier_context(address)
-        };
+        unsafe { crate::kernelet::host_run::restore_carrier_context(address) };
     }
 
     pub(super) fn resume(&self) {
-        #[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
+        #[cfg(feature = "kernelet-host")]
         // SAFETY: The incoming Task retains its context; the scheduler masks IRQs.
         unsafe {
             crate::kernelet::host_run::restore_carrier_context(
@@ -235,6 +267,7 @@ fn runtime_ns() -> u64 {
 }
 
 /// Host monotonic wall time for quota periods and deadlines.
+#[cfg(feature = "kernelet-host")]
 pub(crate) fn now_ns() -> u64 {
     ticks_to_ns(crate::arch::read_tsc())
 }

@@ -23,7 +23,7 @@ use nix::{
 };
 
 use super::{CONTROL_TIMEOUT, Control, Reply, begin_request, receive_reply};
-use crate::protocol::{self, Message, Stream};
+use crate::protocol::{self, Message, Request, Stream};
 
 struct RawInput {
     fd: OwnedFd,
@@ -125,6 +125,7 @@ fn relay(
     terminal: bool,
 ) -> Result<i32> {
     let mut input_open = true;
+    let mut input_credit = false;
     let mut data = vec![0; protocol::STREAM_CHUNK_BYTES];
     let mut pending_input = Vec::new();
     let mut sent = 0;
@@ -146,14 +147,13 @@ fn relay(
             resize = Some((request, next, Instant::now()));
         }
 
-        // Keep draining output while a resize is pending: the holder forwards
-        // output through a bounded queue before it can receive the resize ACK.
+        // Keep draining output while a resize or stdin acknowledgement is pending.
         let mut events = PollFlags::POLLIN;
         if !pending_input.is_empty() {
             events |= PollFlags::POLLOUT;
         }
         let mut fds = vec![PollFd::new(connection.as_fd(), events)];
-        let input_index = (input_open && pending_input.is_empty()).then(|| {
+        let input_index = (input_open && input_credit && pending_input.is_empty()).then(|| {
             fds.push(PollFd::new(input.as_fd(), PollFlags::POLLIN));
             fds.len() - 1
         });
@@ -199,6 +199,23 @@ fn relay(
                     id: process_id,
                     code,
                 } if process_id == id => return Ok(code),
+                Message::OutputFailed {
+                    id: process_id,
+                    stream,
+                    detail,
+                } if process_id == id => {
+                    eprintln!("kernelet process {id} {stream:?} output: {detail}");
+                }
+                Message::InputReady { id: process_id } if process_id == id => {
+                    input_credit = true;
+                }
+                Message::RequestFailed {
+                    request: Request::Data { id: process_id } | Request::Close { id: process_id },
+                    detail,
+                } if process_id == id => {
+                    eprintln!("kernelet process {id} stdin: {detail}");
+                    input_open = false;
+                }
                 Message::Error { detail } => bail!("{detail}"),
                 _ => (),
             }
@@ -249,14 +266,17 @@ fn relay(
                         },
                     )?;
                 }
-                Ok(length) => protocol::send(
-                    &mut pending_input,
-                    &Message::Data {
-                        id,
-                        stream: Stream::Stdin,
-                        data: data[..length].to_vec(),
-                    },
-                )?,
+                Ok(length) => {
+                    input_credit = false;
+                    protocol::send(
+                        &mut pending_input,
+                        &Message::Data {
+                            id,
+                            stream: Stream::Stdin,
+                            data: data[..length].to_vec(),
+                        },
+                    )?;
+                }
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
                 Err(error) => return Err(error.into()),
             }

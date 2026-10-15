@@ -113,6 +113,57 @@ pub(super) struct RegisteredImage {
 }
 
 impl RegisteredImage {
+    /// Storage and page tables retained by one instance, including a
+    /// conservative charge for its references to this kind's shared image.
+    pub(crate) fn reservation_bytes(&self, vcpus: usize) -> Result<usize> {
+        if vcpus == 0 || vcpus > super::abi::MAX_VCPUS {
+            return Err(Error::InvalidArgs);
+        }
+        let local = (self.entry_table.cpu_local_end_offset
+            - self.entry_table.cpu_local_start_offset) as usize;
+        let replicas = local
+            .div_ceil(PAGE_SIZE)
+            .checked_mul(vcpus)
+            .and_then(|n| n.checked_mul(PAGE_SIZE))
+            .ok_or(Error::Overflow)?;
+        let private = usize::from(self.data.is_some())
+            .checked_mul(HUGE_PAGE_SIZE)
+            .ok_or(Error::Overflow)?;
+        let shared = self
+            .text_frames
+            .len()
+            .checked_add(self.rodata_frames.len())
+            .and_then(|n| n.checked_add(usize::from(self.filler.is_some())))
+            .and_then(|n| n.checked_mul(HUGE_PAGE_SIZE))
+            .ok_or(Error::Overflow)?;
+        let template = self
+            .data_template
+            .len()
+            .checked_mul(PAGE_SIZE)
+            .ok_or(Error::Overflow)?;
+        // Boot page, clock reference, vCPU/fault records and the image's
+        // contiguous map. Grant-shared page tables are counted by Grant.
+        let boot = super::abi::vcpu_shared_bytes(vcpus)
+            .div_ceil(PAGE_SIZE)
+            .checked_add(2)
+            .and_then(|n| n.checked_mul(PAGE_SIZE))
+            .ok_or(Error::Overflow)?;
+        let mapping = self
+            .replicas_offset
+            .checked_add(replicas)
+            .ok_or(Error::Overflow)?;
+        let page_tables = mapping
+            .div_ceil(HUGE_PAGE_SIZE)
+            .checked_add(4)
+            .and_then(|n| n.checked_mul(PAGE_SIZE))
+            .ok_or(Error::Overflow)?;
+        [private, replicas, shared, template, boot, page_tables]
+            .into_iter()
+            .try_fold(0usize, |sum, bytes| {
+                sum.checked_add(bytes).ok_or(Error::Overflow)
+            })
+    }
+
     /// Validates and registers an embedded kernelet image.
     ///
     /// The bytes are an ordinary byte string: the parser reads them with
@@ -129,7 +180,7 @@ impl RegisteredImage {
         // The linker and frame layout place permission transitions at
         // 2 MiB boundaries. The text PT_LOAD begins at offset 4 KiB, leaving
         // zero padding before the entry table. Validate this layout before
-        // copying the segments and constructing their base-page mappings.
+        // copying the segments and constructing their huge-page mappings.
         if parsed.text.memsz == 0
             || parsed.rodata.as_ref().is_some_and(|span| {
                 span.memsz == 0 || !span.vaddr.is_multiple_of(HUGE_PAGE_SIZE_U64)
@@ -154,7 +205,10 @@ impl RegisteredImage {
         let gap_pages =
             image_gap_huge_pages(&parsed.text, &parsed.rodata, &parsed.data, replicas_offset)?;
         let filler = if gap_pages.into_iter().any(|pages| pages > 0) {
-            Some(FrameAllocOptions::new().alloc_segment(FRAMES_PER_HUGE_PAGE)?)
+            Some(
+                FrameAllocOptions::new()
+                    .alloc_segment_aligned(FRAMES_PER_HUGE_PAGE, HUGE_PAGE_SIZE)?,
+            )
         } else {
             None
         };
@@ -247,9 +301,8 @@ fn image_gap_huge_pages(
 /// One running instance of a [`RegisteredImage`].
 ///
 /// The instance owns its kernel virtual area and its private data page.
-/// Dropping it unmaps the image range and flushes the local TLB before the
-/// data page is released, so the physical memory is never freed while
-/// still mapped on this CPU.
+/// Dropping it unmaps the image range and waits for all CPUs to invalidate
+/// their TLBs before releasing its shared and private physical segments.
 pub(super) struct ImageInstance {
     /// The instance's image mapping. Dropped before `_data_segment`.
     kvirt: KVirtArea,
@@ -269,6 +322,11 @@ pub(super) struct ImageInstance {
     text_end: Vaddr,
     /// The fixed virtual-interrupt entry inside `KW_TEXT`.
     virq_entry: Vaddr,
+    /// The fixed carrier-yield and exit targets inside the validated stub range.
+    yield_entry: Vaddr,
+    exit_entry: Vaddr,
+    stub_range: Range<Vaddr>,
+    cpu_access_range: Range<Vaddr>,
     /// Validated exception-table bounds in the shared read-only mapping.
     ex_table_start: Vaddr,
     ex_table_end: Vaddr,
@@ -308,6 +366,25 @@ impl ImageInstance {
 
     pub(crate) fn virq_entry_address(&self) -> Vaddr {
         self.virq_entry
+    }
+
+    pub(crate) fn yield_entry_address(&self) -> Vaddr {
+        self.yield_entry
+    }
+
+    pub(crate) fn exit_entry_address(&self) -> Vaddr {
+        self.exit_entry
+    }
+
+    /// Returns the executable range excluded from recursive trap redirects.
+    pub(crate) fn stub_range(&self) -> Range<Vaddr> {
+        self.stub_range.clone()
+    }
+
+    /// CPU-local assembly may receive notices but cannot be redirected until
+    /// its physical-CPU address calculation and access have both completed.
+    pub(crate) fn cpu_access_range(&self) -> Range<Vaddr> {
+        self.cpu_access_range.clone()
     }
 
     /// Returns the image's validated, self-relative copy-recovery table.
@@ -413,7 +490,7 @@ fn copy_segment_frames(bytes: &[u8], span: &SegmentSpan) -> Result<Vec<Frame<()>
 /// Copies a read-only segment into shared 2 MiB segments.
 ///
 /// Unused bytes stay zero, preserving the permission boundaries and padding
-/// prescribed by the linker. Each segment is mapped as tracked base pages.
+/// prescribed by the linker. Physical alignment allows one 2 MiB PTE per segment.
 fn copy_segment_huge_pages(bytes: &[u8], span: &SegmentSpan) -> Result<Vec<Segment<()>>> {
     let mapped_start = span.vaddr & !(HUGE_PAGE_SIZE_U64 - 1);
     let mapped_end = align_up(
@@ -424,7 +501,9 @@ fn copy_segment_huge_pages(bytes: &[u8], span: &SegmentSpan) -> Result<Vec<Segme
     let page_count = ((mapped_end - mapped_start) / HUGE_PAGE_SIZE_U64) as usize;
     let mut pages = Vec::with_capacity(page_count);
     for _ in 0..page_count {
-        pages.push(FrameAllocOptions::new().alloc_segment(FRAMES_PER_HUGE_PAGE)?);
+        pages.push(
+            FrameAllocOptions::new().alloc_segment_aligned(FRAMES_PER_HUGE_PAGE, HUGE_PAGE_SIZE)?,
+        );
     }
     let file_bytes = usize::try_from(span.filesz).map_err(|_| Error::Overflow)?;
     for file_offset in (0..file_bytes).step_by(PAGE_SIZE) {
@@ -439,6 +518,7 @@ fn copy_segment_huge_pages(bytes: &[u8], span: &SegmentSpan) -> Result<Vec<Segme
             .ok_or(Error::InvalidArgs)?;
         let frame = pages[huge_index]
             .slice(&(within_huge..within_huge + PAGE_SIZE))
+            .into_iter()
             .next()
             .ok_or(Error::InvalidArgs)?;
         frame.write_bytes(0, src)?;

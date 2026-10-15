@@ -51,6 +51,90 @@ mod ioctl_defs {
     pub(super) type VsockPolicy = ioc!(KERNELET_VSOCK_POLICY, 0xc7, 0x33, InData<VsockPolicyArgs>);
 }
 
+/// Arms diagnostics through a sandbox capability held by the calling process.
+#[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
+pub(crate) fn rq1_tlb_capture(
+    fd: crate::fs::file::file_table::FileDesc,
+) -> Result<ostd::kernelet::tlb_profile::CaptureHandle> {
+    use ostd::kernelet::tlb_profile::CaptureError;
+
+    let task = Task::current().unwrap();
+    let thread_local = task.as_thread_local().unwrap();
+    let file = thread_local
+        .borrow_file_table()
+        .unwrap()
+        .read()
+        .get_file(fd)?
+        .clone();
+    let sandbox = file
+        .downcast_ref::<SandboxFile>()
+        .ok_or_else(|| Error::with_message(Errno::EBADF, "fd is not a sandbox"))?;
+    let kernelet = {
+        let state = sandbox.state.lock();
+        match &*state {
+            SandboxState::Running { kernelet, .. } => kernelet.clone(),
+            SandboxState::Exited {
+                kernelet: Some(kernelet),
+                ..
+            } => kernelet.clone(),
+            _ => return_errno_with_message!(Errno::ENODEV, "sandbox instance is unavailable"),
+        }
+    };
+    // The returned handle owns diagnostic memory only. Neither this file nor
+    // the temporary instance reference is retained by the procfs session.
+    kernelet.rq1_tlb_capture().map_err(|error| {
+        let errno = match error {
+            CaptureError::Busy => Errno::EBUSY,
+            CaptureError::NoMemory => Errno::ENOMEM,
+            CaptureError::Unavailable => Errno::ENODEV,
+        };
+        Error::with_message(errno, "cannot arm TLB capture")
+    })
+}
+
+/// Arms echo diagnostics through a sandbox capability from this process.
+#[cfg(all(kernelet_rq1_crossing_diag, not(feature = "kernelet")))]
+pub(crate) fn rq1_crossing_capture(
+    fd: crate::fs::file::file_table::FileDesc,
+    nonce: u64,
+) -> Result<ostd::kernelet::crossing_profile::CaptureHandle> {
+    use ostd::kernelet::crossing_profile::CaptureError;
+
+    let task = Task::current().unwrap();
+    let thread_local = task.as_thread_local().unwrap();
+    let file = {
+        let file_table_ref = thread_local.borrow_file_table();
+        let file_table = file_table_ref.unwrap();
+        let table = file_table.read();
+        table.get_file(fd)?.clone()
+    };
+    let sandbox = file
+        .downcast_ref::<SandboxFile>()
+        .ok_or_else(|| Error::with_message(Errno::EBADF, "fd is not a sandbox"))?;
+    let kernelet = {
+        let state = sandbox.state.lock();
+        match &*state {
+            SandboxState::Running { kernelet, .. } => kernelet.clone(),
+            SandboxState::Exited {
+                kernelet: Some(kernelet),
+                ..
+            } => kernelet.clone(),
+            _ => return_errno_with_message!(Errno::ENODEV, "sandbox instance is unavailable"),
+        }
+    };
+    // Both file-table and sandbox guards are gone before OSTD admission.
+    // The returned handle retains diagnostic data, not the file or instance.
+    kernelet.rq1_crossing_capture(nonce).map_err(|error| {
+        let errno = match error {
+            CaptureError::Invalid => Errno::EINVAL,
+            CaptureError::Busy => Errno::EBUSY,
+            CaptureError::NoMemory => Errno::ENOMEM,
+            CaptureError::Unavailable => Errno::ENODEV,
+        };
+        Error::with_message(errno, "cannot arm crossing capture")
+    })
+}
+
 /// A status record carrying only the lifecycle state.
 pub(super) fn blank_status(state: u32) -> StatusRaw {
     StatusRaw {
@@ -84,6 +168,7 @@ pub(super) fn killed_status(code: u32) -> StatusRaw {
 pub(super) fn exit_status_raw(exit: &ExitStatus) -> StatusRaw {
     let mut raw = blank_status(STATE_EXITED);
     raw.uptime_ns = duration_ns(exit.uptime);
+    raw.cpu_time_ns = duration_ns(exit.cpu_time);
     match &exit.reason {
         ExitReason::Exited(code) => {
             raw.reason = STATUS_REASON_EXITED;
@@ -92,7 +177,10 @@ pub(super) fn exit_status_raw(exit: &ExitStatus) -> StatusRaw {
         ExitReason::Panicked(message) => {
             raw.reason = STATUS_REASON_PANICKED;
             let bytes = message.as_bytes();
-            let len = bytes.len().min(raw.message.len());
+            let mut len = bytes.len().min(raw.message.len());
+            while !message.is_char_boundary(len) {
+                len -= 1;
+            }
             raw.message[..len].copy_from_slice(&bytes[..len]);
             raw.message_len = len as u32;
             if bytes.len() > len {
@@ -118,6 +206,54 @@ pub(super) fn exit_status_raw(exit: &ExitStatus) -> StatusRaw {
         }
     }
     raw
+}
+
+#[cfg(ktest)]
+mod tests {
+    use core::time::Duration;
+
+    use ostd::prelude::*;
+
+    use super::*;
+
+    #[ktest]
+    fn exit_status_retains_final_cpu_time() {
+        let exit = ExitStatus {
+            reason: ExitReason::Exited(7),
+            uptime: Duration::from_secs(3),
+            cpu_time: Duration::from_millis(125),
+        };
+        let status = exit_status_raw(&exit);
+        assert_eq!(status.state, STATE_EXITED);
+        assert_eq!(status.reason, STATUS_REASON_EXITED);
+        assert_eq!(status.code, 7);
+        assert_eq!(status.uptime_ns, 3_000_000_000);
+        assert_eq!(status.cpu_time_ns, 125_000_000);
+    }
+
+    #[ktest]
+    fn panic_status_truncates_only_at_utf8_boundaries() {
+        for (message, length, truncated) in [
+            ("x".repeat(256), 256, false),
+            ("界".repeat(86), 255, true),
+            ("😀".repeat(65), 256, true),
+        ] {
+            let exit = ExitStatus {
+                reason: ExitReason::Panicked(message.clone()),
+                uptime: Duration::ZERO,
+                cpu_time: Duration::ZERO,
+            };
+            let status = exit_status_raw(&exit);
+            let actual = &status.message[..status.message_len as usize];
+            assert_eq!(status.message_len as usize, length);
+            assert_eq!(core::str::from_utf8(actual).unwrap(), &message[..length]);
+            assert_eq!(
+                status.flags & kernelet_abi::STATUS_MESSAGE_TRUNCATED != 0,
+                truncated
+            );
+            assert!(status.message[length..].iter().all(|byte| *byte == 0));
+        }
+    }
 }
 
 impl SandboxFile {
@@ -179,16 +315,16 @@ impl SandboxFile {
     }
 
     fn set_budget(&self, args: BudgetArgs) -> Result<()> {
-        if args.reserved0 != [0; 3]
-            || !(-20..=19).contains(&args.nice)
-            || (args.cpu_quota_us != 0 && args.cpu_period_us <= 1_000)
-        {
+        if args.reserved0 != [0; 3] {
             return_errno_with_message!(Errno::EINVAL, "invalid kernelet budget");
         }
         let budget = CpuBudget {
             nice: args.nice,
             quota: (args.cpu_quota_us != 0).then_some((args.cpu_quota_us, args.cpu_period_us)),
         };
+        budget
+            .validate()
+            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid kernelet budget"))?;
         let kernelet = {
             let mut state = self.state.lock();
             match &mut *state {
@@ -217,6 +353,11 @@ impl SandboxFile {
         let mut raw = StatsRaw {
             state: self.status().state,
             cid: self.cid,
+            completion_cpu_ns: kernelet_abi::STATS_UNAVAILABLE,
+            ingress_copy_cpu_ns: kernelet_abi::STATS_UNAVAILABLE,
+            service_calls: kernelet_abi::STATS_UNAVAILABLE,
+            mmio_accesses: kernelet_abi::STATS_UNAVAILABLE,
+            irqs_raised: kernelet_abi::STATS_UNAVAILABLE,
             ..StatsRaw::default()
         };
         if let Some(kernelet) = kernelet {

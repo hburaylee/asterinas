@@ -68,6 +68,9 @@ pub(crate) struct Cursor<'rcu, C: PageTableConfig> {
     ///
     /// From `level` to `guard_level`, the nodes are held in `path`.
     guard_level: PagingLevel,
+    /// Requested mapping granularity. Absent descendants can require a
+    /// higher actual lock root without granting permission for larger leaves.
+    mapping_level_limit: PagingLevel,
     /// The virtual address that the cursor currently points to.
     va: Vaddr,
     /// The virtual address range that is locked.
@@ -152,7 +155,17 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
                 PteStateRef::Mapped(item) => Some(item),
             };
 
-            return Ok((self.cur_va_range(), item));
+            let range = if item.is_none() {
+                // An absent ancestor proves the intersection is empty, but
+                // does not authorize querying outside this cursor's barrier.
+                let size = page_size::<C>(self.level);
+                let start = self.va.align_down(size);
+                start.max(self.barrier_va.start)
+                    ..start.saturating_add(size).min(self.barrier_va.end)
+            } else {
+                self.cur_va_range()
+            };
+            return Ok((range, item));
         }
     }
 
@@ -248,12 +261,7 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
             }
         }
 
-        // If the last entry is absent or empty, but `barrier_va.end` sits in
-        // the middle, `self.move_forward()` will set `self.va` to exceed
-        // `barrier_va.end`. We fix it and ensure `self.va <= barrier_va.end`.
-        if self.va > self.barrier_va.end {
-            self.va = self.barrier_va.end;
-        }
+        debug_assert!(self.va <= self.barrier_va.end);
 
         None
     }
@@ -301,7 +309,9 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
     /// If reached the end of the current page table node, it (recursively)
     /// moves itself up to the next page of the parent page.
     fn move_forward(&mut self) {
-        let next_va = self.cur_va_range().end;
+        // The final canonical ancestor can end at 2^64, which Vaddr cannot
+        // represent. Advance only within the cursor's representable barrier.
+        let next_va = self.cur_va_range().end.min(self.barrier_va.end);
         while self.level < self.guard_level && pte_index::<C>(next_va, self.level) == 0 {
             self.pop_level();
         }
@@ -337,7 +347,7 @@ impl<'rcu, C: PageTableConfig> Cursor<'rcu, C> {
     fn cur_va_range(&self) -> Range<Vaddr> {
         let entry_size = page_size::<C>(self.level);
         let entry_start = self.va.align_down(entry_size);
-        entry_start..entry_start + entry_size
+        entry_start..entry_start.saturating_add(entry_size)
     }
 }
 
@@ -377,6 +387,16 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
         Cursor::new(pt, guard, va, min_level).map(|inner| Self(inner))
     }
 
+    pub(super) fn new_for_mapping(
+        pt: &'rcu PageTable<C>,
+        guard: &'rcu dyn InAtomicMode,
+        va: &Range<Vaddr>,
+        max_map_level: PagingLevel,
+    ) -> Result<Self, PageTableError> {
+        assert!((1..=C::HIGHEST_TRANSLATION_LEVEL).contains(&max_map_level));
+        Cursor::new(pt, guard, va, max_map_level).map(|inner| Self(inner))
+    }
+
     /// Moves the cursor forward to the next mapped virtual address.
     ///
     /// This is the same as [`Cursor::find_next`].
@@ -408,6 +428,42 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
         self.0.query()
     }
 
+    /// Prepares the empty leaf at `va` before a batch publishes any mapping.
+    ///
+    /// All allocation failures are reported here. Holding this cursor until
+    /// commit keeps these nodes locked, so subsequent `map` calls for prepared
+    /// leaves cannot allocate. A failed preparation may leave empty nodes,
+    /// but never a mapping or an ownership transfer of the caller's frames.
+    pub(in crate::mm) fn prepare_mapping(
+        &mut self,
+        va: Vaddr,
+        level: PagingLevel,
+    ) -> crate::Result<()> {
+        assert!((1..=self.0.mapping_level_limit).contains(&level));
+        self.jump(va)?;
+        while self.0.level < level {
+            self.0.pop_level();
+        }
+        let guard = self.0.rcu_guard;
+        while self.0.level > level {
+            let mut entry = self.0.cur_entry();
+            let child = match entry.to_ref() {
+                PteStateRef::PageTable(pt) => {
+                    // SAFETY: The cursor owns this subtree's locks, and no
+                    // guard for this child exists on the cursor path yet.
+                    unsafe { pt.make_guard_unchecked(guard) }
+                }
+                PteStateRef::Absent => entry.try_alloc_if_none(guard)?.unwrap(),
+                PteStateRef::Mapped(_) => return Err(crate::Error::InvalidArgs),
+            };
+            self.0.push_level(child);
+        }
+        if !matches!(self.0.cur_entry().to_ref(), PteStateRef::Absent) {
+            return Err(crate::Error::InvalidArgs);
+        }
+        Ok(())
+    }
+
     /// Maps the item starting from the current address to a physical address range.
     ///
     /// The current virtual address should not be mapped.
@@ -416,7 +472,7 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
     ///
     /// This function will panic if
     ///  - the virtual address range to be mapped is out of the locked range;
-    ///  - the item requires a higher level than the cursor has locked;
+    ///  - the item's level exceeds the cursor's locked root level;
     ///  - the current virtual address is not aligned to the page size of the
     ///    item to be mapped;
     ///  - the virtual address range contains mappings that conflicts with the item.
@@ -443,6 +499,10 @@ impl<'rcu, C: PageTableConfig> CursorMut<'rcu, C> {
         assert!(
             size <= self.0.barrier_va.end - self.0.va,
             "cursor virtual address out-of-bound for mapping"
+        );
+        assert!(
+            level <= self.0.mapping_level_limit,
+            "mapping level exceeds cursor lock root"
         );
 
         let rcu_guard = self.0.rcu_guard;

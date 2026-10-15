@@ -63,6 +63,3 @@ pub(crate) unsafe fn init_on_ap(cpu_id: u32) {
     // 2. The CPU ID of the AP is correct.
     unsafe { id::init_on_ap(cpu_id) };
 }
-
-#[cfg(all(target_arch = "x86_64", not(feature = "kernelet")))]
-pub(crate) use id::host_cpu_gs_offset;

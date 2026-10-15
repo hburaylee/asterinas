@@ -273,13 +273,7 @@ fn vfs_utimes(path: &Path, times: Option<TimeSpecPair>) -> Result<SyscallReturn>
     };
 
     // Update times.
-    if let Some(atime) = atime {
-        path.set_atime(atime);
-    }
-    if let Some(mtime) = mtime {
-        path.set_mtime(mtime);
-    }
-    path.set_ctime(ctime);
+    path.set_times(atime, mtime, ctime)?;
     fs::vfs::notify::on_attr_change(path);
     Ok(SyscallReturn::Return(0))
 }

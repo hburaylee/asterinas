@@ -21,6 +21,8 @@ use crate::{
 
 /// Local data for a POSIX thread.
 pub(crate) struct ThreadLocal {
+    #[cfg(kernelet_rq1_diagnostics)]
+    getpid_timeline: RefCell<ostd::kernelet::getpid_profile::timeline::Timeline>,
     // TID pointers.
     // https://man7.org/linux/man-pages/man2/set_tid_address.2.html
     set_child_tid: Cell<Vaddr>,
@@ -71,6 +73,8 @@ impl ThreadLocal {
         ns_proxy: Arc<NsProxy>,
     ) -> Self {
         Self {
+            #[cfg(kernelet_rq1_diagnostics)]
+            getpid_timeline: RefCell::new(ostd::kernelet::getpid_profile::timeline::Timeline::new()),
             set_child_tid: Cell::new(set_child_tid),
             clear_child_tid: Cell::new(clear_child_tid),
             vmar: RefCell::new(Some(vmar)),
@@ -89,6 +93,13 @@ impl ThreadLocal {
 
     pub(crate) fn set_child_tid(&self) -> &Cell<Vaddr> {
         &self.set_child_tid
+    }
+
+    #[cfg(kernelet_rq1_diagnostics)]
+    pub(crate) fn getpid_timeline(
+        &self,
+    ) -> &RefCell<ostd::kernelet::getpid_profile::timeline::Timeline> {
+        &self.getpid_timeline
     }
 
     pub(crate) fn clear_child_tid(&self) -> &Cell<Vaddr> {

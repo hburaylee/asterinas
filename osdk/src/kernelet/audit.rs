@@ -5,13 +5,15 @@
 //! After the kernelet image is linked and before the host image is built, OSDK
 //! checks the image and fails the build on any violation. The checks implement
 //! the artifact-level audit items listed in `kernelet/ABI.md`; each violation
-//! message names the item it belongs to.
+//! message names the item it belongs to. The book's FP/SIMD item 11 is labeled
+//! separately from the ABI's fixed-assembly item 11.
 
 use super::{
     abi,
     elf::{self, DynamicEntry, ElfImage, ProgramHeader, Relocation, SectionHeader, Symbol},
 };
 
+mod floating_point;
 mod prefixes;
 
 /// The alignment that lets the read-only and the writable mappings of an
@@ -107,8 +109,19 @@ pub fn audit_kernelet_image(
         image.e_entry().unwrap_or_default(),
         entry_table.vcpu_entry(),
         entry_table.virq_entry(),
+        entry_table.yield_entry(),
+        entry_table.exit_entry(),
+        entry_table.stub_range_start(),
+        entry_table.stub_range_end(),
     ) {
         violations.push(err);
+    }
+    if let Err(err) =
+        floating_point::audit(bytes, &program_headers, &sections, &section_names, &symbols)
+    {
+        violations.push(format!(
+            "audit item 11 (FP/SIMD): physical-control/state audit: {err}"
+        ));
     }
 
     if violations.is_empty() {
@@ -139,6 +152,8 @@ fn check_10_indirect_targets(
         ("image entry".to_string(), entry),
         ("secondary vCPU entry".to_string(), table.vcpu_entry()),
         ("virtual interrupt entry".to_string(), table.virq_entry()),
+        ("carrier yield entry".to_string(), table.yield_entry()),
+        ("carrier exit entry".to_string(), table.exit_entry()),
     ];
     let relocated = relocations.iter().filter_map(|relocation| {
         if relocation.rtype != elf::R_X86_64_RELATIVE {
@@ -224,6 +239,30 @@ impl<'a> EntryTableBytes<'a> {
 
     fn virq_entry(&self) -> u64 {
         self.field(abi::entry_table::VIRQ_ENTRY_OFFSET)
+    }
+
+    fn yield_entry(&self) -> u64 {
+        self.field(abi::entry_table::YIELD_ENTRY_OFFSET)
+    }
+
+    fn exit_entry(&self) -> u64 {
+        self.field(abi::entry_table::EXIT_ENTRY_OFFSET)
+    }
+
+    fn stub_range_start(&self) -> u64 {
+        self.field(abi::entry_table::STUB_RANGE_START_OFFSET)
+    }
+
+    fn stub_range_end(&self) -> u64 {
+        self.field(abi::entry_table::STUB_RANGE_END_OFFSET)
+    }
+
+    fn cpu_access_start(&self) -> u64 {
+        self.field(abi::entry_table::CPU_ACCESS_START_OFFSET)
+    }
+
+    fn cpu_access_end(&self) -> u64 {
+        self.field(abi::entry_table::CPU_ACCESS_END_OFFSET)
     }
 
     fn cpu_local_start(&self) -> u64 {
@@ -465,14 +504,43 @@ fn check_4_entry_table(
     for (name, entry) in [
         ("vcpu_entry", table.vcpu_entry()),
         ("virq_entry", table.virq_entry()),
+        ("yield_entry", table.yield_entry()),
+        ("exit_entry", table.exit_entry()),
     ] {
-        if !loads.text.covers_vaddr_range(entry, entry + 1) {
+        if entry
+            .checked_add(1)
+            .is_none_or(|end| !loads.text.covers_vaddr_range(entry, end))
+        {
             violations.push(format!(
                 "audit item 4: the entry table's {name} offset {entry:#x} does not decode inside the executable text segment"
             ));
         }
     }
+    let stub_range = table.stub_range_start()..table.stub_range_end();
+    if stub_range.is_empty()
+        || !loads
+            .text
+            .covers_vaddr_range(stub_range.start, stub_range.end)
+        || [table.virq_entry(), table.yield_entry(), table.exit_entry()]
+            .iter()
+            .any(|entry| !stub_range.contains(entry))
+    {
+        violations.push(format!(
+            "audit item 4: the entry table's stub range [{:#x}, {:#x}) must be executable and contain all three redirect entries",
+            stub_range.start, stub_range.end
+        ));
+    }
     let (cpu_local_start, cpu_local_end) = (table.cpu_local_start(), table.cpu_local_end());
+    let access = table.cpu_access_start()..table.cpu_access_end();
+    if access.is_empty()
+        || !loads.text.covers_vaddr_range(access.start, access.end)
+        || (access.start < stub_range.end && stub_range.start < access.end)
+    {
+        violations.push(format!(
+            "audit item 4: CPU-access range [{:#x}, {:#x}) must be nonempty executable text and disjoint from the fixed stub range",
+            access.start, access.end
+        ));
+    }
     if cpu_local_start > cpu_local_end
         || !loads
             .data
@@ -548,6 +616,16 @@ fn check_5_data_template(
     let Some(sym_ex_table_end) = read_symbol("__ex_table_end") else {
         return;
     };
+    let Some(access_start) = read_symbol("__kernelet_cpu_access_start") else {
+        return;
+    };
+    let Some(access_end) = read_symbol("__kernelet_cpu_access_end") else {
+        return;
+    };
+    if access_start != table.cpu_access_start() || access_end != table.cpu_access_end() {
+        violations
+            .push("audit item 4: CPU-access range disagrees with its linker symbols".to_string());
+    }
 
     // The bounds must agree with the entry table the Host will decode.
     if sym_cpu_local_start != table.cpu_local_start() || sym_cpu_local_end != table.cpu_local_end()

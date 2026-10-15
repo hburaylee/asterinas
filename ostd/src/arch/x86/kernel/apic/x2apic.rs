@@ -1,9 +1,11 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use core::arch::asm;
+
 use x86::msr::{
     IA32_APIC_BASE, IA32_X2APIC_APICID, IA32_X2APIC_CUR_COUNT, IA32_X2APIC_DIV_CONF,
-    IA32_X2APIC_EOI, IA32_X2APIC_ESR, IA32_X2APIC_ICR, IA32_X2APIC_INIT_COUNT,
-    IA32_X2APIC_LVT_TIMER, IA32_X2APIC_SIVR, IA32_X2APIC_VERSION, rdmsr, wrmsr,
+    IA32_X2APIC_EOI, IA32_X2APIC_ICR, IA32_X2APIC_INIT_COUNT, IA32_X2APIC_LVT_TIMER,
+    IA32_X2APIC_SIVR, IA32_X2APIC_VERSION, rdmsr, wrmsr,
 };
 
 use super::ApicTimer;
@@ -53,8 +55,8 @@ impl X2Apic {
                 wrmsr(IA32_APIC_BASE, base);
             }
 
-            // Set SVR. Enable APIC and set Spurious Vector to 15 (reserved IRQ number).
-            let svr: u64 = (1 << 8) | 15;
+            // Use a reserved external vector with the legacy low bits set.
+            let svr: u64 = (1 << 8) | crate::arch::irq::SPURIOUS_VECTOR as u64;
             wrmsr(IA32_X2APIC_SIVR, svr);
         }
     }
@@ -76,20 +78,13 @@ impl super::Apic for X2Apic {
     unsafe fn send_ipi(&self, icr: super::Icr) {
         let _guard = crate::irq::disable_local();
 
-        // SAFETY: These operations write the interrupt command to APIC and wait for results. The
-        // caller guarantees it's safe to execute this interrupt command.
+        // SAFETY: The caller guarantees that this interrupt command is safe to execute.
         unsafe {
-            wrmsr(IA32_X2APIC_ESR, 0);
+            // x2APIC WRMSR is not serializing. Publish prior memory accesses before
+            // sending the IPI (Intel SDM Vol. 3A, Section 13.12.3).
+            asm!("mfence", "lfence", options(nostack, preserves_flags));
+            // Writing the ICR dispatches the IPI; x2APIC has no delivery-status bit.
             wrmsr(IA32_X2APIC_ICR, icr.0);
-            loop {
-                let icr = rdmsr(IA32_X2APIC_ICR);
-                if ((icr >> 12) & 0x1) == 0 {
-                    break;
-                }
-                if rdmsr(IA32_X2APIC_ESR) > 0 {
-                    break;
-                }
-            }
         }
     }
 }

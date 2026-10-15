@@ -19,7 +19,7 @@ __atomic_load_fallible: # (ptr: *const u32) -> u64;
 .size __atomic_load_fallible, .-__atomic_load_fallible
 
 .pushsection .ex_table, "a", @progbits
-    .align 8
+    .balign 8
     .quad .load - .
     .quad .load_fault - .
 .popsection

@@ -21,6 +21,7 @@ use crate::irq::IrqLine;
 static TIMER_IRQ: Once<IrqLine> = Once::new();
 
 /// Reports whether a physical trap is the native APIC timer line.
+#[cfg(feature = "kernelet-host")]
 pub(crate) fn is_timer_irq(line: usize) -> bool {
     TIMER_IRQ
         .get()

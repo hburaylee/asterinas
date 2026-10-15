@@ -3,20 +3,20 @@
 use alloc::sync::Arc;
 use core::time::Duration;
 
-use aster_time::read_monotonic_time;
+#[cfg(not(feature = "kernelet"))]
+use ostd::sync::SpinLock;
 use ostd::{
     cpu::{CpuId, PinCurrentCpu},
     cpu_local,
-    sync::SpinLock,
     task::disable_preempt,
     timer::{Jiffies, TIMER_FREQ},
 };
 use paste::paste;
 use spin::Once;
 
-use crate::time::{
-    self, Clock, SystemTime, system_time::START_TIME_AS_DURATION, timer::TimerManager,
-};
+#[cfg(not(feature = "kernelet"))]
+use crate::time::system_time::START_TIME_AS_DURATION;
+use crate::time::{self, Clock, SystemTime, timer::TimerManager};
 
 /// The Clock that reads the jiffies, and turn the counter into `Duration`.
 pub(crate) struct JiffiesClock {
@@ -80,6 +80,7 @@ pub(crate) struct RealTimeCoarseClock {
 
 impl RealTimeCoarseClock {
     /// A reference to the current value of this clock.
+    #[cfg(not(feature = "kernelet"))]
     fn current_ref() -> &'static Once<SpinLock<Duration>> {
         static CURRENT: Once<SpinLock<Duration>> = Once::new();
 
@@ -165,31 +166,47 @@ impl Clock for RealTimeClock {
 
 impl Clock for MonotonicClock {
     fn read_time(&self) -> Duration {
-        read_monotonic_time()
+        time::read_monotonic_time()
     }
 }
 
 impl Clock for RealTimeCoarseClock {
     fn read_time(&self) -> Duration {
-        *Self::current_ref().get().unwrap().disable_irq().lock()
+        #[cfg(feature = "kernelet")]
+        {
+            SystemTime::now()
+                .duration_since(&SystemTime::UNIX_EPOCH)
+                .unwrap()
+        }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            *Self::current_ref().get().unwrap().disable_irq().lock()
+        }
     }
 }
 
 impl Clock for MonotonicCoarseClock {
     fn read_time(&self) -> Duration {
-        RealTimeCoarseClock::get().read_time() - *START_TIME_AS_DURATION.get().unwrap()
+        #[cfg(feature = "kernelet")]
+        {
+            time::read_monotonic_time()
+        }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            RealTimeCoarseClock::get().read_time() - *START_TIME_AS_DURATION.get().unwrap()
+        }
     }
 }
 
 impl Clock for MonotonicRawClock {
     fn read_time(&self) -> Duration {
-        read_monotonic_time()
+        time::read_monotonic_time()
     }
 }
 
 impl Clock for BootTimeClock {
     fn read_time(&self) -> Duration {
-        read_monotonic_time()
+        time::read_monotonic_time()
     }
 }
 
@@ -313,12 +330,14 @@ pub(crate) fn next_timer_expiry(cpu: CpuId) -> Option<u64> {
     earliest
 }
 
+#[cfg(not(feature = "kernelet"))]
 fn update_coarse_clock() {
     let real_time = RealTimeClock::get().read_time();
     let current = RealTimeCoarseClock::current_ref().get().unwrap();
     *current.disable_irq().lock() = real_time;
 }
 
+#[cfg(not(feature = "kernelet"))]
 fn init_coarse_clock() {
     let real_time = RealTimeClock::get().read_time();
     RealTimeCoarseClock::current_ref().call_once(|| SpinLock::new(real_time));
@@ -329,26 +348,20 @@ pub(super) fn init() {
     init_system_wide_clocks();
     init_system_wide_timer_managers();
     init_jiffies_clock_manager();
+    #[cfg(not(feature = "kernelet"))]
     init_coarse_clock();
 }
 
 #[cfg(ktest)]
-/// Init `CLOCK_REALTIME_MANAGER` for process-related ktests.
-///
-/// TODO: `ktest` may require a feature that allows the registration of initialization functions
-/// to avoid functions like this one.
+/// Initializes real clocks and timer dispatch for kernel tests.
 pub(crate) fn init_for_ktest() {
-    // If `spin::Once` has initialized, this closure will not be executed.
-    for cpu in ostd::cpu::all_cpus() {
-        CLOCK_REALTIME_MANAGER.get_on_cpu(cpu).call_once(|| {
-            let clock = RealTimeClock { _private: () };
-            TimerManager::new(Arc::new(clock))
-        });
-    }
-    CLOCK_REALTIME_COARSE_INSTANCE.call_once(|| Arc::new(RealTimeCoarseClock { _private: () }));
-    RealTimeCoarseClock::current_ref().call_once(|| SpinLock::new(Duration::from_secs(0)));
-    JIFFIES_TIMER_MANAGER.call_once(|| {
-        let clock = JiffiesClock { _private: () };
-        TimerManager::new(Arc::new(clock))
+    static INIT: Once<()> = Once::new();
+    INIT.call_once(|| {
+        #[cfg(not(feature = "kernelet"))]
+        aster_time::init_for_ktest();
+        aster_softirq::init_for_ktest();
+        time::system_time::init();
+        init();
+        time::softirq::init();
     });
 }

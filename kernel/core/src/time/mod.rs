@@ -27,6 +27,20 @@ const NSEC_PER_USEC: i64 = 1_000;
 const USEC_PER_SEC: i64 = 1_000_000;
 pub(crate) const NSEC_PER_SEC: i64 = 1_000_000_000;
 
+/// Reads elapsed time in the kernel's monotonic clock domain.
+///
+/// Images consume the Host snapshot; they do not initialize a machine clocksource.
+pub(crate) fn read_monotonic_time() -> Duration {
+    #[cfg(feature = "kernelet")]
+    {
+        Duration::from_nanos(ostd::kernelet::entry::clock_now_ns())
+    }
+    #[cfg(not(feature = "kernelet"))]
+    {
+        aster_time::read_monotonic_time()
+    }
+}
+
 pub(super) fn init() {
     system_time::init();
     clocks::init();
