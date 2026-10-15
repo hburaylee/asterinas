@@ -5,12 +5,9 @@ use core::time::Duration;
 
 #[cfg(not(feature = "kernelet"))]
 use ostd::sync::SpinLock;
-use ostd::{
-    cpu::{CpuId, PinCurrentCpu},
-    cpu_local,
-    task::disable_preempt,
-    timer::{Jiffies, TIMER_FREQ},
-};
+#[cfg(feature = "kernelet")]
+use ostd::{cpu::CpuId, timer::TIMER_FREQ};
+use ostd::{cpu::PinCurrentCpu, cpu_local, task::disable_preempt, timer::Jiffies};
 use paste::paste;
 use spin::Once;
 
@@ -306,6 +303,7 @@ fn init_jiffies_clock_manager() {
 }
 
 /// Returns the next timer expiry in the shared elapsed-jiffy clock domain.
+#[cfg(feature = "kernelet")]
 pub(crate) fn next_timer_expiry(cpu: CpuId) -> Option<u64> {
     let now_jiffies = Jiffies::elapsed().as_u64();
     let tick_ns = 1_000_000_000 / TIMER_FREQ;

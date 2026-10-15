@@ -2,11 +2,12 @@
 
 use alloc::{boxed::Box, vec, vec::Vec};
 
-use aster_softirq::{BottomHalfDisabled, SoftIrqLine, softirq_id::TIMER_SOFTIRQ_ID};
-use ostd::{
-    sync::{RcuOption, SpinGuardian},
-    timer,
-};
+#[cfg(feature = "kernelet")]
+use aster_softirq::BottomHalfDisabled;
+use aster_softirq::{SoftIrqLine, softirq_id::TIMER_SOFTIRQ_ID};
+#[cfg(feature = "kernelet")]
+use ostd::sync::SpinGuardian;
+use ostd::{sync::RcuOption, timer};
 
 #[expect(clippy::type_complexity)]
 static TIMER_SOFTIRQ_CALLBACKS: RcuOption<Box<Vec<fn()>>> = RcuOption::new_none();
@@ -15,14 +16,18 @@ pub(super) fn init() {
     SoftIrqLine::get(TIMER_SOFTIRQ_ID).enable(timer_softirq_handler);
 
     timer::register_callback_on_cpu(raise_timer_softirq);
-    timer::register_next_expiry_callback(super::clocks::next_timer_expiry);
-    timer::register_deadline_callback(process_timer_deadline);
+    #[cfg(feature = "kernelet")]
+    {
+        timer::register_next_expiry_callback(super::clocks::next_timer_expiry);
+        timer::register_deadline_callback(process_timer_deadline);
+    }
 }
 
 fn raise_timer_softirq() {
     SoftIrqLine::get(TIMER_SOFTIRQ_ID).raise();
 }
 
+#[cfg(feature = "kernelet")]
 fn process_timer_deadline() {
     // Dropping this guard drains the raised softirq in task context, including
     // when no physical or virtual execution tick accompanies the wakeup.

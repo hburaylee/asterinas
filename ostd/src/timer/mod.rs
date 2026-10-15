@@ -8,6 +8,7 @@ use alloc::{boxed::Box, vec::Vec};
 use core::{cell::RefCell, sync::atomic::Ordering};
 
 pub use jiffies::Jiffies;
+#[cfg(feature = "kernelet")]
 use spin::Once;
 
 #[cfg(feature = "kernelet")]
@@ -36,8 +37,11 @@ type InterruptCallback = Box<dyn Fn() + Sync + Send>;
 type SampledTaskCallback =
     Box<dyn Fn(&crate::task::Task, crate::cpu::PrivilegeLevel, u64) + Sync + Send>;
 
+#[cfg(feature = "kernelet")]
 static NEXT_EXPIRY: Once<fn(CpuId) -> Option<u64>> = Once::new();
+#[cfg(feature = "kernelet")]
 static DEADLINE_CALLBACK: Once<fn()> = Once::new();
+#[cfg(feature = "kernelet")]
 static IDLE_ELAPSED_CALLBACK: Once<fn(u64)> = Once::new();
 
 #[cfg(feature = "kernelet")]
@@ -106,16 +110,19 @@ pub(crate) fn call_sampled_task_callbacks(
 /// entered an RCU extended quiescent state. It must not start an RCU reader or
 /// sleep. The callback may retire objects; the idle path rechecks for ready
 /// RCU callbacks before entering the Host wait.
+#[cfg(feature = "kernelet")]
 pub fn register_next_expiry_callback(func: fn(CpuId) -> Option<u64>) {
     NEXT_EXPIRY.call_once(|| func);
 }
 
 /// Registers the timer-wheel callback used after an idle deadline expires.
+#[cfg(feature = "kernelet")]
 pub fn register_deadline_callback(func: fn()) {
     DEADLINE_CALLBACK.call_once(|| func);
 }
 
 /// Registers a bulk idle-time accounting callback.
+#[cfg(feature = "kernelet")]
 pub fn register_idle_elapsed_callback(func: fn(u64)) {
     IDLE_ELAPSED_CALLBACK.call_once(|| func);
 }

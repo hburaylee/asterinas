@@ -111,6 +111,7 @@ impl CpuTimeStatsManager {
         self.idle.add_on_cpu(cpu, 1);
     }
 
+    #[cfg(feature = "kernelet")]
     fn add_idle_time(&self, cpu: CpuId, jiffies: u64) {
         self.idle
             .add_on_cpu(cpu, jiffies.min(isize::MAX as u64) as isize);
@@ -189,6 +190,7 @@ fn is_idle() -> bool {
     }
 }
 
+#[cfg(feature = "kernelet")]
 fn update_idle_elapsed(jiffies: u64) {
     // The Host measured actual parked time; no execution tick or CPU timer is charged.
     CpuTimeStatsManager::singleton().add_idle_time(CpuId::current_racy(), jiffies);
@@ -196,6 +198,7 @@ fn update_idle_elapsed(jiffies: u64) {
 
 pub(crate) fn init() {
     SINGLETON.call_once(CpuTimeStatsManager::new);
+    #[cfg(feature = "kernelet")]
     ostd::timer::register_idle_elapsed_callback(update_idle_elapsed);
 }
 

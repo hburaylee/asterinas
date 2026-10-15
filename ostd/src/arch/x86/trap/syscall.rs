@@ -97,9 +97,12 @@ impl RawUserContext {
     ///
     /// If `trap_num` is `0x100`, it will go user by `sysret` (`rcx` and `r11` are dropped),
     /// otherwise it will use `iret`.
-    // Keep the small native entry wrapper inside its hot caller; optional
+    // Keep the small Host entry wrapper inside its hot caller; optional
     // per-call profiling has a separate, larger body.
-    #[cfg_attr(not(kernelet_getpid_profile), inline(always))]
+    #[cfg_attr(
+        all(feature = "kernelet-host", not(kernelet_getpid_profile)),
+        inline(always)
+    )]
     pub(in crate::arch) fn run(&mut self, guard: DisabledLocalIrqGuard) {
         #[cfg(kernelet_getpid_profile)]
         let raw_span = if profile::enabled() {

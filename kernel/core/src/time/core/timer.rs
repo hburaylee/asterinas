@@ -193,6 +193,7 @@ impl TimerManager {
     }
 
     /// Returns the earliest live expiry in this manager's clock domain.
+    #[cfg(feature = "kernelet")]
     pub(crate) fn next_expiry(&self) -> Option<Duration> {
         let mut callbacks = self.timer_callbacks.disable_irq().lock();
         loop {
