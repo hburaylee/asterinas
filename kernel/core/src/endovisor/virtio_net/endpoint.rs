@@ -21,17 +21,19 @@ use super::{
     sockets::TCP_LISTENER_RESERVATION_BYTES,
 };
 use crate::{
+    dispatch_ioctl,
     events::IoEvents,
     fs::{
         file::{AccessMode, FileCommon, FileLike, StatusFlags, file_table::FdFlags},
         pseudofs::AnonInodeFs,
     },
+    ioc,
     prelude::*,
     process::{
         Uid,
         signal::{PollHandle, Pollable, Pollee},
     },
-    util::ioctl::{InData, RawIoctl, dispatch_ioctl, ioc},
+    util::ioctl::{InData, RawIoctl},
 };
 
 // These slots retain the first event of each kind, independently of repeats.

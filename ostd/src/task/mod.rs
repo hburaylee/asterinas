@@ -50,7 +50,7 @@ static PRE_SCHEDULE_HANDLER: Once<fn(&DisabledLocalIrqGuard)> = Once::new();
 
 static POST_SCHEDULE_HANDLER: Once<fn()> = Once::new();
 
-#[cfg(all(ktest, target_arch = "x86_64", not(feature = "kernelet")))]
+#[cfg(all(ktest, target_arch = "x86_64"))]
 pub(crate) fn preempt_guard_count() -> u32 {
     preempt::cpu_local::get_guard_count()
 }

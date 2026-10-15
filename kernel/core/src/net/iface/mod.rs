@@ -5,10 +5,9 @@ mod init;
 mod poll;
 mod sched;
 
-pub(crate) use broadcast::is_broadcast_endpoint;
+pub(super) use init::{init, iter_all_ifaces};
 #[cfg(ktest)]
-pub(crate) use init::init_loopback_for_ktest;
-pub(crate) use init::{init, iter_all_ifaces, loopback_iface, virtio_iface};
+pub(crate) use init::{init_loopback_for_ktest, loopback_iface};
 pub(super) use poll::init_in_first_kthread;
 
 pub(super) type Iface = dyn aster_bigtcp::iface::Iface<ext::BigtcpExt>;

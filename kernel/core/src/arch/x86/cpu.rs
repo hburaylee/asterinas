@@ -7,7 +7,7 @@ use ostd::{
     arch::{
         cpu::{
             context::{
-                CpuException, PageFaultErrorCode, RawPageFaultInfo, USER_MODIFIABLE_RFLAGS,
+                CpuException, PageFaultErrorCode, RFlags, RawPageFaultInfo, USER_MODIFIABLE_RFLAGS,
                 UserContext,
             },
             cpuid::cpuid,
@@ -19,7 +19,6 @@ use ostd::{
     sync::SpinLock,
     task::DisabledPreemptGuard,
 };
-use x86_64::registers::rflags::RFlags;
 
 use crate::{
     cpu::LinuxAbi,

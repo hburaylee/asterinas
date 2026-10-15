@@ -122,6 +122,11 @@ pub(super) const EXCEPTIONS: &[Exception] = &[
         "global logger registration uses shared static state",
     ),
     Exception::external(
+        "log",
+        "0.4.33",
+        "global logger registration uses shared static state",
+    ),
+    Exception::external(
         "num-traits",
         "0.2.19",
         "numeric casts use unchecked conversion intrinsics",
@@ -142,6 +147,11 @@ pub(super) const EXCEPTIONS: &[Exception] = &[
         "pointer metadata constructors use raw-pointer operations",
     ),
     Exception::external(
+        "ptr_meta",
+        "0.3.1",
+        "pointer metadata constructors use raw-pointer operations",
+    ),
+    Exception::external(
         "scopeguard",
         "1.2.0",
         "scope-exit guard moves a value from ManuallyDrop",
@@ -152,8 +162,18 @@ pub(super) const EXCEPTIONS: &[Exception] = &[
         "serialization internals use unchecked pointer casts",
     ),
     Exception::external(
+        "serde_core",
+        "1.0.228",
+        "serialization internals use unchecked pointer casts",
+    ),
+    Exception::external(
         "smallvec",
         "1.16.2",
+        "inline vector storage manages uninitialized elements",
+    ),
+    Exception::external(
+        "smallvec",
+        "1.15.2",
         "inline vector storage manages uninitialized elements",
     ),
     Exception::external(
@@ -179,6 +199,11 @@ pub(super) const EXCEPTIONS: &[Exception] = &[
     Exception::external(
         "zerocopy",
         "0.8.59",
+        "byte-layout traits and slice casts use raw memory access",
+    ),
+    Exception::external(
+        "zerocopy",
+        "0.8.54",
         "byte-layout traits and slice casts use raw memory access",
     ),
     Exception::external(
@@ -279,6 +304,11 @@ pub(super) const EXCEPTIONS: &[Exception] = &[
     Exception::external(
         "time",
         "0.3.55",
+        "date-time internals use unchecked value construction and pointer operations",
+    ),
+    Exception::external(
+        "time",
+        "0.3.53",
         "date-time internals use unchecked value construction and pointer operations",
     ),
     Exception::external(

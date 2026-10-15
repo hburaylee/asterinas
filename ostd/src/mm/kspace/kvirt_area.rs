@@ -631,7 +631,7 @@ mod test {
             let segment = FrameAllocOptions::new()
                 .alloc_segment_aligned(HUGE_SIZE / PAGE_SIZE, HUGE_SIZE)
                 .unwrap();
-            let frame = segment.slice(&(0..PAGE_SIZE)).next().unwrap();
+            let frame = segment.slice(&(0..PAGE_SIZE)).into_iter().next().unwrap();
             let paddr = segment.paddr();
             let mut area = KVirtArea::try_reserve_aligned(HUGE_SIZE, HUGE_SIZE)
                 .unwrap()
@@ -681,7 +681,7 @@ mod test {
         let segment = FrameAllocOptions::new()
             .alloc_segment_aligned(HUGE_SIZE / PAGE_SIZE, HUGE_SIZE)
             .unwrap();
-        let segment_frame = segment.slice(&(0..PAGE_SIZE)).next().unwrap();
+        let segment_frame = segment.slice(&(0..PAGE_SIZE)).into_iter().next().unwrap();
         let existing = FrameAllocOptions::new().alloc_frame().unwrap();
         let mut area = KVirtArea::try_reserve_aligned(HUGE_SIZE, HUGE_SIZE)
             .unwrap()
@@ -761,7 +761,7 @@ mod test {
         let segment = FrameAllocOptions::new()
             .alloc_segment_aligned(HUGE_SIZE / PAGE_SIZE, HUGE_SIZE)
             .unwrap();
-        let frame = segment.slice(&(0..PAGE_SIZE)).next().unwrap();
+        let frame = segment.slice(&(0..PAGE_SIZE)).into_iter().next().unwrap();
         let paddr = segment.paddr();
         let initial_refs = frame.reference_count();
         assert_eq!(initial_refs, 2);

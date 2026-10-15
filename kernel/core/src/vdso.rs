@@ -39,7 +39,7 @@ mod host {
     use aster_util::coeff::Coeff;
     use ostd::{
         const_assert,
-        mm::{PAGE_SIZE, UFrame, VmIo, VmIoOnce, VmReader},
+        mm::{UFrame, VmIo, VmIoOnce, VmReader},
         sync::SpinLock,
     };
     use ostd_pod::IntoBytes;

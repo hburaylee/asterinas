@@ -20,6 +20,7 @@ use super::{
 #[cfg(kernelet_nat_failure_diag_host)]
 use crate::endovisor::policy::{QuotaClass, QuotaTag};
 use crate::{
+    dispatch_ioctl,
     endovisor::{
         io_accounting::{ChargedSpan, WorkCategory},
         policy::{Admission, EndpointReservation, PrestartEndpointReservation},
@@ -36,7 +37,7 @@ use crate::{
         signal::{PollHandle, Pollable, Pollee},
     },
     thread::kernel_thread::ThreadOptions,
-    util::ioctl::{RawIoctl, dispatch_ioctl},
+    util::ioctl::RawIoctl,
 };
 
 const CLOSE_TIMEOUT: Duration = Duration::from_secs(8);
@@ -44,7 +45,7 @@ const CLOSE_CHARGE: usize = size_of::<Closing>() + 32;
 const HOST_ENDPOINT_CHARGE: usize = size_of::<HostEndpoint>() + size_of::<HostEndpointFile>() + 128;
 
 mod ioctl_defs {
-    use crate::util::ioctl::{NoData, ioc};
+    use crate::{ioc, util::ioctl::NoData};
 
     pub(super) type Shutdown = ioc!(KERNELET_VSOCK_SHUTDOWN, 0xc7, 0x32, NoData);
 }

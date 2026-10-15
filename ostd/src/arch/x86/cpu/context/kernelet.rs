@@ -207,7 +207,9 @@ mod test {
         // mov eax, 0x13572468; syscall; ud2.
         let space = UserSpace::new(&[0xb8, 0x68, 0x24, 0x57, 0x13, 0x0f, 0x05, 0x0f, 0x0b]);
         let mut context = space.context();
+        context.rflags |= 1; // Carry must survive both entry and return.
         assert_eq!(enter_until_event(&mut context), USER_RETURN_SYSCALL);
+        assert_eq!(context.rflags & (1 | 2 | (1 << 9)), 1 | 2 | (1 << 9));
         assert_eq!(context.general.rax, 0x13572468);
         assert_eq!(context.general.r12, 0x123456789abcdef0);
         assert_eq!(context.general.rip, USER_CODE + 7);
@@ -219,6 +221,7 @@ mod test {
         assert_eq!(context.general.r12, 0x123456789abcdef0);
         assert_eq!(context.trap_num, 6);
         assert_eq!(context.error_code, 0);
+        assert_eq!(context.rflags & (1 | 2 | (1 << 9)), 1 | 2 | (1 << 9));
     }
 
     #[ktest]

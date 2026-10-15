@@ -502,6 +502,7 @@ const _: () = {
     assert!(offset_of!(CopyFaultRecord, pending) == 16);
     assert!(size_of::<KletUserContext>() == 168);
     assert!(offset_of!(KletUserContext, general) == 0);
+    assert!(offset_of!(KletUserContext, rflags) == 17 * 8);
     assert!(offset_of!(KletUserContext, trap_num) == 18 * 8);
     assert!(offset_of!(KletUserContext, error_code) == 19 * 8);
     assert!(offset_of!(KletUserContext, fault_addr) == 20 * 8);

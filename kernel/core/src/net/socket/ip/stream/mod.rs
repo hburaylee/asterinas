@@ -24,6 +24,7 @@ use super::{
     options::{IpOptionSet, SetIpLevelOption},
 };
 use crate::{
+    dispatch_ioctl,
     events::IoEvents,
     fs::file::{FileCommon, FileLike},
     net::{
@@ -47,7 +48,7 @@ use crate::{
     process::signal::{PollHandle, Pollable, Pollee},
     util::{
         MultiRead, MultiWrite,
-        ioctl::{RawIoctl, common_defs::GetNumBytesToRead, dispatch_ioctl},
+        ioctl::{RawIoctl, common_defs::GetNumBytesToRead},
         net::SockType,
     },
 };

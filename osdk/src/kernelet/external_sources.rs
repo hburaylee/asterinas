@@ -27,17 +27,34 @@ pub(super) fn verify(
     version: &str,
     directory: &Path,
 ) -> io::Result<&'static Identity> {
-    let identity = IDENTITIES
+    if !IDENTITIES
         .iter()
-        .find(|entry| entry.package == package && entry.version == version)
-        .ok_or_else(|| io::Error::other("external unsafe source has no reviewed identity"))?;
-    if tree_hash(directory)? != identity.tree_sha256 {
-        return Err(io::Error::other(format!(
-            "external unsafe source differs from reviewed {} {} ({})",
-            package, version, identity.source
-        )));
+        .any(|entry| entry.package == package && entry.version == version)
+    {
+        return Err(io::Error::other(
+            "external unsafe source has no reviewed identity",
+        ));
     }
-    Ok(identity)
+    let actual_tree = tree_hash(directory)?;
+    select_reviewed_identity(IDENTITIES, package, version, &actual_tree)
+}
+
+fn select_reviewed_identity<'a>(
+    identities: &'a [Identity],
+    package: &str,
+    version: &str,
+    actual_tree: &str,
+) -> io::Result<&'a Identity> {
+    identities
+        .iter()
+        .find(|entry| {
+            entry.package == package && entry.version == version && entry.tree_sha256 == actual_tree
+        })
+        .ok_or_else(|| {
+            io::Error::other(format!(
+                "external unsafe source differs from reviewed {package} {version}"
+            ))
+        })
 }
 
 fn tree_hash(directory: &Path) -> io::Result<String> {
@@ -86,6 +103,55 @@ fn tree_hash(directory: &Path) -> io::Result<String> {
 }
 
 const IDENTITIES: &[Identity] = &[
+    Identity {
+        package: "log",
+        version: "0.4.33",
+        source: "registry+https://github.com/rust-lang/crates.io-index",
+        archive_sha256: Some("0ceec5bc11778974d1bcb055b18002eba7f4b3518b6a0081b3af5f21666da9ad"),
+        tree_sha256: "7f951f5a1f5b389224bc99326191cb5a830ea1ed2295e088841a234b4805a252",
+    },
+    Identity {
+        package: "ptr_meta",
+        version: "0.3.1",
+        source: "registry+https://github.com/rust-lang/crates.io-index",
+        archive_sha256: Some("0b9a0cf95a1196af61d4f1cbdab967179516d9a4a4312af1f31948f8f6224a79"),
+        tree_sha256: "f07085f9837089fc324995936de432b74085b86221e0c182c30c271801ef201d",
+    },
+    Identity {
+        package: "serde_core",
+        version: "1.0.228",
+        source: "registry+https://github.com/rust-lang/crates.io-index",
+        archive_sha256: Some("41d385c7d4ca58e59fc732af25c3983b67ac852c1a25000afe1175de458b67ad"),
+        tree_sha256: "db7f694977ad9ef136aede92fc6e0ba6cb89418a00d6df68fdc7aba65bc3eea4",
+    },
+    Identity {
+        package: "smallvec",
+        version: "1.15.2",
+        source: "registry+https://github.com/rust-lang/crates.io-index",
+        archive_sha256: Some("8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"),
+        tree_sha256: "df60adf186eedcd8f2528aaf767de6a5a3000af78e96a6ee06ff5304c7b001db",
+    },
+    Identity {
+        package: "time",
+        version: "0.3.53",
+        source: "registry+https://github.com/rust-lang/crates.io-index",
+        archive_sha256: Some("18dfaaeddcb932337b5e7866ee7d0ce9b76d2fd092997146f187ec09b4558a50"),
+        tree_sha256: "8f0281b4813add8c9001062bbe600a21bf5e6324aa4de87b62e3c53d327174e6",
+    },
+    Identity {
+        package: "zerocopy",
+        version: "0.8.54",
+        source: "registry+https://github.com/rust-lang/crates.io-index",
+        archive_sha256: Some("b7cbbc0a705a0fd05cc3676525980d2bf5a9bc4adac6d6475209a7887cf59d19"),
+        tree_sha256: "ed583d4678be7caa23bab214ce109d24842146c227fbebfd4c065fb80fe6601d",
+    },
+    Identity {
+        package: "smoltcp",
+        version: "0.11.0",
+        source: "git+https://github.com/asterinas/smoltcp?tag=r_2026-08-11_1b7629c#56ab83798451a91dad5faa3314e5dc592c675d94",
+        archive_sha256: None,
+        tree_sha256: "661be7f6b32bcc0e51778a8d0f33f5d5cfebfa6c08778ecf0aba9bcb8af70bf9",
+    },
     Identity {
         package: "allocator-api2",
         version: "0.2.21",
@@ -413,6 +479,43 @@ const IDENTITIES: &[Identity] = &[
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn same_version_sources_require_an_exact_reviewed_tree() {
+        let identities = [
+            Identity {
+                package: "smoltcp",
+                version: "0.11.0",
+                source: "old-reviewed-git-revision",
+                archive_sha256: None,
+                tree_sha256: "old-reviewed-tree",
+            },
+            Identity {
+                package: "smoltcp",
+                version: "0.11.0",
+                source: "new-reviewed-git-revision",
+                archive_sha256: None,
+                tree_sha256: "new-reviewed-tree",
+            },
+        ];
+        for identity in &identities {
+            let selected = select_reviewed_identity(
+                &identities,
+                identity.package,
+                identity.version,
+                identity.tree_sha256,
+            )
+            .unwrap();
+            assert_eq!(selected.source, identity.source);
+        }
+        for (package, version, tree) in [
+            ("smoltcp", "0.11.0", "unreviewed-tree"),
+            ("smoltcp", "0.11.1", "new-reviewed-tree"),
+            ("impostor", "0.11.0", "new-reviewed-tree"),
+        ] {
+            assert!(select_reviewed_identity(&identities, package, version, tree).is_err());
+        }
+    }
 
     #[test]
     fn same_named_path_dependency_has_no_unsafe_exemption() {

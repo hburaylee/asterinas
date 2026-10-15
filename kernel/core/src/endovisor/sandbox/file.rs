@@ -20,11 +20,12 @@ use ostd::{
 
 use super::{SandboxFile, SandboxState};
 use crate::{
+    dispatch_ioctl,
     events::IoEvents,
     fs::file::{FileCommon, FileLike, file_table::FdFlags},
     prelude::*,
     process::signal::{PollHandle, Pollable},
-    util::ioctl::{RawIoctl, dispatch_ioctl},
+    util::ioctl::RawIoctl,
 };
 
 mod ioctl_defs {
@@ -33,7 +34,10 @@ mod ioctl_defs {
         VsockArgs, VsockPolicyArgs,
     };
 
-    use crate::util::ioctl::{InData, InOutData, NoData, OutData, PassByVal, ioc};
+    use crate::{
+        ioc,
+        util::ioctl::{InData, InOutData, NoData, OutData, PassByVal},
+    };
 
     pub(super) type Create = ioc!(KERNELET_CREATE, 0xc7, 0x01, InOutData<CreateArgs>);
     pub(super) type ListImages = ioc!(KERNELET_LIST_IMAGES, 0xc7, 0x02, OutData<[ImageInfoRaw; 8]>);

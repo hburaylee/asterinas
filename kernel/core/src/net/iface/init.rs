@@ -14,6 +14,11 @@ use crate::{net::iface::sched::PollScheduler, prelude::*};
 
 static IFACES: Once<Vec<Arc<Iface>>> = Once::new();
 
+#[cfg(ktest)]
+pub(crate) fn loopback_iface() -> &'static Arc<Iface> {
+    &IFACES.get().unwrap()[0]
+}
+
 fn virtio_iface() -> Option<&'static Arc<Iface>> {
     IFACES.get().unwrap().get(1)
 }
@@ -53,7 +58,7 @@ pub(in crate::net) fn init() {
 #[cfg(ktest)]
 pub(crate) fn init_loopback_for_ktest() {
     IFACES.call_once(|| vec![new_loopback()]);
-    broadcast::init();
+    crate::net::route::init();
     poll_ifaces();
 }
 

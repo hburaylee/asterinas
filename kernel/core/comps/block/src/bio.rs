@@ -645,3 +645,66 @@ fn share_buffer(buffer: DmaBuffer<FromAndToDevice>) -> DmaBuffer<FromAndToDevice
         buffer
     }
 }
+
+#[cfg(all(feature = "kernelet-host", ktest))]
+mod test {
+    use ostd::{mm::HasDaddr, prelude::*};
+
+    use super::*;
+
+    #[ktest]
+    fn bio_views_keep_arena_pages_until_last_view_is_dropped() {
+        // Use a private, full arena so another BIO cannot obscure early slot reuse.
+        let pool = BioSegmentPool {
+            arena_pool: DmaArenaPool::new(2).unwrap(),
+            direction: BioDirection::ToDevice,
+        };
+        let segment = BioSegment {
+            inner: Arc::new(
+                pool.alloc(2, SECTOR_SIZE, 2 * BLOCK_SIZE - SECTOR_SIZE)
+                    .unwrap(),
+            ),
+        };
+        let allocation_daddr = segment.dma_slice().daddr() - SECTOR_SIZE;
+        let parent = Bio::new(BioType::Write, Sid::from_offset(0), vec![segment], None);
+        let view = parent.segments()[0]
+            .slice(SECTOR_SIZE..3 * SECTOR_SIZE)
+            .unwrap();
+        let nested_view = view.slice(SECTOR_SIZE..2 * SECTOR_SIZE).unwrap();
+        assert_eq!(view.dma_slice().daddr(), allocation_daddr + 2 * SECTOR_SIZE);
+        assert_eq!(
+            nested_view.dma_slice().daddr(),
+            allocation_daddr + 3 * SECTOR_SIZE
+        );
+        assert_eq!(nested_view.nbytes(), SECTOR_SIZE);
+
+        let data = [0xa5u8; SECTOR_SIZE];
+        assert_eq!(
+            nested_view
+                .writer()
+                .unwrap()
+                .write(&mut VmReader::from(data.as_slice())),
+            data.len()
+        );
+        drop(parent);
+        assert!(pool.arena_pool.alloc(1).is_none());
+
+        // This is the actual DMA buffer, rather than a separately allocated test copy.
+        let mut read_back = [0u8; SECTOR_SIZE];
+        assert_eq!(
+            nested_view
+                .dma_slice()
+                .reader()
+                .unwrap()
+                .read(&mut VmWriter::from(read_back.as_mut_slice())),
+            data.len()
+        );
+        assert_eq!(read_back, data);
+
+        drop(view);
+        assert!(pool.arena_pool.alloc(1).is_none());
+        drop(nested_view);
+        let reused = pool.arena_pool.alloc(2).unwrap();
+        assert_eq!(reused.daddr(), allocation_daddr);
+    }
+}

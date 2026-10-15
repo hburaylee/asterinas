@@ -186,7 +186,7 @@ const UDATA: u64 = 0x00CF_F300_0000_FFFF;
 
 pub(in crate::arch) const KERNEL_CS: SegmentSelector =
     SegmentSelector::new(1, PrivilegeLevel::Ring0);
-const KERNEL_SS: SegmentSelector = SegmentSelector::new(2, PrivilegeLevel::Ring0);
+pub(super) const KERNEL_SS: SegmentSelector = SegmentSelector::new(2, PrivilegeLevel::Ring0);
 const_assert!(KERNEL_CS.0 & OFFSET_MASK == offset_of!(Gdt, kcode64) as u16);
 const_assert!(KERNEL_SS.0 & OFFSET_MASK == offset_of!(Gdt, kdata) as u16);
 

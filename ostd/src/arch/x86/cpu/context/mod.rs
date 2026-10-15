@@ -901,3 +901,37 @@ pub(in crate::arch) fn enable_essential_features() {
         }
     }
 }
+
+#[cfg(ktest)]
+mod rflags_tests {
+    use super::{RFlags, UserContext};
+    use crate::{prelude::*, user::UserContextApiInternal};
+
+    #[ktest]
+    fn user_flags_preserve_required_bits_and_reject_privilege_bits() {
+        let mut context = UserContext::default();
+        let required = (RFlags::INTERRUPT_FLAG | RFlags::ID).bits() as usize | 2;
+        let privileged = (RFlags::IOPL_LOW
+            | RFlags::IOPL_HIGH
+            | RFlags::VIRTUAL_8086_MODE
+            | RFlags::VIRTUAL_INTERRUPT
+            | RFlags::VIRTUAL_INTERRUPT_PENDING)
+            .bits() as usize;
+        assert_eq!(context.rflags(), required);
+
+        context.set_rflags(usize::MAX);
+        assert_eq!(context.rflags() & required, required);
+        assert_eq!(context.rflags() & privileged, 0);
+        assert_ne!(context.rflags() & RFlags::CARRY_FLAG.bits() as usize, 0);
+        assert_eq!(context.as_trap_frame().rflags, context.rflags());
+
+        context.general_regs_mut().rip = 0x400000;
+        context.general_regs_mut().rax = usize::MAX;
+        context.set_rflags(0);
+        assert_eq!(context.rflags(), required);
+        let frame = context.as_trap_frame();
+        assert_eq!(frame.rflags, required);
+        assert_eq!(frame.rip, 0x400000);
+        assert_eq!(frame.rax, usize::MAX);
+    }
+}

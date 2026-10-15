@@ -158,6 +158,7 @@ pub(super) struct RawUserContext {
 
 // Both native assembly entry paths access exactly this twenty-word prefix.
 crate::const_assert!(core::mem::offset_of!(RawUserContext, general) == 0);
+crate::const_assert!(core::mem::offset_of!(RawUserContext, rflags) == 17 * size_of::<usize>());
 crate::const_assert!(core::mem::offset_of!(RawUserContext, trap_num) == 18 * size_of::<usize>());
 crate::const_assert!(core::mem::offset_of!(RawUserContext, error_code) == 19 * size_of::<usize>());
 #[cfg(not(any(feature = "kernelet", feature = "kernelet-host")))]

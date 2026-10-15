@@ -521,7 +521,7 @@ mod lock_levels {
     }
 
     #[ktest]
-    #[should_panic(expected = "cursor level not suitable for mapping")]
+    #[should_panic(expected = "mapping level exceeds cursor lock root")]
     fn map_above_locked_level() {
         let pt = PageTable::<TestPtConfig>::empty();
         let guard = disable_preempt();
