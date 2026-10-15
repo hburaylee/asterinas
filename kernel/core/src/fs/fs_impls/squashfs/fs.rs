@@ -44,12 +44,17 @@ pub(super) type SquashFsIno = u32;
 pub(crate) struct SquashFs {
     device: Arc<dyn BlockDevice>,
     pub(super) super_block: SuperBlock,
+    /// Block-pointer array of the UID/GID table.
     id_locations: Vec<MetaBlockLocation>,
+    /// Block-pointer array of the fragment table; empty if the image has no fragments.
     frag_locations: Vec<MetaBlockLocation>,
     decompress: DecompressContext,
     anon_device_id: AnonDeviceId,
+    /// Live inodes, held weakly so unreferenced ones can be dropped and
+    /// re-read from disk.
     inode_cache: RwMutex<BTreeMap<SquashFsIno, Weak<dyn Inode>>>,
     pub(super) fs_event_subscriber_stats: FsEventSubscriberStats,
+    /// Weak self reference so inodes can outlive-check the filesystem.
     self_ref: Weak<SquashFs>,
 }
 

@@ -78,6 +78,7 @@ struct RawSuperBlock {
 const_assert!(size_of::<RawSuperBlock>() == 96);
 
 impl SuperBlock {
+    /// Reads and validates the superblock from the block device.
     pub(super) fn read(device: &Arc<dyn BlockDevice>) -> Result<Self, super::SquashFsError> {
         let raw_super_block = device
             .read_val::<RawSuperBlock>(0)
