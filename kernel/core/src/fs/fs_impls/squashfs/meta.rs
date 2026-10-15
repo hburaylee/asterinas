@@ -149,6 +149,9 @@ pub(super) struct MetaReader<'a> {
     device: &'a Arc<dyn BlockDevice>,
     decompress: &'a DecompressContext,
     base: u64,
+    /// Absolute disk position marking the end of the metadata region. A block
+    /// that starts at or after this position is rejected as corrupt.
+    end: u64,
     cursor: MetaCursor,
 }
 
@@ -159,10 +162,21 @@ impl<'a> MetaReader<'a> {
         base: u64,
         cursor: MetaCursor,
     ) -> Self {
+        Self::with_end(device, decompress, base, u64::MAX, cursor)
+    }
+
+    pub(super) fn with_end(
+        device: &'a Arc<dyn BlockDevice>,
+        decompress: &'a DecompressContext,
+        base: u64,
+        end: u64,
+        cursor: MetaCursor,
+    ) -> Self {
         Self {
             device,
             decompress,
             base,
+            end,
             cursor,
         }
     }
@@ -190,6 +204,11 @@ impl<'a> MetaReader<'a> {
         let mut filled = 0;
         while filled < buf.len() {
             let disk_pos = self.base + self.cursor.block;
+            if disk_pos >= self.end {
+                return Err(SquashFsError::CorruptedImage(
+                    "metadata block beyond table end",
+                ));
+            }
             let start = self.cursor.offset as usize;
 
             let (copied, blk_len, next_pos) = {
@@ -228,6 +247,11 @@ impl<'a> MetaReader<'a> {
     pub(super) fn skip(&mut self, mut n: usize) -> Result<(), SquashFsError> {
         while n > 0 {
             let disk_pos = self.base + self.cursor.block;
+            if disk_pos >= self.end {
+                return Err(SquashFsError::CorruptedImage(
+                    "metadata block beyond table end",
+                ));
+            }
             let start = self.cursor.offset as usize;
 
             let (blk_len, next_pos) = {
