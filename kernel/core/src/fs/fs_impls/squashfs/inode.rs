@@ -305,7 +305,6 @@ pub(super) fn read_inode(
     reader: &mut MetaReader,
     block_size: u32,
     inode_count: u32,
-    bytes_used: u64,
 ) -> Result<RawInode, SquashFsError> {
     let base: RawBaseInode = reader.read_val()?;
 
@@ -318,8 +317,8 @@ pub(super) fn read_inode(
     let (body, nlink) = match inode_type {
         SquashFsInodeType::BasicDirectory => parse_basic_dir_body(reader)?,
         SquashFsInodeType::ExtendedDirectory => parse_extended_dir_body(reader)?,
-        SquashFsInodeType::BasicFile => parse_basic_file_body(reader, block_size, bytes_used)?,
-        SquashFsInodeType::ExtendedFile => parse_extended_file_body(reader, block_size, bytes_used)?,
+        SquashFsInodeType::BasicFile => parse_basic_file_body(reader, block_size)?,
+        SquashFsInodeType::ExtendedFile => parse_extended_file_body(reader, block_size)?,
         SquashFsInodeType::BasicSymlink => parse_symlink_body(reader)?,
         SquashFsInodeType::ExtendedSymlink => {
             let body = parse_symlink_body(reader)?;
@@ -415,13 +414,9 @@ fn parse_extended_dir_body(reader: &mut MetaReader) -> Result<(InodeBody, u32), 
 fn parse_basic_file_body(
     reader: &mut MetaReader,
     block_size: u32,
-    bytes_used: u64,
 ) -> Result<(InodeBody, u32), SquashFsError> {
     let raw: RawBasicFile = reader.read_val()?;
     let nblocks = file_block_count(block_size, raw.frag_index, raw.file_size as u64) as usize;
-    if nblocks as u64 > bytes_used / block_size as u64 + 1 {
-        return Err(SquashFsError::CorruptedImage("file block count exceeds image size"));
-    }
     let blocks = read_blocks(reader, nblocks, raw.blocks_start as u64)?;
     Ok((
         InodeBody::File {
@@ -438,13 +433,9 @@ fn parse_basic_file_body(
 fn parse_extended_file_body(
     reader: &mut MetaReader,
     block_size: u32,
-    bytes_used: u64,
 ) -> Result<(InodeBody, u32), SquashFsError> {
     let raw: RawExtendedFile = reader.read_val()?;
     let nblocks = file_block_count(block_size, raw.frag_index, raw.file_size) as usize;
-    if nblocks as u64 > bytes_used / block_size as u64 + 1 {
-        return Err(SquashFsError::CorruptedImage("file block count exceeds image size"));
-    }
     let blocks = read_blocks(reader, nblocks, raw.blocks_start)?;
     Ok((
         InodeBody::File {
@@ -469,7 +460,7 @@ fn read_blocks(
     nblocks: usize,
     blocks_start: u64,
 ) -> Result<Arc<[BlockInfo]>, SquashFsError> {
-    let mut blocks = Vec::with_capacity(nblocks);
+    let mut blocks = Vec::new();
     let mut offset = blocks_start;
     for _ in 0..nblocks {
         let raw_size: u32 = reader.read_val()?;

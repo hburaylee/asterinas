@@ -158,17 +158,21 @@ impl SquashFs {
     /// decompressing metadata blocks from the device.
     pub(super) fn read_inode(&self, inode_ref: u64) -> Result<ParsedInode> {
         let raw = {
-            let mut reader = MetaReader::new(
+            // The inode table's metadata ends where the directory table begins.
+            // Clamp to `bytes_used` so a corrupt `dir_table` past the used
+            // bytes cannot widen the read bound.
+            let inode_table_end = self.super_block.dir_table.min(self.super_block.bytes_used);
+            let mut reader = MetaReader::with_end(
                 &self.device,
                 &self.decompress,
                 self.super_block.inode_table,
+                inode_table_end,
                 MetaCursor::from_ref(inode_ref),
             );
             inode::read_inode(
                 &mut reader,
                 self.super_block.block_size,
                 self.super_block.inode_count,
-                self.super_block.bytes_used,
             )?
         };
 
