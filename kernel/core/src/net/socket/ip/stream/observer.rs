@@ -12,13 +12,13 @@ pub(crate) struct StreamObserver {
     // Shared only with the native socket file. Background TCP keeps this
     // charge until its final protocol owner and observer clone are dropped.
     #[cfg(feature = "kernelet-host")]
-    _nat_charge: Arc<SpinLock<Option<NativeTcpBufferCharge>>>,
+    _nat_charge: Option<Arc<NativeTcpBufferCharge>>,
 }
 
 impl StreamObserver {
     pub(super) fn new(
         pollee: Pollee,
-        #[cfg(feature = "kernelet-host")] nat_charge: Arc<SpinLock<Option<NativeTcpBufferCharge>>>,
+        #[cfg(feature = "kernelet-host")] nat_charge: Option<Arc<NativeTcpBufferCharge>>,
     ) -> Self {
         Self {
             pollee,

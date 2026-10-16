@@ -18,6 +18,7 @@ mod placement;
 mod policy;
 mod reaper;
 mod sandbox;
+mod scheduling;
 mod virtio_block;
 mod virtio_console;
 mod virtio_mmio;

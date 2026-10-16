@@ -162,7 +162,7 @@ fn fill(segments: &[BioSegment], value: u8) -> Result<()> {
     let bytes = [value; PAGE_SIZE];
     for segment in segments {
         // Device-side access also initializes FromDevice buffers to a sentinel.
-        let mut writer = segment.inner_dma_slice().writer()?;
+        let mut writer = segment.dma_slice().writer()?;
         for _ in 0..segment.nbytes() / PAGE_SIZE {
             if writer.write(&mut VmReader::from(&bytes[..])) != PAGE_SIZE {
                 return_errno!(Errno::EIO);

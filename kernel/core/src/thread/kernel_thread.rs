@@ -5,6 +5,7 @@ use core::num::NonZeroU16;
 
 use ostd::{
     cpu::CpuSet,
+    mm::VmSpace,
     task::{Task, TaskOptions},
 };
 
@@ -17,13 +18,34 @@ use crate::{
 
 /// The inner data of a kernel thread.
 pub(super) struct KernelThread {
-    vmar: Option<Arc<Vmar>>,
+    address_space: AddressSpace,
+}
+
+/// A process mapping owner or carrier restoration state, never both.
+enum AddressSpace {
+    None,
+    Process(Arc<Vmar>),
+    #[cfg(feature = "kernelet-host")]
+    Carrier(Arc<VmSpace>),
 }
 
 impl KernelThread {
     /// Returns the VMAR associated with the kernel thread.
     pub(super) fn vmar(&self) -> Option<&Arc<Vmar>> {
-        self.vmar.as_ref()
+        match &self.address_space {
+            AddressSpace::Process(vmar) => Some(vmar),
+            _ => None,
+        }
+    }
+
+    /// Returns the address space to activate when this thread is scheduled.
+    pub(super) fn vm_space(&self) -> Option<&Arc<VmSpace>> {
+        match &self.address_space {
+            AddressSpace::None => None,
+            AddressSpace::Process(vmar) => Some(vmar.vm_space()),
+            #[cfg(feature = "kernelet-host")]
+            AddressSpace::Carrier(space) => Some(space),
+        }
     }
 }
 
@@ -52,7 +74,7 @@ pub(crate) struct ThreadOptions {
     sched_policy: SchedPolicy,
     #[cfg(feature = "kernelet-host")]
     fair_weight_divisor: NonZeroU16,
-    vmar: Option<Arc<Vmar>>,
+    address_space: AddressSpace,
 }
 
 impl ThreadOptions {
@@ -69,7 +91,7 @@ impl ThreadOptions {
             sched_policy,
             #[cfg(feature = "kernelet-host")]
             fair_weight_divisor: NonZeroU16::MIN,
-            vmar: None,
+            address_space: AddressSpace::None,
         }
     }
 
@@ -96,7 +118,17 @@ impl ThreadOptions {
     /// the mappings to outlive their userspace owner must hold a separate owner-memory lease.
     #[cfg_attr(all(not(ktest), not(feature = "kernelet-host")), expect(dead_code))]
     pub(crate) fn vmar(mut self, vmar: Arc<Vmar>) -> Self {
-        self.vmar = Some(vmar);
+        self.address_space = AddressSpace::Process(vmar);
+        self
+    }
+
+    /// Associates a carrier's page-table restoration state with this thread.
+    ///
+    /// This does not supply a Host process VMAR for resolving page faults.
+    /// Activation still validates the registered root through `VmSpace`.
+    #[cfg(feature = "kernelet-host")]
+    pub(crate) fn carrier_vm_space(mut self, vm_space: Arc<VmSpace>) -> Self {
+        self.address_space = AddressSpace::Carrier(vm_space);
         self
     }
 
@@ -120,7 +152,9 @@ impl ThreadOptions {
 
         Arc::new_cyclic(|weak_task| {
             let thread = {
-                let kernel_thread = KernelThread { vmar: self.vmar };
+                let kernel_thread = KernelThread {
+                    address_space: self.address_space,
+                };
                 let cpu_affinity = self.cpu_affinity;
                 let sched_policy = self.sched_policy;
                 let thread =
@@ -261,6 +295,90 @@ mod tests {
 
         worker.join();
         assert_eq!(result.lock().take().unwrap(), expected);
+    }
+
+    #[cfg(feature = "kernelet-host")]
+    #[ktest]
+    fn carrier_vm_space_is_restored_without_process_vmar() {
+        super::super::init();
+
+        let space = Arc::new(VmSpace::new());
+        let worker_space = space.clone();
+        let completed = Arc::new(Mutex::new(false));
+        let worker_completed = completed.clone();
+        let test_cpu = CpuId::current_racy();
+        let worker = ThreadOptions::new(move || {
+            let current = Thread::current().unwrap();
+            let kernel_thread = current.as_kernel_thread().unwrap();
+            assert!(kernel_thread.vmar().is_none());
+            assert!(Arc::ptr_eq(
+                kernel_thread.vm_space().unwrap(),
+                &worker_space
+            ));
+
+            // A different association forces a real root switch before resuming.
+            let switcher = ThreadOptions::new(|| {})
+                .cpu_affinity(test_cpu.into())
+                .carrier_vm_space(Arc::new(VmSpace::new()))
+                .spawn();
+            switcher.join();
+
+            const UNMAPPED_ADDR: usize = PAGE_SIZE * 16;
+            let mut reader = worker_space.reader(UNMAPPED_ADDR, 1).unwrap();
+            let mut output = [0u8; 1];
+            let mut writer = VmWriter::from(output.as_mut_slice()).to_fallible();
+            // The root was restored, but no Host process VMAR may resolve this fault.
+            assert_eq!(
+                reader.read_fallible(&mut writer),
+                Err((Error::PageFault, 0))
+            );
+            *worker_completed.lock() = true;
+        })
+        .cpu_affinity(test_cpu.into())
+        .carrier_vm_space(space)
+        .spawn();
+
+        worker.join();
+        assert!(*completed.lock());
+    }
+
+    #[cfg(not(feature = "kernelet"))]
+    #[ktest]
+    fn unassociated_kernel_thread_preserves_native_address_space() {
+        super::super::init();
+
+        let vmar_handle = VmarHandle::new(new_process_vm());
+        let associated_vmar = vmar_handle.clone_arc();
+        let worker_vmar = associated_vmar.clone();
+        let completed = Arc::new(Mutex::new(false));
+        let worker_completed = completed.clone();
+        let test_cpu = CpuId::current_racy();
+        let worker = ThreadOptions::new(move || {
+            let inherited_vmar = worker_vmar.clone();
+            let child_completed = worker_completed.clone();
+            let child = ThreadOptions::new(move || {
+                assert!(
+                    Thread::current()
+                        .unwrap()
+                        .as_kernel_thread()
+                        .unwrap()
+                        .vmar()
+                        .is_none()
+                );
+                assert!(inherited_vmar.vm_space().reader(PAGE_SIZE * 16, 0).is_ok());
+                *child_completed.lock() = true;
+            })
+            .cpu_affinity(test_cpu.into())
+            .spawn();
+            child.join();
+            assert!(worker_vmar.vm_space().reader(PAGE_SIZE * 16, 0).is_ok());
+        })
+        .cpu_affinity(test_cpu.into())
+        .vmar(associated_vmar)
+        .spawn();
+
+        worker.join();
+        assert!(*completed.lock());
     }
 
     #[ktest]

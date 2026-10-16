@@ -5,12 +5,12 @@
 use core::{
     arch::asm,
     fmt::{self, Write},
-    sync::atomic::{AtomicPtr, Ordering},
+    sync::atomic::{AtomicPtr, AtomicU64, Ordering},
 };
 
 use super::abi::{
-    BootArgs, ClockPage, CopyFaultRecord, DeviceEntry, EntryTable, STOP_PANIC, ServiceTable,
-    VIRQ_LINES, VIRQ_TICK, VcpuRecord, copy_fault_records_offset, vcpu_shared_bytes,
+    BootArgs, CopyFaultRecord, DeviceEntry, EntryTable, STOP_PANIC, ServiceTable, VIRQ_LINES,
+    VIRQ_TICK, VcpuRecord, copy_fault_records_offset, vcpu_shared_bytes,
 };
 use crate::mm::PAGE_SIZE;
 
@@ -26,6 +26,9 @@ unsafe extern "C" {
 static KERNELET_SERVICES: AtomicPtr<ServiceTable> = AtomicPtr::new(core::ptr::null_mut());
 #[unsafe(no_mangle)]
 pub(crate) static KERNELET_BOOT_ARGS: AtomicPtr<BootArgs> = AtomicPtr::new(core::ptr::null_mut());
+
+// Each relocated image owns this watermark; no Host clock page is written.
+static LAST_CLOCK_NS: AtomicU64 = AtomicU64::new(0);
 
 /// Starts virtual CPU zero on its boot stack.
 ///
@@ -68,10 +71,10 @@ pub unsafe extern "C" fn _kernelet_entry(services: &'static ServiceTable, boot: 
     if boot.size != size_of::<BootArgs>() as u32
         || entry_table.size != size_of::<EntryTable>() as u64
         || boot.source_hash != entry_table.source_hash
+        || boot.tsc_freq_hz == 0
         || (boot.num_vcpus == 0 || boot.num_vcpus as usize > super::abi::MAX_VCPUS)
         || boot.vcpu_records != PAGE_SIZE as u32
-        || boot.clock_page != ((1 + record_pages) * PAGE_SIZE) as u32
-        || boot.info_page != boot.clock_page + PAGE_SIZE as u32
+        || boot.info_page != ((1 + record_pages) * PAGE_SIZE) as u32
         || boot.max_meta_sections == 0
         || boot.grant_table != boot.info_page + PAGE_SIZE as u32
         || u64::from(boot.meta_section_index) < run_end
@@ -139,16 +142,15 @@ pub fn boot_args() -> &'static BootArgs {
     unsafe { &*ptr }
 }
 
-/// Reads the Host's one-field monotonic clock snapshot.
+/// Reads Host-boot monotonic time using the image's read-only TSC calibration.
 pub fn clock_now_ns() -> u64 {
     let boot = boot_args();
-    let ptr = (boot as *const BootArgs as *const u8)
-        .wrapping_add(boot.clock_page as usize)
-        .cast::<ClockPage>();
-    // SAFETY: Entry validation checked the page offset and the Host maps and
-    // pins the clock frame read-only for the lifetime of every carrier.
-    let page = unsafe { &*ptr };
-    page.monotonic_ns.load(Ordering::Relaxed)
+    super::clock::monotonic_ns_at(
+        crate::arch::read_tsc_ordered(),
+        boot.clock_origin_tsc,
+        boot.tsc_freq_hz,
+        &LAST_CLOCK_NS,
+    )
 }
 
 /// Reads realtime nanoseconds since the Unix epoch from the virtual clock.
@@ -538,8 +540,24 @@ macro_rules! returning_stub {
 returning_stub!(virq_entry, virq_dispatch);
 returning_stub!(yield_entry, yield_dispatch);
 
+// Keep the dispatch prologue and epilogue in the redirect-excluded range too.
+// A Host preemption request is still pending until the yield service runs.
+#[unsafe(link_section = ".text.kernelet_stubs")]
 extern "C" fn yield_dispatch() {
+    let was_off = vcpu_record().irq_off.swap(1, Ordering::AcqRel);
     (services().vcpu_yield)();
+    // Host preemption can coincide with every physical tick. Consume pending
+    // virtual events after resuming so repeated yields cannot starve the Image
+    // timer. Forced yields inside a virtual critical section keep deferring it.
+    let record = vcpu_record();
+    if was_off == 0
+        && record.guards.load(Ordering::Acquire) == 0
+        && copy_fault_record().pending.load(Ordering::Acquire) == 0
+    {
+        let _ = deliver_pending();
+    }
+    // Pending delivery can switch the internal Task onto another vCPU.
+    vcpu_record().irq_off.store(was_off, Ordering::Release);
 }
 
 /// Terminates a carrier without touching its possibly exhausted Task stack.

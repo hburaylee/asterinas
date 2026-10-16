@@ -59,7 +59,7 @@ mod loadavg;
 mod meminfo;
 mod mounts;
 mod pid;
-#[cfg(kernelet_rq1)]
+#[cfg(any(kernelet_rq1, kernelet_rq1_diagnostics))]
 mod rq1_io;
 mod self_;
 mod stat;

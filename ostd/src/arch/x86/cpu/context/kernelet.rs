@@ -48,7 +48,7 @@ pub(crate) fn run_host_user(raw: &mut RawUserContext) -> i32 {
 
     #[cfg(kernelet_getpid_profile)]
     let raw_span = profile::span(profile::stage::HOST_RAW_RUN);
-    raw.run(crate::irq::disable_local());
+    raw.fault_addr = raw.run(crate::irq::disable_local());
     #[cfg(kernelet_getpid_profile)]
     let _ = profile::end(raw_span);
 
@@ -222,6 +222,48 @@ mod test {
         assert_eq!(context.trap_num, 6);
         assert_eq!(context.error_code, 0);
         assert_eq!(context.rflags & (1 | 2 | (1 << 9)), 1 | 2 | (1 << 9));
+    }
+
+    #[ktest]
+    fn native_user_return_leaves_shared_fault_metadata_untouched() {
+        let _preempt = disable_preempt();
+        let enter = |context: &mut RawUserContext| loop {
+            let fault_addr = context.run(crate::irq::disable_local());
+            let pending = context.trap_num >= crate::arch::irq::IRQ_NUM_MIN as usize
+                && context.trap_num != 0x100;
+            if pending {
+                let frame = context.as_trap_frame();
+                call_irq_callback_functions(
+                    &frame,
+                    &HwIrqLine::new(frame.trap_num as u8),
+                    PrivilegeLevel::User,
+                );
+            }
+            crate::arch::irq::enable_local();
+            if !pending {
+                break fault_addr;
+            }
+        };
+        const SENTINEL: usize = 0xfeedcafe;
+        let fault_addr = 0x12345000usize;
+        let mut code = alloc::vec![0x48, 0xa1];
+        code.extend_from_slice(&fault_addr.to_le_bytes());
+        {
+            let space = UserSpace::new(&code);
+            let mut context = space.context();
+            context.fault_addr = SENTINEL;
+            assert_eq!(enter(&mut context), fault_addr);
+            assert_eq!(context.trap_num, 14);
+            assert_eq!(context.fault_addr, SENTINEL);
+        }
+        {
+            let space = UserSpace::new(&[0x0f, 0x05]);
+            let mut context = space.context();
+            context.fault_addr = SENTINEL;
+            assert_eq!(enter(&mut context), 0);
+            assert_eq!(context.trap_num, 0x100);
+            assert_eq!(context.fault_addr, SENTINEL);
+        }
     }
 
     #[ktest]

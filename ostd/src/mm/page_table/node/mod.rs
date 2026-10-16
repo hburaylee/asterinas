@@ -105,11 +105,14 @@ impl<C: PageTableConfig> PageTableNode<C> {
     /// # Panics
     ///
     /// Only top-level page tables can be activated using this function.
-    pub(super) unsafe fn activate(&self) {
+    pub(super) unsafe fn activate(
+        &self,
+        #[cfg(feature = "kernelet-host")] _irq_guard: &crate::irq::DisabledLocalIrqGuard,
+    ) {
         use crate::arch::mm::{activate_page_table, current_page_table_paddr};
 
-        #[cfg(feature = "kernelet-host")]
-        let _irq_guard = crate::irq::disable_local();
+        // Host callers retain their IRQ guard through the root and VmSpace
+        // updates, so the native root reference needs no nested IRQ guard.
         assert_eq!(self.level(), C::NR_LEVELS);
 
         #[cfg(feature = "kernelet-host")]

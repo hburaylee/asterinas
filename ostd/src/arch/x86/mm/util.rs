@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: MPL-2.0
 
-core::arch::global_asm!(include_str!("memcpy_fallible.S"));
-core::arch::global_asm!(include_str!("memset_fallible.S"));
-
-core::arch::global_asm!(include_str!("atomic_load_fallible.S"));
-core::arch::global_asm!(include_str!("atomic_cmpxchg_fallible.S"));
+core::arch::global_asm!(
+    include_str!("memcpy_fallible.S"),
+    include_str!("memset_fallible.S"),
+    include_str!("atomic_load_fallible.S"),
+    include_str!("atomic_cmpxchg_fallible.S"),
+    RELATIVE_EX_TABLE = const cfg!(feature = "kernelet") as usize,
+);
 
 unsafe extern "C" {
     /// Copies `size` bytes from `src` to `dst`. This function works with exception handling

@@ -48,9 +48,6 @@ pub(crate) struct Vmar {
     /// The RSS counters
     rss_counters: [PerCpuCounter; NUM_RSS_COUNTERS],
     /// The process VM
-    #[cfg(feature = "kernelet-host")]
-    process_vm: Option<ProcessVm>,
-    #[cfg(not(feature = "kernelet-host"))]
     process_vm: ProcessVm,
     /// The number of handles that this `Vmar` has (see [`super::VmarHandle`])
     num_handles: AtomicUsize,
@@ -70,24 +67,8 @@ impl Vmar {
             inner: RwMutex::new(inner),
             vm_space: Arc::new(vm_space),
             rss_counters,
-            #[cfg(feature = "kernelet-host")]
-            process_vm: Some(process_vm),
-            #[cfg(not(feature = "kernelet-host"))]
             process_vm,
             num_handles: AtomicUsize::new(1),
-            weak_self: weak_self.clone(),
-        })
-    }
-
-    /// Wraps an activation-only space without Host ownership of its mappings.
-    #[cfg(feature = "kernelet-host")]
-    pub(crate) fn from_vm_space(vm_space: Arc<VmSpace>) -> Arc<Self> {
-        Arc::new_cyclic(|weak_self| Vmar {
-            inner: RwMutex::new(VmarInner::new()),
-            vm_space,
-            rss_counters: array::from_fn(|_| PerCpuCounter::new()),
-            process_vm: None,
-            num_handles: AtomicUsize::new(0),
             weak_self: weak_self.clone(),
         })
     }
@@ -109,16 +90,7 @@ impl Vmar {
 
     /// Returns the attached `ProcessVm`.
     pub(crate) fn process_vm(&self) -> &ProcessVm {
-        #[cfg(feature = "kernelet-host")]
-        {
-            self.process_vm
-                .as_ref()
-                .expect("activation-only VMAR has no process VM")
-        }
-        #[cfg(not(feature = "kernelet-host"))]
-        {
-            &self.process_vm
-        }
+        &self.process_vm
     }
 
     /// Returns whether this VMAR has multiple handles.

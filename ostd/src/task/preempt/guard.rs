@@ -42,13 +42,13 @@ impl GuardTransfer for DisabledPreemptGuard {
 
 impl Drop for DisabledPreemptGuard {
     fn drop(&mut self) {
+        // Native guard release keeps upstream scheduling boundaries. Carriers
+        // enter the Host scheduler through dedicated service points.
         #[cfg(feature = "kernelet")]
         let _irq_guard = crate::irq::disable_local();
         super::cpu_local::dec_guard_count();
         #[cfg(feature = "kernelet")]
         crate::kernelet::entry::leave_preempt_guard();
-        #[cfg(all(target_arch = "x86_64", feature = "kernelet-host"))]
-        super::check_preempt();
     }
 }
 

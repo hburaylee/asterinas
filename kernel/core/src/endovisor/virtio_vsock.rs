@@ -9,8 +9,8 @@
 //! zero of the configuration space (§5.10.4).
 //! See <https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html>.
 //!
-//! The MMIO notify path validates descriptor chains and queues fixed-size
-//! records. A device thread copies packets through `GuestMemory`, routes them
+//! The MMIO notify path records a doorbell. A device thread validates bounded
+//! descriptor chains, copies packets through `GuestMemory`, routes them
 //! through the Host switch, and publishes used-ring completions. It never
 //! exposes a guest address to the switch.
 
@@ -39,7 +39,6 @@ use crate::{
     events::IoEvents,
     prelude::{Errno, Error, Result},
     process::signal::{PollHandle, Pollee},
-    thread::kernel_thread::ThreadOptions,
 };
 
 const QUEUE_SIZE: usize = 64;
@@ -141,6 +140,7 @@ struct Registers {
     driver_features: u64,
     queue_select: u32,
     queues: [Queue<QUEUE_SIZE>; NUM_QUEUES],
+    notified: [bool; NUM_QUEUES],
     generation: u64,
     active: usize,
     resetting: bool,
@@ -280,6 +280,7 @@ impl Registers {
             driver_features: 0,
             queue_select: 0,
             queues: [Queue::<QUEUE_SIZE>::default(); NUM_QUEUES],
+            notified: [false; NUM_QUEUES],
             generation: 1,
             active: 0,
             resetting: false,
@@ -293,6 +294,7 @@ impl Registers {
     }
 
     fn reset(&mut self) -> VecDeque<QueuedPacket> {
+        self.notified.fill(false);
         self.generation = self.generation.wrapping_add(1);
         self.rx.clear();
         self.tx.clear();
@@ -412,12 +414,12 @@ impl VirtioVsock {
         Ok(device)
     }
 
-    pub(super) fn start_worker(self: &Arc<Self>) {
+    pub(super) fn start_worker(self: &Arc<Self>, execution: &super::scheduling::ExecutionThreads) {
         if self.worker_started.swap(true, Ordering::AcqRel) {
             return;
         }
         let device = self.clone();
-        ThreadOptions::new(move || device.worker()).spawn();
+        execution.spawn_worker(move || device.worker());
     }
 
     pub(super) fn cancel(&self) {
@@ -674,7 +676,7 @@ impl VirtioVsock {
                 if index >= NUM_QUEUES || !registers.queues[index].ready || registers.resetting {
                     return -INVALID;
                 }
-                self.collect_requests(&mut registers, index);
+                registers.notified[index] = true;
                 self.changes.wake_all();
                 #[cfg(kernelet_host_connect_gate)]
                 self.connect_gate_changes.wake_all();
@@ -728,6 +730,7 @@ impl VirtioVsock {
     }
 
     fn collect_requests(&self, registers: &mut Registers, index: usize) {
+        registers.notified[index] = false;
         let queue = registers.queues[index];
         let Ok(avail_idx) = self.read_u16(queue.avail + 2) else {
             registers.status |= DEVICE_NEEDS_RESET;
@@ -738,7 +741,9 @@ impl VirtioVsock {
             return;
         }
         let capacity = if index == EVENT { 1 } else { QUEUE_SIZE };
-        while registers.queues[index].last_avail != avail_idx {
+        let mut budget = 1;
+        while budget != 0 && registers.queues[index].last_avail != avail_idx {
+            budget -= 1;
             let pending = match index {
                 RX => registers.rx.len(),
                 TX => registers.tx.len(),
@@ -770,6 +775,8 @@ impl VirtioVsock {
             }
             registers.queues[index].last_avail = last.wrapping_add(1);
         }
+        registers.notified[index] = registers.queues[index].last_avail != avail_idx
+            && registers.status & DEVICE_NEEDS_RESET == 0;
     }
 
     fn collect_chain(&self, registers: &Registers, index: usize, head: u16) -> Option<Request> {
@@ -825,9 +832,6 @@ impl VirtioVsock {
         loop {
             // This adopted worker processes one bounded packet/header per
             // iteration. Throttle before claiming a request or taking locks.
-            if self.kernelet.wait_for_cpu_budget().is_err() {
-                break;
-            }
             #[cfg(kernelet_host_connect_gate)]
             self.hold_connect_request();
             if self.changes.wait_until(|| self.take_work()) {
@@ -838,7 +842,35 @@ impl VirtioVsock {
     }
 
     /// Returns `None` to block, `Some(false)` for progress, `Some(true)` to exit.
+    fn collect_notified(&self) -> bool {
+        let mut registers = self.registers.lock();
+        if registers.cancelled || registers.resetting || registers.status & DEVICE_NEEDS_RESET != 0
+        {
+            return false;
+        }
+        let mut progressed = false;
+        for index in 0..NUM_QUEUES {
+            if !registers.notified[index] {
+                continue;
+            }
+            let before = registers.queues[index].last_avail;
+            self.collect_requests(&mut registers, index);
+            progressed = registers.queues[index].last_avail != before;
+            if progressed || registers.status & DEVICE_NEEDS_RESET != 0 {
+                break;
+            }
+        }
+        drop(registers);
+        if progressed && ostd::task::Task::need_yield() {
+            ostd::task::Task::yield_now();
+        }
+        progressed
+    }
+
     fn take_work(&self) -> Option<bool> {
+        if self.collect_notified() {
+            return Some(false);
+        }
         let mut registers = self.registers.lock();
         if registers.cancelled {
             return Some(true);

@@ -14,7 +14,9 @@ use kernelet_abi::{
     StatsRaw, StatusRaw,
 };
 use ostd::{
-    kernelet::control::{CpuBudget, ExitReason, ExitStatus, KerneletState, KillReason},
+    kernelet::control::{
+        BudgetError, CpuBudget, ExitReason, ExitStatus, KerneletState, KillReason,
+    },
     task::Task,
 };
 
@@ -147,7 +149,7 @@ pub(super) fn blank_status(state: u32) -> StatusRaw {
         code: 0,
         flags: 0,
         uptime_ns: 0,
-        cpu_time_ns: 0,
+        cpu_time_ns: kernelet_abi::STATS_UNAVAILABLE,
         fault_addr: 0,
         fault_ip: 0,
         message_len: 0,
@@ -326,9 +328,12 @@ impl SandboxFile {
             nice: args.nice,
             quota: (args.cpu_quota_us != 0).then_some((args.cpu_quota_us, args.cpu_period_us)),
         };
-        budget
-            .validate()
-            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid kernelet budget"))?;
+        budget.validate().map_err(|error| match error {
+            BudgetError::UnsupportedQuota => {
+                Error::with_message(Errno::EOPNOTSUPP, "cpu quota is unsupported")
+            }
+            _ => Error::with_message(Errno::EINVAL, "invalid kernelet budget"),
+        })?;
         let kernelet = {
             let mut state = self.state.lock();
             match &mut *state {
@@ -357,6 +362,7 @@ impl SandboxFile {
         let mut raw = StatsRaw {
             state: self.status().state,
             cid: self.cid,
+            cpu_time_ns: kernelet_abi::STATS_UNAVAILABLE,
             completion_cpu_ns: kernelet_abi::STATS_UNAVAILABLE,
             ingress_copy_cpu_ns: kernelet_abi::STATS_UNAVAILABLE,
             service_calls: kernelet_abi::STATS_UNAVAILABLE,

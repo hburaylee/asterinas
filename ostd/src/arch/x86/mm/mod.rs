@@ -7,9 +7,9 @@ pub(crate) use util::__memcpy_fallible_end;
 pub(crate) use util::{
     __atomic_cmpxchg_fallible, __atomic_load_fallible, __memcpy_fallible, __memset_fallible,
 };
+use x86_64::{VirtAddr, instructions::tlb};
+#[cfg(not(feature = "kernelet"))]
 use x86_64::{
-    VirtAddr,
-    instructions::tlb,
     registers::model_specific::{Efer, EferFlags},
     structures::paging::PhysFrame,
 };
@@ -23,7 +23,9 @@ use crate::mm::{
 mod pat;
 mod util;
 
-use self::pat::{cache_policy_to_flags, configure_pat, flags_to_cache_policy};
+#[cfg(not(feature = "kernelet"))]
+use self::pat::configure_pat;
+use self::pat::{cache_policy_to_flags, flags_to_cache_policy};
 
 #[derive(Clone, Debug, Default)]
 pub(crate) struct PagingConsts {}
@@ -96,11 +98,17 @@ pub(crate) fn tlb_flush_addr_range(range: &Range<Vaddr>) {
 
 /// Flushes all TLB entries, except for the global-page entries.
 pub(crate) fn tlb_flush_all_excluding_global() {
+    #[cfg(not(feature = "kernelet"))]
     tlb::flush_all();
+    #[cfg(feature = "kernelet")]
+    flush_carrier_tlb();
 }
 
 /// Flushes all TLB entries, including the global-page entries.
 pub(crate) fn tlb_flush_all_including_global() {
+    #[cfg(feature = "kernelet")]
+    flush_carrier_tlb();
+    #[cfg(not(feature = "kernelet"))]
     // SAFETY: Updates to CR4 here only change the global-page bit. The side effect
     // is only to invalidate the TLB, which doesn't affect the memory safety.
     unsafe {
@@ -112,6 +120,18 @@ pub(crate) fn tlb_flush_all_including_global() {
         x86_64::registers::control::Cr4::update(|cr4| {
             *cr4 |= x86_64::registers::control::Cr4Flags::PAGE_GLOBAL;
         });
+    }
+}
+
+#[cfg(feature = "kernelet")]
+fn flush_carrier_tlb() {
+    // Invalidating global entries is stronger than a non-global flush. The
+    // service retains the desired root; it does not deactivate the VmSpace.
+    let status = (crate::kernelet::entry::services().tlb_shootdown)(0, 0, u64::MAX);
+    if status != 0 {
+        crate::kernelet::entry::stop_panic(format_args!(
+            "Host refused a local carrier TLB flush: {status}"
+        ));
     }
 }
 
@@ -138,11 +158,21 @@ pub(crate) unsafe fn sync_dma_range(_range: Range<Vaddr>, _is_from_device: bool)
 /// Changing the root-level page table is unsafe, because it's possible to violate memory safety by
 /// changing the page mapping.
 pub(crate) unsafe fn activate_page_table(root_paddr: Paddr) {
-    let addr = PhysFrame::from_start_address(x86_64::PhysAddr::new(root_paddr as u64)).unwrap();
-    let flags = x86_64::registers::control::Cr3Flags::empty();
+    #[cfg(feature = "kernelet")]
+    {
+        // Image roots are owned and validated by the Host registry. This
+        // primitive cannot bypass that registry with a physical CR3 write.
+        let status = (crate::kernelet::entry::services().pt_activate)(root_paddr as u64);
+        assert_eq!(status, 0, "Host refused to activate a registered root");
+    }
+    #[cfg(not(feature = "kernelet"))]
+    {
+        let addr = PhysFrame::from_start_address(x86_64::PhysAddr::new(root_paddr as u64)).unwrap();
+        let flags = x86_64::registers::control::Cr3Flags::empty();
 
-    // SAFETY: The safety is upheld by the caller.
-    unsafe { x86_64::registers::control::Cr3::write(addr, flags) };
+        // SAFETY: The safety is upheld by the caller.
+        unsafe { x86_64::registers::control::Cr3::write(addr, flags) };
+    }
 }
 
 pub(crate) fn current_page_table_paddr() -> Paddr {
@@ -316,6 +346,7 @@ unsafe impl PteTrait for PageTableEntry {
 }
 
 /// Enables memory-management essential features for the x86 MMU.
+#[cfg(not(feature = "kernelet"))]
 pub(super) fn enable_essential_features() {
     // Page Attribute Table (PAT) has been available since Pentium III (1999)
     // and is ubiquitous in modern 64-bit CPUs. Therefore, we assume that all

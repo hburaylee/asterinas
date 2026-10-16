@@ -14,7 +14,7 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use crate::cpu::CpuId;
 use crate::{
     arch::mm::tlb_flush_addr_range,
-    kernelet::abi::{INVALID, KSTACK_MAPPING_BYTES, KSTACK_USABLE_BYTES, STATE, StackTickRecord},
+    kernelet::abi::{INVALID, KSTACK_MAPPING_BYTES, KSTACK_USABLE_BYTES},
     mm::{
         CachePolicy, FrameAllocOptions, PAGE_SIZE, PageFlags, PageProperty, PrivilegedPageFlags,
         VmSpace, kspace::kvirt_area::KVirtArea, vm_space::RegisteredPageTable,
@@ -40,12 +40,6 @@ pub(super) const STACK_STRIDE: usize = 2 * STACK_BYTES;
 
 const _: () = assert!(STACK_STRIDE.is_power_of_two());
 const _: () = assert!(STACK_BYTES == KSTACK_MAPPING_BYTES);
-
-#[derive(Debug, Eq, PartialEq)]
-pub(super) enum TickSampleError {
-    InvalidStack,
-    Overflow,
-}
 
 fn allocate_stack_frames() -> crate::Result<alloc::vec::IntoIter<crate::mm::Frame<()>>> {
     let mut frames = Vec::new();
@@ -83,7 +77,8 @@ impl Drop for RootRegistration {
 
 /// Shared Task stacks and page-table registration outlive all fixed carriers.
 pub(crate) struct ExecutionResources {
-    pub(super) stacks: SpinLock<StackPool, LocalIrqDisabled>,
+    stacks: SpinLock<StackPool, LocalIrqDisabled>,
+    stack_layout: Arc<StackPoolLayout>,
     // Sorted by physical root address. Service and trap paths locate a root
     // without a scan proportional to the number of image processes.
     pub(super) roots: SpinLock<Vec<RootRegistration>, LocalIrqDisabled>,
@@ -116,6 +111,11 @@ impl ExecutionResources {
             .checked_add(vcpus)
             .and_then(|slots| slots.checked_mul(per_task))
             .and_then(|bytes| bytes.checked_add(vcpus.checked_mul(per_carrier)?))
+            // Reserve the separately shared layout, its Arc counters and the
+            // additional handle independently of per-slot allocation charges.
+            .and_then(|bytes| {
+                bytes.checked_add(size_of::<StackPoolLayout>() + 3 * size_of::<usize>())
+            })
             .ok_or(crate::Error::Overflow)
     }
 
@@ -133,8 +133,11 @@ impl ExecutionResources {
             .try_reserve_exact(vcpus)
             .map_err(|_| crate::Error::NoMemory)?;
         carrier_spaces.extend((0..vcpus).map(|_| Arc::new(VmSpace::new_activation_only())));
+        let stacks = StackPool::new(max_tasks, vcpus)?;
+        let stack_layout = stacks.layout.clone();
         Ok(Self {
-            stacks: SpinLock::new(StackPool::new(max_tasks, vcpus)?),
+            stacks: SpinLock::new(stacks),
+            stack_layout,
             roots: SpinLock::new(roots),
             carrier_spaces,
         })
@@ -155,12 +158,22 @@ impl ExecutionResources {
     }
     #[cfg(ktest)]
     pub(crate) fn boot_stack_base(&self) -> usize {
-        self.stacks.lock().slots[0].base()
+        self.initial_stack_base(0).unwrap()
+    }
+
+    /// Returns the fixed initial stack assigned to one carrier by creation.
+    /// The START protocol, rather than this address getter, admits initial use.
+    pub(super) fn initial_stack_base(&self, vcpu: usize) -> Option<usize> {
+        (vcpu < self.carrier_spaces.len()).then(|| self.stack_layout.stack_base(vcpu))
     }
 
     #[cfg(ktest)]
     pub(crate) fn register_test_root(&self, root: u64) {
-        self.roots.lock().push(RootRegistration::new(root).unwrap());
+        let mut roots = self.roots.lock();
+        let index = roots
+            .binary_search_by_key(&root, |entry| entry.paddr)
+            .unwrap_err();
+        roots.insert(index, RootRegistration::new(root).unwrap());
     }
 
     #[cfg(ktest)]
@@ -169,6 +182,15 @@ impl ExecutionResources {
         roots
             .binary_search_by_key(&root, |entry| entry.paddr)
             .is_ok_and(|index| roots[index].table.is_active_on(cpu))
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn test_root_last_direct_activation_from(&self, root: u64) -> Option<usize> {
+        let roots = self.roots.lock();
+        roots
+            .binary_search_by_key(&root, |entry| entry.paddr)
+            .ok()
+            .map(|index| roots[index].table.last_direct_activation_from())
     }
 
     pub(crate) fn counts(&self) -> (u32, u32) {
@@ -181,12 +203,28 @@ impl ExecutionResources {
     /// Returns the aligned pool bounds and the stable live-bitmap address.
     /// The resources pin the arena and bitmap until every carrier detaches.
     pub(super) fn stack_pool_layout(&self) -> (usize, usize, usize) {
-        let stacks = self.stacks.lock();
         (
-            stacks.start,
-            stacks.end,
-            stacks.live_bitmap.as_ptr() as usize,
+            self.stack_layout.start,
+            self.stack_layout.end,
+            self.stack_layout.live_bitmap.as_ptr() as usize,
         )
+    }
+
+    /// Checks a range against fixed stack bounds and its allocation's live bit.
+    /// This does not acquire the allocator lock or pin a Task's stack owner.
+    pub(super) fn contains_stack_range(&self, start: usize, end: usize) -> bool {
+        self.stack_layout.contains_range(start, end)
+    }
+
+    /// Checks a range on the stack selected by the interrupted RSP.
+    /// Task execution ownership must keep that allocation live through use.
+    pub(super) fn contains_current_stack_range(
+        &self,
+        start: usize,
+        end: usize,
+        rsp: usize,
+    ) -> bool {
+        self.stack_layout.contains_current_range(start, end, rsp)
     }
 
     /// Returns an authenticated stack slot and releases its allocation charge.
@@ -223,7 +261,7 @@ impl ExecutionResources {
             stacks.active_tasks += 1;
             let slot = &mut stacks.slots[index];
             slot.allocating = true;
-            (index, slot.base(), slot.mapped, stacks.arena.clone())
+            (index, slot.base(), slot.mapped, stacks.layout.arena.clone())
         };
 
         // Mapping and remote acknowledgements must not hold the pool lock.
@@ -250,10 +288,6 @@ impl ExecutionResources {
             return Err(error);
         }
         stacks.slots[index].mapped = true;
-        // The slot has no live execution owner until publish_live below.
-        // Initialize both new and reused storage before the Guest can run.
-        // SAFETY: Mapping completed, but this slot has not been published live.
-        unsafe { stacks.slots[index].initialize_ticks() };
         stacks.slots[index].allocated = true;
         if !mapped {
             stacks.mapped_slots += 1;
@@ -262,7 +296,7 @@ impl ExecutionResources {
         Ok((base as u64, !mapped))
     }
 }
-pub(super) struct StackSlot {
+struct StackSlot {
     base: usize,
     mapped: bool,
     allocated: bool,
@@ -274,42 +308,28 @@ pub(super) struct StackSlot {
 
 /// Distinguishes initial bootstrap storage from a counted Task allocation.
 #[derive(Debug, Eq, PartialEq)]
-pub(super) enum StackRelease {
+enum StackRelease {
     Boot,
     Task,
 }
 
 impl StackSlot {
-    pub(super) fn base(&self) -> usize {
+    fn base(&self) -> usize {
         self.base
     }
 
-    pub(super) fn contains(&self, rsp: usize) -> bool {
-        (self.base()..self.base() + STACK_BYTES).contains(&rsp)
+    fn contains(&self, rsp: usize) -> bool {
+        // An empty descending stack has RSP at its exclusive mapping end.
+        // Retain the lower boundary too when rejecting release of a live stack.
+        (self.base()..=self.base() + KSTACK_USABLE_BYTES).contains(&rsp)
     }
 
+    #[cfg(ktest)]
     fn contains_range(&self, start: usize, end: usize) -> bool {
         self.allocated
             && start <= end
             && start >= self.base()
             && end <= self.base() + KSTACK_USABLE_BYTES
-    }
-
-    fn ticks(&self) -> &StackTickRecord {
-        // SAFETY: A mapped pool slot retains these frames until every carrier
-        // detaches. Initialization precedes its first live publication.
-        unsafe { &*((self.base() + KSTACK_USABLE_BYTES) as *const StackTickRecord) }
-    }
-
-    /// # Safety
-    /// The mapped slot must have no live producer or Guest execution owner.
-    unsafe fn initialize_ticks(&self) {
-        unsafe {
-            core::ptr::write(
-                (self.base() + KSTACK_USABLE_BYTES) as *mut StackTickRecord,
-                StackTickRecord::default(),
-            )
-        };
     }
 }
 
@@ -319,14 +339,69 @@ const STACK_PROP: PageProperty = PageProperty {
     priv_flags: PrivilegedPageFlags::empty(),
 };
 
-pub(super) struct StackPool {
+/// Fixed stack geometry and publication state, shared without an allocator lock.
+/// The arena and bitmap remain owned together, and the bitmap never grows.
+struct StackPoolLayout {
     arena: Arc<KVirtArea>,
     start: usize,
     end: usize,
-    // Neither vector grows after creation. Assembly may read these atomic
-    // words through the address copied into each pinned carrier context.
     live_bitmap: Vec<AtomicU64>,
-    pub(super) slots: Vec<StackSlot>,
+}
+
+impl StackPoolLayout {
+    fn slot_index(&self, address: usize) -> Option<usize> {
+        (self.start..self.end)
+            .contains(&address)
+            .then(|| (address - self.start) / STACK_STRIDE)
+    }
+
+    fn stack_base(&self, index: usize) -> usize {
+        // new() validates the entire fixed geometry before publishing it.
+        self.start + index * STACK_STRIDE + STACK_BYTES
+    }
+
+    fn is_live(&self, index: usize) -> bool {
+        self.live_bitmap
+            .get(index / 64)
+            .is_some_and(|word| word.load(Ordering::Acquire) & (1 << (index % 64)) != 0)
+    }
+
+    fn publish_live(&self, index: usize) {
+        self.live_bitmap[index / 64].fetch_or(1 << (index % 64), Ordering::Release);
+    }
+
+    fn clear_live(&self, index: usize) {
+        self.live_bitmap[index / 64].fetch_and(!(1 << (index % 64)), Ordering::Release);
+    }
+
+    fn contains_range(&self, start: usize, end: usize) -> bool {
+        let Some(index) = self.slot_index(start) else {
+            return false;
+        };
+        let base = self.stack_base(index);
+        start <= end && start >= base && end <= base + KSTACK_USABLE_BYTES && self.is_live(index)
+    }
+
+    fn contains_current_range(&self, start: usize, end: usize, rsp: usize) -> bool {
+        let Some(index) = rsp
+            .checked_sub(1)
+            .and_then(|address| self.slot_index(address))
+        else {
+            return false;
+        };
+        let base = self.stack_base(index);
+        rsp > base
+            && rsp <= base + KSTACK_USABLE_BYTES
+            && start <= end
+            && start >= base
+            && end <= base + KSTACK_USABLE_BYTES
+            && self.is_live(index)
+    }
+}
+
+struct StackPool {
+    layout: Arc<StackPoolLayout>,
+    slots: Vec<StackSlot>,
     boot_slots: usize,
     mapped_slots: usize,
     max_tasks: usize,
@@ -371,11 +446,14 @@ impl StackPool {
             allocating: false,
             boot_reserved: index < boot_slots,
         }));
-        Ok(Self {
+        let layout = Arc::new(StackPoolLayout {
             arena,
             start,
             end,
             live_bitmap,
+        });
+        Ok(Self {
+            layout,
             slots,
             boot_slots,
             mapped_slots: 0,
@@ -390,8 +468,8 @@ impl StackPool {
                 continue;
             }
             let base = self.slots[index].base();
-            self.arena.map_additional_frames(
-                base - self.arena.start(),
+            self.layout.arena.map_additional_frames(
+                base - self.layout.arena.start(),
                 allocate_stack_frames()?,
                 STACK_PROP,
             )?;
@@ -399,8 +477,6 @@ impl StackPool {
             // arena addresses were synchronously retired by their old owner.
             tlb_flush_addr_range(&(base..base + STACK_BYTES));
             self.slots[index].mapped = true;
-            // SAFETY: No carrier has entered this unpublished instance.
-            unsafe { self.slots[index].initialize_ticks() };
             self.slots[index].allocated = true;
             self.mapped_slots += 1;
             self.publish_live(index);
@@ -409,21 +485,16 @@ impl StackPool {
     }
 
     fn publish_live(&self, index: usize) {
-        self.live_bitmap[index / 64].fetch_or(1 << (index % 64), Ordering::Release);
+        self.layout.publish_live(index);
     }
 
     fn slot_index(&self, address: usize) -> Option<usize> {
-        (self.start..self.end)
+        (self.layout.start..self.layout.end)
             .contains(&address)
-            .then(|| (address - self.start) / STACK_STRIDE)
+            .then(|| (address - self.layout.start) / STACK_STRIDE)
     }
 
-    pub(super) fn free(
-        &mut self,
-        base: usize,
-        saved_rsp: usize,
-        vcpu: usize,
-    ) -> Result<StackRelease, i64> {
+    fn free(&mut self, base: usize, saved_rsp: usize, vcpu: usize) -> Result<StackRelease, i64> {
         let Some(index) = self.slot_index(base) else {
             return Err(-INVALID);
         };
@@ -435,11 +506,6 @@ impl StackPool {
         {
             return Err(-INVALID);
         }
-        // The Guest must settle the old owner's samples before this slot can
-        // acquire another identity. Reject rather than erase deferred credit.
-        if !slot.ticks().is_empty() {
-            return Err(-STATE);
-        }
         let released = if slot.boot_reserved {
             slot.boot_reserved = false;
             StackRelease::Boot
@@ -448,39 +514,26 @@ impl StackPool {
             StackRelease::Task
         };
         slot.allocated = false;
-        self.live_bitmap[index / 64].fetch_and(!(1 << (index % 64)), Ordering::Release);
+        self.layout.clear_live(index);
         Ok(released)
     }
 
-    pub(super) fn contains_range(&self, start: usize, end: usize) -> bool {
+    #[cfg(ktest)]
+    fn contains_range(&self, start: usize, end: usize) -> bool {
         self.slot_index(start)
             .is_some_and(|index| self.slots[index].contains_range(start, end))
     }
 
-    pub(super) fn contains_current_range(&self, start: usize, end: usize, rsp: usize) -> bool {
-        self.slot_index(rsp).is_some_and(|index| {
-            let slot = &self.slots[index];
-            slot.contains(rsp) && slot.contains_range(start, end)
-        })
-    }
-
-    /// Samples only a live Host-owned slot, using the interrupted kernel RSP.
-    /// Neither CURRENT_TASK nor a Guest-published stack limit identifies it.
-    pub(super) fn record_tick(&self, rsp: usize, user: bool) -> Result<(), TickSampleError> {
-        let Some(index) = self.slot_index(rsp) else {
-            return Err(TickSampleError::InvalidStack);
-        };
-        let slot = &self.slots[index];
-        // An empty stack may point exactly at its usable end: the next push
-        // writes below it. No frame may use the sample record above that end.
-        if !slot.allocated || !slot.contains(rsp) || rsp > slot.base() + KSTACK_USABLE_BYTES {
-            return Err(TickSampleError::InvalidStack);
-        }
-        if slot.ticks().record(user) {
-            Ok(())
-        } else {
-            Err(TickSampleError::Overflow)
-        }
+    #[cfg(ktest)]
+    fn contains_current_range(&self, start: usize, end: usize, rsp: usize) -> bool {
+        // Locate the byte below RSP so an empty stack still selects its own
+        // slot, including the last slot whose top equals the pool's end.
+        rsp.checked_sub(1)
+            .and_then(|address| self.slot_index(address))
+            .is_some_and(|index| {
+                let slot = &self.slots[index];
+                rsp > slot.base() && slot.contains(rsp) && slot.contains_range(start, end)
+            })
     }
 
     #[cfg(ktest)]
@@ -494,8 +547,185 @@ impl StackPool {
 
 #[cfg(ktest)]
 mod stack_pool_tests {
+    use core::sync::atomic::AtomicBool;
+
     use super::*;
-    use crate::prelude::*;
+    use crate::{cpu::PinCurrentCpu, prelude::*};
+
+    struct StackPublicationProbe {
+        resources: Arc<ExecutionResources>,
+        remote: CpuId,
+        first: usize,
+        second: usize,
+        first_live: AtomicBool,
+        ready: AtomicBool,
+        go: AtomicBool,
+    }
+
+    static STACK_PUBLICATION_PROBE: SpinLock<Option<Arc<StackPublicationProbe>>, LocalIrqDisabled> =
+        SpinLock::new(None);
+
+    fn observe_stack_publication() {
+        let probe = STACK_PUBLICATION_PROBE.lock().as_ref().unwrap().clone();
+        assert_eq!(crate::cpu::CpuId::current_racy(), probe.remote);
+        assert_eq!(
+            probe
+                .resources
+                .contains_stack_range(probe.first, probe.first + 8),
+            probe.first_live.load(Ordering::Acquire)
+        );
+        assert!(probe.resources.contains_current_stack_range(
+            probe.second + STACK_BYTES - 64,
+            probe.second + STACK_BYTES,
+            probe.second + STACK_BYTES,
+        ));
+    }
+
+    fn update_remote_stack_bits() {
+        let probe = STACK_PUBLICATION_PROBE.lock().as_ref().unwrap().clone();
+        assert_eq!(crate::cpu::CpuId::current_racy(), probe.remote);
+        probe.ready.store(true, Ordering::Release);
+        while !probe.go.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        for _ in 0..4096 {
+            probe.resources.stack_layout.clear_live(1);
+            probe.resources.stack_layout.publish_live(1);
+        }
+    }
+
+    fn compare_stack_validation_with_locked_slots(resources: &ExecutionResources) {
+        // Keeping this guard while calling production readers also verifies
+        // that neither reader nor fixed-layout getter acquires the pool lock.
+        let stacks = resources.stacks.lock();
+        let (start, end, bitmap) = resources.stack_pool_layout();
+        assert_eq!(start, stacks.layout.start);
+        assert_eq!(end, stacks.layout.end);
+        assert_eq!(bitmap, stacks.layout.live_bitmap.as_ptr() as usize);
+        assert_eq!(
+            resources.initial_stack_base(0),
+            Some(stacks.slots[0].base())
+        );
+        assert_eq!(
+            resources.initial_stack_base(resources.carrier_spaces.len()),
+            None
+        );
+        let mut boundaries = alloc::vec![0, 1, usize::MAX, start - 1, start, end - 1, end, end + 1];
+        for slot in &stacks.slots {
+            let base = slot.base();
+            let top = base + KSTACK_USABLE_BYTES;
+            boundaries.extend([base - 1, base, base + 1, top - 1, top, top + 1]);
+        }
+        for &range_start in &boundaries {
+            for &range_end in &boundaries {
+                assert_eq!(
+                    resources.contains_stack_range(range_start, range_end),
+                    stacks.contains_range(range_start, range_end),
+                    "range={:#x?}",
+                    (range_start, range_end)
+                );
+                for &rsp in &boundaries {
+                    assert_eq!(
+                        resources.contains_current_stack_range(range_start, range_end, rsp),
+                        stacks.contains_current_range(range_start, range_end, rsp),
+                        "range and RSP={:#x?}",
+                        (range_start, range_end, rsp)
+                    );
+                }
+            }
+        }
+    }
+
+    #[ktest]
+    fn lock_free_stack_validation_matches_allocator_boundaries_and_reuse() {
+        let mut resources = ExecutionResources::new(2, 1).unwrap();
+        let layout = resources.stack_pool_layout();
+        compare_stack_validation_with_locked_slots(&resources);
+        resources.prepare().unwrap();
+        compare_stack_validation_with_locked_slots(&resources);
+        let boot = resources.boot_stack_base();
+        assert!(resources.contains_stack_range(boot, boot));
+        assert!(!resources.contains_stack_range(boot + STACK_BYTES, boot + STACK_BYTES));
+        assert!(resources.contains_current_stack_range(
+            boot + STACK_BYTES,
+            boot + STACK_BYTES,
+            boot + STACK_BYTES,
+        ));
+        let (first, _) = resources.allocate_stack().unwrap();
+        compare_stack_validation_with_locked_slots(&resources);
+        let (_last, _) = resources.allocate_stack().unwrap();
+        compare_stack_validation_with_locked_slots(&resources);
+        let charged = AtomicU32::new(3);
+        resources
+            .release_stack(first as usize, boot, 0, &charged)
+            .unwrap();
+        compare_stack_validation_with_locked_slots(&resources);
+        assert!(!resources.contains_stack_range(first as usize, first as usize));
+        let (reused, mapped) = resources.allocate_stack().unwrap();
+        assert_eq!(reused, first);
+        assert!(!mapped);
+        compare_stack_validation_with_locked_slots(&resources);
+        assert_eq!(resources.stack_pool_layout(), layout);
+    }
+
+    #[ktest]
+    fn stack_live_publication_is_visible_on_another_cpu_without_lost_bits() {
+        let guard = crate::task::disable_preempt();
+        let current = guard.current_cpu();
+        let Some(remote) = crate::cpu::all_cpus().find(|cpu| *cpu != current) else {
+            crate::early_println!("[skipped: stack publication requires two physical CPUs]");
+            return;
+        };
+        let mut resources = ExecutionResources::new(1, 2).unwrap();
+        resources.prepare().unwrap();
+        let resources = Arc::new(resources);
+        let first = resources.initial_stack_base(0).unwrap();
+        let second = resources.initial_stack_base(1).unwrap();
+        let layout = resources.stack_pool_layout();
+        let probe = Arc::new(StackPublicationProbe {
+            resources: resources.clone(),
+            remote,
+            first,
+            second,
+            first_live: AtomicBool::new(true),
+            ready: AtomicBool::new(false),
+            go: AtomicBool::new(false),
+        });
+        *STACK_PUBLICATION_PROBE.lock() = Some(probe.clone());
+        let observe_fn = |first_live| {
+            probe.first_live.store(first_live, Ordering::Release);
+            crate::smp::inter_processor_call(&remote.into(), observe_stack_publication).wait();
+        };
+        observe_fn(true);
+        let charged = AtomicU32::new(2);
+        resources.release_stack(first, second, 0, &charged).unwrap();
+        observe_fn(false);
+        let (reused, mapped) = resources.allocate_stack().unwrap();
+        assert_eq!(reused as usize, first);
+        assert!(!mapped);
+        observe_fn(true);
+
+        // Both mappings remain owned and unused by Tasks. Exercise concurrent
+        // publication of different bits in the same word on two real CPUs;
+        // this checks the atomic protocol, not Task identity or stack pinning.
+        let pending = crate::smp::inter_processor_call(&remote.into(), update_remote_stack_bits);
+        while !probe.ready.load(Ordering::Acquire) {
+            core::hint::spin_loop();
+        }
+        probe.go.store(true, Ordering::Release);
+        for _ in 0..4096 {
+            resources.stack_layout.clear_live(0);
+            resources.stack_layout.publish_live(0);
+        }
+        pending.wait();
+        assert_eq!(
+            resources.stack_layout.live_bitmap[0].load(Ordering::Acquire),
+            3
+        );
+        observe_fn(true);
+        assert_eq!(resources.stack_pool_layout(), layout);
+        STACK_PUBLICATION_PROBE.lock().take();
+    }
 
     #[ktest]
     fn reservation_covers_boot_stacks_in_addition_to_ordinary_tasks() {
@@ -523,67 +753,6 @@ mod stack_pool_tests {
     }
 
     #[ktest]
-    fn physical_ticks_follow_stack_rsp_and_settle_before_reuse() {
-        let mut resources = ExecutionResources::new(2, 1).unwrap();
-        resources.prepare().unwrap();
-        let (first, _) = resources.allocate_stack().unwrap();
-        let (second, _) = resources.allocate_stack().unwrap();
-        let first = first as usize;
-        let second = second as usize;
-        let charged = AtomicU32::new(3);
-        {
-            let stacks = resources.stacks.lock();
-            // Publishing a different Guest current Task cannot affect these
-            // samples: only the physical/saved kernel RSP selects the slot.
-            stacks.record_tick(first + 128, true).unwrap();
-            stacks.record_tick(first + 64, false).unwrap();
-            // An initial/empty stack's next push is below this valid end.
-            stacks
-                .record_tick(first + KSTACK_USABLE_BYTES, false)
-                .unwrap();
-            stacks.record_tick(second + 64, false).unwrap();
-            assert_eq!(
-                stacks.record_tick(first + KSTACK_USABLE_BYTES + 1, true),
-                Err(TickSampleError::InvalidStack)
-            );
-            assert_eq!(
-                stacks.record_tick(first - 8, true),
-                Err(TickSampleError::InvalidStack)
-            );
-        }
-        assert_eq!(
-            resources.release_stack(first, second + 64, 0, &charged),
-            Err(-STATE)
-        );
-        assert_eq!(charged.load(Ordering::Relaxed), 3);
-        {
-            let stacks = resources.stacks.lock();
-            assert_eq!(stacks.active_tasks, 2);
-            let first_slot = &stacks.slots[stacks.slot_index(first).unwrap()];
-            let second_slot = &stacks.slots[stacks.slot_index(second).unwrap()];
-            assert_eq!(first_slot.ticks().take(), (1, 2));
-            assert_eq!(second_slot.ticks().take(), (0, 1));
-            assert_eq!(first_slot.ticks().take(), (0, 0));
-        }
-        resources
-            .release_stack(first, second + 64, 0, &charged)
-            .unwrap();
-        assert_eq!(charged.load(Ordering::Relaxed), 2);
-        assert_eq!(
-            resources.stacks.lock().record_tick(first + 64, true),
-            Err(TickSampleError::InvalidStack)
-        );
-        let (reused, mapped) = resources.allocate_stack().unwrap();
-        assert_eq!(reused as usize, first);
-        assert!(!mapped);
-        let stacks = resources.stacks.lock();
-        let reused = &stacks.slots[stacks.slot_index(first).unwrap()];
-        assert_eq!(reused.ticks().take(), (0, 0));
-        stacks.record_tick(first + 64, true).unwrap();
-        assert_eq!(reused.ticks().take(), (1, 0));
-    }
-
-    #[ktest]
     fn aligned_stack_pool_maps_on_demand_and_retains_freed_mappings() {
         let mut resources = ExecutionResources::new(2, 1).unwrap();
         resources.prepare().unwrap();
@@ -601,10 +770,17 @@ mod stack_pool_tests {
         {
             let guard = crate::irq::disable_local();
             let stacks = resources.stacks.lock();
-            assert!(stacks.arena.query(&guard, boot).is_some());
-            assert!(stacks.arena.query(&guard, boot - PAGE_SIZE).is_none());
+            assert!(stacks.layout.arena.query(&guard, boot).is_some());
             assert!(
                 stacks
+                    .layout
+                    .arena
+                    .query(&guard, boot - PAGE_SIZE)
+                    .is_none()
+            );
+            assert!(
+                stacks
+                    .layout
                     .arena
                     .query(&guard, start + STACK_STRIDE + STACK_BYTES)
                     .is_none()
@@ -631,9 +807,35 @@ mod stack_pool_tests {
         ));
         {
             let mut stacks = resources.stacks.lock();
+            for base in [boot, first as usize, second as usize] {
+                let top = base + STACK_BYTES;
+                assert!(stacks.contains_current_range(top - 64, top, top));
+                assert!(!stacks.contains_current_range(top - 64, top, top + 1));
+                assert!(!stacks.contains_current_range(top - 64, top + 1, top));
+                assert!(!stacks.contains_current_range(base, base + 8, base));
+                assert!(!stacks.contains_current_range(base, base + 8, base - 1));
+                assert!(!stacks.contains_current_range(base, base + 8, 0));
+            }
             assert!(stacks.contains_current_range(
                 first as usize + 16,
                 first as usize + KSTACK_USABLE_BYTES,
+                first as usize + 8,
+            ));
+            // The entire mapping is usable stack storage, while the first
+            // byte beyond its upper bound must remain inaccessible to a frame.
+            assert!(stacks.contains_current_range(
+                first as usize + STACK_BYTES - 8,
+                first as usize + STACK_BYTES,
+                first as usize + 8,
+            ));
+            assert!(!stacks.contains_current_range(
+                first as usize + STACK_BYTES - 8,
+                first as usize + STACK_BYTES + 1,
+                first as usize + 8,
+            ));
+            assert!(!stacks.contains_current_range(
+                first as usize - 8,
+                first as usize + 8,
                 first as usize + 8,
             ));
             assert!(!stacks.contains_current_range(
@@ -647,15 +849,24 @@ mod stack_pool_tests {
                 stacks.free(first as usize, first as usize + 8, 0),
                 Err(-INVALID)
             );
+            assert_eq!(
+                stacks.free(first as usize, first as usize + STACK_BYTES, 0),
+                Err(-INVALID)
+            );
             assert_eq!(stacks.free(first as usize, boot, 0), Ok(StackRelease::Task));
             assert_eq!(stacks.free(first as usize, boot, 0), Err(-INVALID));
             assert!(!stacks.contains_range(first as usize, first as usize + 8));
+            assert!(!stacks.contains_current_range(
+                first as usize + STACK_BYTES - 64,
+                first as usize + STACK_BYTES,
+                first as usize + STACK_BYTES,
+            ));
         }
         assert_eq!(live.load(Ordering::Acquire), 5);
         {
             let guard = crate::irq::disable_local();
             let stacks = resources.stacks.lock();
-            assert!(stacks.arena.query(&guard, first as usize).is_some());
+            assert!(stacks.layout.arena.query(&guard, first as usize).is_some());
         }
         let before_reuse = STACK_MAPPING_FLUSHES.load(Ordering::Relaxed);
         let (reused, new_mapping) = resources.allocate_stack().unwrap();
@@ -665,6 +876,11 @@ mod stack_pool_tests {
         assert_eq!(live.load(Ordering::Acquire), 7);
         assert_eq!(resources.counts(), (3, 0));
         assert_eq!(resources.stack_pool_layout(), layout);
+        assert!(resources.stacks.lock().contains_current_range(
+            first as usize + STACK_BYTES - 64,
+            first as usize + STACK_BYTES,
+            first as usize + STACK_BYTES,
+        ));
     }
 
     #[ktest]
@@ -678,14 +894,15 @@ mod stack_pool_tests {
         {
             let mut stacks = resources.stacks.lock();
             assert_eq!(stacks.active_tasks, 1);
-            assert_eq!(stacks.live_bitmap[0].load(Ordering::Acquire), 7);
+            assert_eq!(stacks.layout.live_bitmap[0].load(Ordering::Acquire), 7);
             assert_eq!(stacks.free(boot, first as usize, 1), Err(-INVALID));
             assert_eq!(stacks.free(boot, boot + 8, 0), Err(-INVALID));
+            assert_eq!(stacks.free(boot, boot + STACK_BYTES, 0), Err(-INVALID));
             // Boot storage is independent of the ordinary active_tasks
             // limit. Its total stack charge was reserved by create.
             assert_eq!(stacks.free(boot, first as usize, 0), Ok(StackRelease::Boot));
             assert_eq!(stacks.active_tasks, 1);
-            assert_eq!(stacks.live_bitmap[0].load(Ordering::Acquire), 6);
+            assert_eq!(stacks.layout.live_bitmap[0].load(Ordering::Acquire), 6);
             assert_eq!(stacks.free(boot, first as usize, 0), Err(-INVALID));
             assert!(stacks.slots[0].mapped);
             assert!(!stacks.slots[0].allocated);
@@ -703,7 +920,7 @@ mod stack_pool_tests {
                 Ok(StackRelease::Task)
             );
             assert_eq!(stacks.active_tasks, 0);
-            assert_eq!(stacks.live_bitmap[0].load(Ordering::Acquire), 2);
+            assert_eq!(stacks.layout.live_bitmap[0].load(Ordering::Acquire), 2);
         }
 
         let (reused, new_mapping) = resources.allocate_stack().unwrap();
@@ -716,12 +933,12 @@ mod stack_pool_tests {
         ));
         let mut stacks = resources.stacks.lock();
         assert_eq!(stacks.active_tasks, 1);
-        assert_eq!(stacks.live_bitmap[0].load(Ordering::Acquire), 3);
+        assert_eq!(stacks.layout.live_bitmap[0].load(Ordering::Acquire), 3);
         // Once reused, this is a normal Task stack and may be released by
         // another vCPU after its Task migrates.
         assert_eq!(stacks.free(boot, second_boot, 1), Ok(StackRelease::Task));
         assert_eq!(stacks.active_tasks, 0);
-        assert_eq!(stacks.live_bitmap[0].load(Ordering::Acquire), 2);
+        assert_eq!(stacks.layout.live_bitmap[0].load(Ordering::Acquire), 2);
         assert_eq!(stacks.free(boot, second_boot, 1), Err(-INVALID));
     }
 
@@ -777,6 +994,6 @@ mod stack_pool_tests {
         assert_eq!(stacks_allocated.load(Ordering::Relaxed), 0);
         let stacks = resources.stacks.lock();
         assert_eq!(stacks.active_tasks, 0);
-        assert_eq!(stacks.live_bitmap[0].load(Ordering::Acquire), 0);
+        assert_eq!(stacks.layout.live_bitmap[0].load(Ordering::Acquire), 0);
     }
 }

@@ -118,10 +118,17 @@ impl VirtioTransport for VirtioPciModernTransport {
 
     fn notify_config(&self, idx: usize) -> ConfigManager<u32> {
         debug_assert!(idx < self.num_queues() as usize);
-        let safe_ptr = Some(SafePtr::new(
-            self.notify.io_memory.clone(),
-            (self.notify.offset + self.notify.offset_multiplier * idx as u32) as usize,
-        ));
+        field_ptr!(&self.common_cfg, VirtioPciCommonCfg, queue_select)
+            .write_once(&(idx as u16))
+            .unwrap();
+        let queue_notify_off = field_ptr!(&self.common_cfg, VirtioPciCommonCfg, queue_notify_off)
+            .read_once()
+            .unwrap();
+        // VirtIO 1.3 section 4.1.4.4: the device supplies this offset for
+        // the selected queue; it need not equal the queue index.
+        let offset = self.notify.offset as usize
+            + self.notify.offset_multiplier as usize * queue_notify_off as usize;
+        let safe_ptr = Some(SafePtr::new(self.notify.io_memory.clone(), offset));
 
         ConfigManager::new(safe_ptr, None)
     }

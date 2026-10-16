@@ -330,11 +330,17 @@ pub(crate) struct PageTable<C: PageTableConfig> {
 }
 
 impl PageTable<UserPtConfig> {
-    pub(in crate::mm) fn activate(&self) {
+    pub(in crate::mm) fn activate(
+        &self,
+        #[cfg(feature = "kernelet-host")] irq_guard: &crate::irq::DisabledLocalIrqGuard,
+    ) {
         // SAFETY: The user mode page table is safe to activate since the kernel
         // mappings are shared.
         unsafe {
-            self.root.activate();
+            self.root.activate(
+                #[cfg(feature = "kernelet-host")]
+                irq_guard,
+            );
         }
     }
 
@@ -360,9 +366,17 @@ impl PageTable<UserPtConfig> {
 
 impl PageTable<KernelPtConfig> {
     #[cfg(not(feature = "kernelet"))]
-    pub(in crate::mm) fn activate(&self) {
+    pub(in crate::mm) fn activate(
+        &self,
+        #[cfg(feature = "kernelet-host")] irq_guard: &crate::irq::DisabledLocalIrqGuard,
+    ) {
         // SAFETY: The permanent kernel root owns all shared Host mappings.
-        unsafe { self.root.activate() };
+        unsafe {
+            self.root.activate(
+                #[cfg(feature = "kernelet-host")]
+                irq_guard,
+            )
+        };
     }
 
     /// Creates a new kernel page table.

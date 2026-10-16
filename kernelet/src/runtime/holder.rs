@@ -390,7 +390,8 @@ fn handle(holder: &Arc<Holder>, mut connection: UnixStream) -> Result<()> {
             protocol::send_value(
                 &mut connection,
                 &Reply::Stats(Stats {
-                    cpu_time_ns: stats.cpu_time_ns,
+                    cpu_time_ns: (stats.cpu_time_ns != kernelet_abi::STATS_UNAVAILABLE)
+                        .then_some(stats.cpu_time_ns),
                     throttled_ns: stats.throttled_ns,
                     completion_cpu_ns: (stats.completion_cpu_ns != kernelet_abi::STATS_UNAVAILABLE)
                         .then_some(stats.completion_cpu_ns),

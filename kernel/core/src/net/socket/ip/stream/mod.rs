@@ -72,7 +72,7 @@ pub(crate) struct StreamSocket {
 
     pollee: Pollee,
     #[cfg(feature = "kernelet-host")]
-    nat_charge: Arc<SpinLock<Option<crate::endovisor::NativeTcpBufferCharge>>>,
+    nat_charge: Option<Arc<crate::endovisor::NativeTcpBufferCharge>>,
     common: FileCommon,
 }
 
@@ -114,6 +114,31 @@ impl OptionSet {
 
 impl StreamSocket {
     pub(crate) fn new(is_nonblocking: bool, family: IpAddressFamily) -> Arc<Self> {
+        Self::new_inner(
+            is_nonblocking,
+            family,
+            #[cfg(feature = "kernelet-host")]
+            None,
+        )
+    }
+
+    /// Creates a NAT socket whose protocol observers retain its buffer charge.
+    #[cfg(feature = "kernelet-host")]
+    pub(crate) fn new_nat(
+        is_nonblocking: bool,
+        family: IpAddressFamily,
+        charge: crate::endovisor::NativeTcpBufferCharge,
+    ) -> Arc<Self> {
+        Self::new_inner(is_nonblocking, family, Some(Arc::new(charge)))
+    }
+
+    fn new_inner(
+        is_nonblocking: bool,
+        family: IpAddressFamily,
+        #[cfg(feature = "kernelet-host")] nat_charge: Option<
+            Arc<crate::endovisor::NativeTcpBufferCharge>,
+        >,
+    ) -> Arc<Self> {
         let init_stream = InitStream::new();
         Arc::new(Self {
             state: RwLock::new(Takeable::new(State::Init(init_stream))),
@@ -122,7 +147,7 @@ impl StreamSocket {
             timeouts: SocketTimeouts::new(),
             pollee: Pollee::new(),
             #[cfg(feature = "kernelet-host")]
-            nat_charge: Arc::new(SpinLock::new(None)),
+            nat_charge,
             common: new_socket_common(is_nonblocking),
         })
     }
@@ -133,6 +158,9 @@ impl StreamSocket {
         listener_options: &OptionSet,
         listener_timeouts: &SocketTimeouts,
         is_nonblocking: bool,
+        #[cfg(feature = "kernelet-host")] nat_charge: Option<
+            Arc<crate::endovisor::NativeTcpBufferCharge>,
+        >,
     ) -> Arc<Self> {
         let options = connected_stream.raw_with(|raw_tcp_socket| {
             let mut options = OptionSet::new();
@@ -166,8 +194,6 @@ impl StreamSocket {
         });
 
         let pollee = Pollee::new();
-        #[cfg(feature = "kernelet-host")]
-        let nat_charge = Arc::new(SpinLock::new(None));
         connected_stream.init_observer(StreamObserver::new(
             pollee.clone(),
             #[cfg(feature = "kernelet-host")]
@@ -186,18 +212,17 @@ impl StreamSocket {
         })
     }
 
-    /// Retains NAT TCP buffer accounting through the native protocol lifetime.
+    /// Accepts a NAT connection with its charge installed before observer creation.
     #[cfg(feature = "kernelet-host")]
-    pub(crate) fn retain_nat_charge(
+    pub(crate) fn accept_nat(
         &self,
+        is_nonblocking: bool,
         charge: crate::endovisor::NativeTcpBufferCharge,
-    ) -> Result<()> {
-        let mut retained = self.nat_charge.lock();
-        if retained.is_some() {
-            return_errno_with_message!(Errno::EALREADY, "native NAT TCP charge already installed");
-        }
-        *retained = Some(charge);
-        Ok(())
+    ) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
+        let charge = Arc::new(charge);
+        self.block_on(IoEvents::IN, self.timeouts.recv_timeout(), || {
+            self.try_accept(is_nonblocking, Some(&charge))
+        })
     }
 
     /// Ensures that the socket state is up to date and obtains a read lock on it.
@@ -358,7 +383,13 @@ impl StreamSocket {
         }
     }
 
-    fn try_accept(&self, is_nonblocking: bool) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
+    fn try_accept(
+        &self,
+        is_nonblocking: bool,
+        #[cfg(feature = "kernelet-host")] nat_charge: Option<
+            &Arc<crate::endovisor::NativeTcpBufferCharge>,
+        >,
+    ) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
         let state = self.read_updated_state();
 
         let State::Listen(listen_stream) = state.as_ref() else {
@@ -374,6 +405,8 @@ impl StreamSocket {
                 &listener_options,
                 &self.timeouts,
                 is_nonblocking,
+                #[cfg(feature = "kernelet-host")]
+                nat_charge.cloned(),
             );
             (accepted_socket as _, remote_endpoint.into())
         });
@@ -614,7 +647,11 @@ impl Socket for StreamSocket {
 
     fn accept(&self, is_nonblocking: bool) -> Result<(Arc<dyn FileLike>, SocketAddr)> {
         self.block_on(IoEvents::IN, self.timeouts.recv_timeout(), || {
-            self.try_accept(is_nonblocking)
+            self.try_accept(
+                is_nonblocking,
+                #[cfg(feature = "kernelet-host")]
+                None,
+            )
         })
     }
 

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MPL-2.0
 
+#[cfg(not(feature = "kernelet"))]
 use x86::msr::{IA32_PAT, wrmsr};
 
 use super::PteFlags;
@@ -65,6 +66,7 @@ const_assert!(matches!(
 
 /// Programs the PAT MSR so that write-combining mappings use the
 /// correct memory type.
+#[cfg(not(feature = "kernelet"))]
 pub(super) fn configure_pat() {
     // Reference: Intel(R) 64 and IA-32 Architectures Software Developer's Manual, Table 12-10,
     // "Memory Types That Can Be Encoded With PAT".

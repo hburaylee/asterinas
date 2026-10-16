@@ -141,11 +141,11 @@ impl RegisteredImage {
             .len()
             .checked_mul(PAGE_SIZE)
             .ok_or(Error::Overflow)?;
-        // Boot page, clock reference, vCPU/fault records and the image's
+        // Boot page, vCPU/fault records and the image's
         // contiguous map. Grant-shared page tables are counted by Grant.
         let boot = super::abi::vcpu_shared_bytes(vcpus)
             .div_ceil(PAGE_SIZE)
-            .checked_add(2)
+            .checked_add(1)
             .and_then(|n| n.checked_mul(PAGE_SIZE))
             .ok_or(Error::Overflow)?;
         let mapping = self

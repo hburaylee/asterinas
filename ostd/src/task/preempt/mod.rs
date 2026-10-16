@@ -2,28 +2,10 @@
 
 pub(super) mod cpu_local;
 mod guard;
+#[cfg(all(ktest, target_arch = "x86_64", not(feature = "kernelet")))]
+mod test;
 
 pub use self::guard::{DisabledPreemptGuard, disable_preempt};
-
-/// Checks for preemption after leaving an atomic section.
-#[cfg(all(target_arch = "x86_64", feature = "kernelet-host"))]
-#[inline]
-pub(crate) fn check_preempt() {
-    if !cpu_local::should_preempt() {
-        return;
-    }
-
-    // A bottom half may release its final guard with IRQs still off. Bootstrap
-    // must also finish installing its idle Task before the first switch.
-    if !crate::irq::InterruptLevel::current().is_task_context()
-        || !crate::arch::irq::is_local_enabled()
-        || super::Task::current().is_none()
-    {
-        return;
-    }
-
-    super::scheduler::might_preempt();
-}
 
 /// Halts the CPU until interrupts if no preemption is required.
 ///

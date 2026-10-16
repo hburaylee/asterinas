@@ -610,6 +610,8 @@ fn physical_control_in_ordinary_image_code_fails_artifact_admission() {
         &[0x0f, 0x01, 0xc1][..],             // VMCALL
         &[0x9d][..],                         // POPFQ can restore physical IF
         &[0x0f, 0x05][..],                   // SYSCALL bypasses the service gate
+        &[0x0f, 0x22, 0xd8][..],             // MOV RAX -> CR3
+        &[0x0f, 0x30][..],                   // WRMSR
     ] {
         let bytes = image_with(&[Mutation {
             offset: TEXT_VADDR as usize + 0x80,

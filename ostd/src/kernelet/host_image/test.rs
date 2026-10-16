@@ -167,7 +167,8 @@ fn test_boot_args(num_vcpus: u16) -> BootArgs {
         size: size_of::<BootArgs>() as u32,
         generation: 1,
         source_hash: [0; 32],
-        tsc_freq_hz: 0,
+        tsc_freq_hz: 1_000_000_000,
+        clock_origin_tsc: 0,
         kernelet: 1,
         num_vcpus,
         vcpu_host_cpu: [0; MAX_VCPUS],
@@ -181,7 +182,6 @@ fn test_boot_args(num_vcpus: u16) -> BootArgs {
         meta_block_sections: 0,
         meta_grain_bitmap: 0,
         max_meta_sections: 1,
-        clock_page: 0,
         info_page: 0,
         vcpu_records: PAGE_SIZE as u32,
         max_tasks: 4,
@@ -232,12 +232,14 @@ fn instance_relocation_and_sharing() {
     assert_eq!(u64::from_le_bytes(prefix), ENTRY_TABLE_SIZE);
 
     let first_boot = BootArgs {
+        clock_origin_tsc: 0x1122_3344_5566_7788,
         realtime_base_ns: 1_790_000_000_000_000_000,
         monotonic_base_ns: 123_456,
         ..test_boot_args(1)
     };
     let second_boot = BootArgs {
         generation: 2,
+        clock_origin_tsc: first_boot.clock_origin_tsc + 1,
         realtime_base_ns: first_boot.realtime_base_ns + 1_000_000_000,
         monotonic_base_ns: first_boot.monotonic_base_ns + 1_000_000_000,
         ..first_boot
@@ -269,6 +271,13 @@ fn instance_relocation_and_sharing() {
     );
     // The virtual RTC needs both anchors from this instance's boot page.
     for (instance, boot) in [(&first, &first_boot), (&second, &second_boot)] {
+        let mut calibration = [0u8; 16];
+        instance
+            ._boot_frame
+            .read_bytes(offset_of!(BootArgs, tsc_freq_hz), &mut calibration)
+            .unwrap();
+        assert_eq!(&calibration[..8], &boot.tsc_freq_hz.to_le_bytes());
+        assert_eq!(&calibration[8..], &boot.clock_origin_tsc.to_le_bytes());
         let mut anchors = [0u8; 16];
         instance
             ._boot_frame
@@ -418,39 +427,32 @@ fn instance_relocation_and_sharing() {
     assert_eq!(&boot_prefix[0..4], &second_boot.size.to_le_bytes());
     assert_eq!(&boot_prefix[4..8], &second_boot.generation.to_le_bytes());
 
-    // Both instances see the one Host clock frame through a read-only
-    // mapping at the nonzero offset published in their boot pages.
-    let mut clock_offset_bytes = [0u8; 4];
-    first
-        ._boot_frame
-        .read_bytes(
-            core::mem::offset_of!(BootArgs, clock_page),
-            &mut clock_offset_bytes,
-        )
-        .unwrap();
-    let clock_offset = u32::from_le_bytes(clock_offset_bytes) as usize;
-    assert_eq!(clock_offset, 2 * PAGE_SIZE);
-    let first_clock = match first
-        .kvirt
-        .query(&guard, first.boot_args_address() + clock_offset)
-    {
-        Some(MappedItemRef::Tracked(frame, prop)) => {
-            assert_eq!(prop.flags, PageFlags::R);
-            frame.paddr()
+    // Calibration lives in BootArgs. The info page immediately follows the
+    // vCPU records, with no intervening clock frame or writable mapping.
+    for (instance, grant) in [(&first, &first_grant), (&second, &second_grant)] {
+        let mut offset_bytes = [0u8; 4];
+        instance
+            ._boot_frame
+            .read_bytes(offset_of!(BootArgs, info_page), &mut offset_bytes)
+            .unwrap();
+        let info_offset = u32::from_le_bytes(offset_bytes) as usize;
+        assert_eq!(info_offset, 2 * PAGE_SIZE);
+        match instance
+            .kvirt
+            .query(&guard, instance.boot_args_address() + info_offset)
+        {
+            Some(MappedItemRef::Tracked(frame, prop)) => {
+                assert_eq!(prop.flags, PageFlags::R);
+                assert_eq!(frame.paddr(), grant.shared_frames().next().unwrap().paddr());
+            }
+            _ => panic!("the instance info page must be mapped"),
         }
-        _ => panic!("the shared clock page must be mapped"),
-    };
-    let second_clock = match second
-        .kvirt
-        .query(&guard, second.boot_args_address() + clock_offset)
-    {
-        Some(MappedItemRef::Tracked(frame, prop)) => {
-            assert_eq!(prop.flags, PageFlags::R);
-            frame.paddr()
-        }
-        _ => panic!("the second clock page must be mapped"),
-    };
-    assert_eq!(first_clock, second_clock);
+        instance
+            ._boot_frame
+            .read_bytes(offset_of!(BootArgs, grant_table), &mut offset_bytes)
+            .unwrap();
+        assert_eq!(u32::from_le_bytes(offset_bytes) as usize, 3 * PAGE_SIZE);
+    }
 
     for offset in [2 * HUGE_PAGE_SIZE, 4 * HUGE_PAGE_SIZE] {
         match first.kvirt.query(&guard, first.base_vaddr() + offset) {

@@ -215,6 +215,7 @@ pub fn read_random() -> Option<u64> {
     None
 }
 
+#[cfg(not(feature = "kernelet"))]
 pub(crate) fn enable_cpu_features() {
     use cpu::extension::{IsaExtensions, has_extensions};
     use x86_64::registers::{

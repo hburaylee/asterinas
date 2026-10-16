@@ -359,9 +359,6 @@ fn run(
     let mut accept_retry = vec![None; listeners.len()];
     let result = (|| {
         loop {
-            if model.kernelet.wait_for_cpu_budget().is_err() {
-                return Ok(());
-            }
             let generation = model.endpoint.generation();
             let timestamp =
                 NetworkInstant::from_millis(now().as_millis().min(i64::MAX as u128) as i64);
@@ -1459,7 +1456,7 @@ mod mapped_tcp_admission_tests {
     use crate::{
         endovisor::policy::{Admission, NatQuotaSnapshot},
         net::{
-            iface,
+            init_loopback_for_ktest, poll_loopback_for_ktest,
             socket::{
                 Socket,
                 ip::{IpAddressFamily, StreamSocket},
@@ -1654,7 +1651,7 @@ mod mapped_tcp_admission_tests {
             INIT.call_once(|| {
                 crate::time::clocks::init_for_ktest();
                 crate::util::random::init();
-                iface::init_loopback_for_ktest();
+                init_loopback_for_ktest();
                 crate::endovisor::reaper::init().unwrap();
             });
             let kind = FIXTURE_KIND.call_once(|| KerneletKind::register_dormant_fixture().unwrap());
@@ -1831,7 +1828,7 @@ mod mapped_tcp_admission_tests {
     fn poll_until(mut predicate: impl FnMut() -> bool) -> bool {
         let deadline = now() + TEST_WAIT;
         loop {
-            iface::loopback_iface().poll();
+            poll_loopback_for_ktest();
             if predicate() {
                 return true;
             }

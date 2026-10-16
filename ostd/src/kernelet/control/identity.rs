@@ -197,11 +197,7 @@ mod test {
     use super::*;
     use crate::{
         cpu::CpuId,
-        kernelet::{
-            account::Account,
-            control::{CpuBudget, KerneletPolicy},
-            host_run,
-        },
+        kernelet::{account::Account, control::KerneletPolicy, host_run},
         prelude::*,
         sync::WaitQueue,
     };
@@ -210,11 +206,7 @@ mod test {
         RunControl::new(
             Registration::new().unwrap(),
             0,
-            Account::new(
-                Arc::new(WaitQueue::new()),
-                CpuBudget::default(),
-                KerneletPolicy::default(),
-            ),
+            Account::new(Arc::new(WaitQueue::new()), KerneletPolicy::default()),
             alloc::vec![CpuId::bsp()],
             host_run::ExecutionResources::new(1, 1).unwrap(),
         )

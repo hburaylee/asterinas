@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MPL-2.0
 
 mod iface;
+#[cfg(ktest)]
+pub(crate) use iface::{init_loopback_for_ktest, poll_loopback_for_ktest};
 mod route;
 pub(crate) mod socket;
 pub(crate) mod uts_ns;

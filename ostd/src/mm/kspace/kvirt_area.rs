@@ -531,17 +531,21 @@ impl Drop for KVirtArea {
 
         #[cfg(feature = "kernelet-host")]
         {
-            drop(irq_guard);
-            if self.synchronous_reclaim {
-                // All roots share these kernel-half PTEs. Retain both the removed
-                // page-table fragments and the reservation until every CPU has
-                // acknowledged the invalidation. No allocator lock spans the IPI.
-                crate::smp::inter_processor_call(
-                    &crate::cpu::CpuSet::new_full(),
-                    crate::arch::mm::tlb_flush_all_including_global,
-                )
-                .wait();
+            if !self.synchronous_reclaim {
+                // Ordinary areas need no wait between unmapping and returning
+                // their reservation. Keep the original IRQ guard throughout.
+                kvirt_area_allocator(&irq_guard).free(range);
+                return;
             }
+            drop(irq_guard);
+            // All roots share these kernel-half PTEs. Retain both the removed
+            // page-table fragments and the reservation until every CPU has
+            // acknowledged the invalidation. No allocator lock spans the IPI.
+            crate::smp::inter_processor_call(
+                &crate::cpu::CpuSet::new_full(),
+                crate::arch::mm::tlb_flush_all_including_global,
+            )
+            .wait();
             drop(retired);
             // Free the virtual block only after stale translations are gone.
             let irq_guard = irq::disable_local();

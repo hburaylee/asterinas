@@ -383,8 +383,9 @@ pub(super) fn print_exemptions(
     base_crate: &Path,
     features: &[String],
     toolchain: Option<&OsStr>,
+    cargo_home: Option<&Path>,
 ) -> io::Result<()> {
-    let current_packages = image_dependency_closure(base_crate, features, toolchain)?;
+    let current_packages = image_dependency_closure(base_crate, features, toolchain, cargo_home)?;
     let content = fs::read_to_string(path)?;
     let entries: BTreeSet<AuditEntry> = content
         .lines()
@@ -442,8 +443,14 @@ fn image_dependency_closure(
     base_crate: &Path,
     features: &[String],
     toolchain: Option<&OsStr>,
+    cargo_home: Option<&Path>,
 ) -> io::Result<HashSet<(String, String, String)>> {
     let mut command = Command::new("cargo");
+    if let Some(home) = cargo_home {
+        command
+            .env("CARGO_HOME", home)
+            .env("CARGO_NET_OFFLINE", "true");
+    }
     command.current_dir(base_crate).args([
         "metadata",
         "--format-version=1",

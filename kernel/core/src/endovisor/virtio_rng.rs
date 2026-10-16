@@ -8,8 +8,8 @@
 //! `VIRTIO_F_VERSION_1` (§6).
 //! See <https://docs.oasis-open.org/virtio/virtio/v1.3/virtio-v1.3.html>.
 //!
-//! The MMIO hook only snapshots validated descriptor chains. A Host kernel
-//! thread fills their writable buffers and publishes used-ring completions.
+//! The MMIO hook records a doorbell. A Host kernel thread validates descriptor
+//! chains, fills their writable buffers, and publishes used-ring completions.
 
 use alloc::{collections::VecDeque, sync::Arc};
 use core::sync::atomic::{AtomicBool, AtomicU32, Ordering, fence};
@@ -26,7 +26,7 @@ use ostd::{
 use super::virtio_mmio::{
     feature_word, invalid_read, set_high, set_low, write_driver_feature_word,
 };
-use crate::{thread::kernel_thread::ThreadOptions, util::random::getrandom};
+use crate::util::random::getrandom;
 
 const QUEUE_SIZE: usize = 64;
 const MAX_REQUEST_BYTES: usize = 4096;
@@ -59,6 +59,7 @@ struct Registers {
     queue_select: u32,
     queue_num: u32,
     queue_ready: bool,
+    notified: bool,
     desc: u64,
     avail: u64,
     used: u64,
@@ -81,6 +82,7 @@ impl Registers {
             queue_select: 0,
             queue_num: 0,
             queue_ready: false,
+            notified: false,
             desc: 0,
             avail: 0,
             used: 0,
@@ -99,6 +101,7 @@ impl Registers {
         self.inbox.clear();
         self.pending.fill(false);
         self.queue_ready = false;
+        self.notified = false;
         self.last_avail = 0;
         self.next_used = 0;
         self.resetting = self.active != 0;
@@ -132,9 +135,9 @@ impl VirtioRng {
         })
     }
 
-    pub(super) fn start_worker(self: &Arc<Self>) {
+    pub(super) fn start_worker(self: &Arc<Self>, execution: &super::scheduling::ExecutionThreads) {
         let device = self.clone();
-        ThreadOptions::new(move || device.worker()).spawn();
+        execution.spawn_worker(move || device.worker());
     }
 
     pub(super) fn cancel(&self) {
@@ -203,7 +206,7 @@ impl VirtioRng {
                 {
                     return -INVALID;
                 }
-                self.collect_requests(&mut registers);
+                registers.notified = true;
                 self.requests.wake_all();
             }
             0x64 => {
@@ -243,6 +246,7 @@ impl VirtioRng {
     }
 
     fn collect_requests(&self, r: &mut Registers) {
+        r.notified = false;
         let Ok(avail_idx) = self.read_u16(r.avail + 2) else {
             r.status |= DEVICE_NEEDS_RESET;
             return;
@@ -251,7 +255,7 @@ impl VirtioRng {
             r.status |= DEVICE_NEEDS_RESET;
             return;
         }
-        while r.last_avail != avail_idx && r.inbox.len() + r.active < QUEUE_SIZE {
+        if r.last_avail != avail_idx && r.inbox.len() + r.active < QUEUE_SIZE {
             let slot = r.last_avail as u32 % r.queue_num;
             let Some(head_addr) = r.avail.checked_add(4 + slot as u64 * 2) else {
                 r.status |= DEVICE_NEEDS_RESET;
@@ -273,6 +277,7 @@ impl VirtioRng {
             r.inbox.push_back(request);
             r.last_avail = r.last_avail.wrapping_add(1);
         }
+        r.notified = r.last_avail != avail_idx;
     }
 
     fn collect_chain(&self, r: &Registers, head: u16) -> Option<Request> {
@@ -333,14 +338,15 @@ impl VirtioRng {
             return;
         }
         loop {
-            if self.kernelet.wait_for_cpu_budget().is_err() {
-                break;
-            }
             let request = self.requests.wait_until(|| {
                 if self.cancelled.load(Ordering::Acquire) {
                     return Some(None);
                 }
                 let mut r = self.registers.lock();
+                if r.notified && r.queue_ready && !r.resetting && r.status & DEVICE_NEEDS_RESET == 0
+                {
+                    self.collect_requests(&mut r);
+                }
                 let request = r.inbox.pop_front()?;
                 r.active += 1;
                 Some(Some(request))
@@ -351,6 +357,9 @@ impl VirtioRng {
             let mut entropy = [0u8; MAX_REQUEST_BYTES];
             getrandom(&mut entropy[..request.total_bytes]);
             self.complete(request, &entropy);
+            if ostd::task::Task::need_yield() {
+                ostd::task::Task::yield_now();
+            }
         }
         self.kernelet.disown_current_task();
     }

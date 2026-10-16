@@ -24,6 +24,9 @@ cpu_local_cell! {
     // The first switch discards the bootstrap continuation. Release its Host
     // pool slot only once we are executing on the first ordinary Task's stack.
     static BOOT_STACK_TO_RELEASE: usize = 0;
+    // Captured at the logical handoff; settled for PREVIOUS_TASK_PTR before
+    // that Task can migrate. Host physical IRQs never access this Image cell.
+    static PREVIOUS_TASK_TICKS: u64 = 0;
 }
 
 /// Returns a pointer to the current task running on the processor.
@@ -75,15 +78,27 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
     }
 
     before_switching_to(&next_task, &irq_guard);
-    #[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
+    #[cfg(any(
+        feature = "kernelet-host",
+        feature = "kernelet",
+        kernelet_rq1,
+        kernelet_rq1_diagnostics,
+        ktest
+    ))]
     if let Some(current) = Task::current() {
         #[cfg(kernelet_rq1_diagnostics)]
         crate::kernelet::fpu_profile::event(crate::kernelet::fpu_profile::Event::TaskSwitchOut);
+        #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
         let _ = current.accounting.sample(false);
-        // Carrier state belongs to the execution continuation, independently
-        // of whether optional CPU-time accounting is enabled.
+        // Carrier state belongs to the native execution continuation.
         #[cfg(feature = "kernelet-host")]
-        current.accounting.pause();
+        {
+            let address = current.carrier_context.load(Ordering::Acquire);
+            if address != 0 {
+                // SAFETY: IRQs are masked and the outgoing Task retains its context.
+                unsafe { crate::kernelet::host_run::pause_carrier_context(address) };
+            }
+        }
     }
 
     // `before_switching_to` guarantees that from now on, and while the next task is running on the
@@ -95,6 +110,18 @@ pub(super) fn switch_to_task(next_task: Arc<Task>) {
     let vcpu_record = crate::kernelet::entry::vcpu_record() as *const _;
 
     let current_task_ptr = CURRENT_TASK_PTR.load();
+    #[cfg(feature = "kernelet")]
+    {
+        // One atomic take defines the accounting boundary for both privilege
+        // counts. Later ticks belong to the incoming Task. Keep callbacks off
+        // this path until the old owner is settled on the new stack.
+        let batch = crate::kernelet::entry::vcpu_record().task_ticks.take();
+        debug_assert_eq!(PREVIOUS_TASK_TICKS.load(), 0);
+        // Bootstrap without an adopted Task has no CPU clock to charge.
+        if !current_task_ptr.is_null() {
+            PREVIOUS_TASK_TICKS.store(batch);
+        }
+    }
     CURRENT_TASK_PTR.store(Arc::into_raw(next_task));
     debug_assert!(PREVIOUS_TASK_PTR.load().is_null());
     PREVIOUS_TASK_PTR.store(current_task_ptr);
@@ -195,13 +222,6 @@ pub(super) unsafe fn after_switching_to() {
         let boot_stack = BOOT_STACK_TO_RELEASE.load();
         if boot_stack != 0 {
             BOOT_STACK_TO_RELEASE.store(0);
-            // This fallback has no adopted Task/accounting target. A real
-            // Guest entry adopts its boot Task and settles it below instead.
-            let ticks = (boot_stack + crate::kernelet::abi::KSTACK_USABLE_BYTES)
-                as *const crate::kernelet::abi::StackTickRecord;
-            // SAFETY: The obsolete boot slot is still live and no longer
-            // executing; physical samples now use this new stack's RSP.
-            unsafe { &*ticks }.take();
             // The first switch never saves a resumable bootstrap context.
             // Guest IRQs are still masked, so this vCPU cannot switch Tasks
             // while returning its own obsolete bootstrap slot to the Host.
@@ -209,8 +229,23 @@ pub(super) unsafe fn after_switching_to() {
             assert_eq!(result, 0, "Host refused to retire a bootstrap stack");
         }
     }
-    #[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
+    #[cfg(any(
+        feature = "kernelet-host",
+        feature = "kernelet",
+        kernelet_rq1,
+        kernelet_rq1_diagnostics,
+        ktest
+    ))]
     if let Some(current) = Task::current() {
+        #[cfg(feature = "kernelet-host")]
+        {
+            let address = current.carrier_context.load(Ordering::Acquire);
+            if address != 0 {
+                // SAFETY: IRQs are masked and the incoming Task retains its context.
+                unsafe { crate::kernelet::host_run::restore_carrier_context(address) };
+            }
+        }
+        #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
         current.accounting.resume();
     }
     // Release the previous task.
@@ -224,10 +259,13 @@ pub(super) unsafe fn after_switching_to() {
         let prev_task = unsafe { Arc::from_raw(prev) };
 
         #[cfg(feature = "kernelet")]
-        // RSP is already on the new stack. Before the Release below permits
-        // migration, no CPU can execute the old Task or add another sample to
-        // its record. Account it on this original vCPU while its Arc is live.
-        prev_task.drain_sampled_ticks();
+        {
+            let batch = PREVIOUS_TASK_TICKS.load();
+            PREVIOUS_TASK_TICKS.store(0);
+            // Settle only the captured old batch. New per-vCPU samples belong
+            // to the incoming Task and stay pending until its own boundary.
+            prev_task.account_sampled_ticks(batch);
+        }
 
         #[cfg(feature = "kernelet")]
         if prev_task.kstack.is_boot() {

@@ -18,11 +18,11 @@ pub(crate) struct WorkItem {
     // This stays set after dequeue until a worker starts the callback. The
     // queue link tracks only membership, so it cannot replace this flag.
     was_pending: AtomicBool,
-    link: Arc<ArcQueueLink<Self>>,
+    link: ArcQueueLink<Self>,
 }
 
 impl ArcQueueItem for WorkItem {
-    fn queue_link(&self) -> &Arc<ArcQueueLink<Self>> {
+    fn queue_link(&self) -> &ArcQueueLink<Self> {
         &self.link
     }
 }

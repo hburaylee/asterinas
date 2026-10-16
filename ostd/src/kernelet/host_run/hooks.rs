@@ -37,9 +37,8 @@ extern "C" fn kernelet_host_mmio_read_impl(device: u32, offset: u32, width: u32)
         state.set_phase(RETURNING);
         return failure;
     }
-    state
-        .control
-        .account
+    state.control.carriers[state.vcpu as usize]
+        .counters
         .mmio_accesses
         .fetch_add(1, Ordering::Relaxed);
     let result = state
@@ -70,9 +69,8 @@ extern "C" fn kernelet_host_mmio_write_impl(
         state.set_phase(RETURNING);
         return -INVALID;
     }
-    state
-        .control
-        .account
+    state.control.carriers[state.vcpu as usize]
+        .counters
         .mmio_accesses
         .fetch_add(1, Ordering::Relaxed);
     let result = state

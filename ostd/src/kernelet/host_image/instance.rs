@@ -8,7 +8,6 @@ use core::mem::offset_of;
 use super::{
     super::{
         abi::{BootArgs, DeviceEntry, MAX_VCPUS, VcpuRecord, vcpu_shared_bytes},
-        clock,
         host_grant::Grant,
     },
     *,
@@ -74,12 +73,11 @@ impl RegisteredImage {
         let vcpu_frames: Vec<_> = (0..record_pages)
             .map(|_| FrameAllocOptions::new().alloc_frame())
             .collect::<Result<_>>()?;
-        let clock_frame = clock::frame()?.clone();
 
         // 2. Map the image, every private CPU-local replica, and Host-shared
         //    pages in one contiguous area. ELF code/data offsets stay fixed;
         //    only the shared-page offset depends on the virtual CPU count.
-        let shared_pages = 2usize
+        let shared_pages = 1usize
             .checked_add(record_pages)
             .and_then(|pages| pages.checked_add(grant.shared_pages()))
             .ok_or(Error::Overflow)?;
@@ -123,7 +121,6 @@ impl RegisteredImage {
             (cpu_local_frames.clone(), DATA_PAGE_PROP),
             (vec![boot_frame.clone()], READONLY_PAGE_PROP),
             (vcpu_frames.clone(), DATA_PAGE_PROP),
-            (vec![clock_frame.clone()], READONLY_PAGE_PROP),
             (grant.shared_frames().collect(), READONLY_PAGE_PROP),
         ];
         for (frames, prop) in base_runs {
@@ -141,14 +138,13 @@ impl RegisteredImage {
 
         let mut boot = *boot;
         boot.meta_base = grant.meta_base();
-        boot.clock_page = ((1 + record_pages) * PAGE_SIZE) as u32;
-        boot.info_page = ((2 + record_pages) * PAGE_SIZE) as u32;
-        boot.grant_table = ((3 + record_pages) * PAGE_SIZE) as u32;
-        boot.meta_section_index = ((3 + record_pages + grant.run_pages()) * PAGE_SIZE) as u32;
+        boot.info_page = ((1 + record_pages) * PAGE_SIZE) as u32;
+        boot.grant_table = ((2 + record_pages) * PAGE_SIZE) as u32;
+        boot.meta_section_index = ((2 + record_pages + grant.run_pages()) * PAGE_SIZE) as u32;
         boot.meta_block_sections =
-            ((3 + record_pages + grant.run_pages() + grant.index_pages()) * PAGE_SIZE) as u32;
+            ((2 + record_pages + grant.run_pages() + grant.index_pages()) * PAGE_SIZE) as u32;
         boot.meta_grain_bitmap =
-            ((3 + record_pages + grant.run_pages() + grant.index_pages() + grant.reverse_pages())
+            ((2 + record_pages + grant.run_pages() + grant.index_pages() + grant.reverse_pages())
                 * PAGE_SIZE) as u32;
         boot.cmdline_offset = size_of::<BootArgs>() as u32;
         boot.cmdline_len = cmdline.len() as u32;
@@ -346,6 +342,10 @@ fn write_boot_args(frame: &Frame<()>, boot: &BootArgs) -> Result<()> {
         offset_of!(BootArgs, tsc_freq_hz),
         &boot.tsc_freq_hz.to_le_bytes(),
     )?;
+    frame.write_bytes(
+        offset_of!(BootArgs, clock_origin_tsc),
+        &boot.clock_origin_tsc.to_le_bytes(),
+    )?;
     frame.write_bytes(offset_of!(BootArgs, kernelet), &boot.kernelet.to_le_bytes())?;
     frame.write_bytes(
         offset_of!(BootArgs, num_vcpus),
@@ -399,10 +399,6 @@ fn write_boot_args(frame: &Frame<()>, boot: &BootArgs) -> Result<()> {
     frame.write_bytes(
         offset_of!(BootArgs, max_meta_sections),
         &boot.max_meta_sections.to_le_bytes(),
-    )?;
-    frame.write_bytes(
-        offset_of!(BootArgs, clock_page),
-        &boot.clock_page.to_le_bytes(),
     )?;
     frame.write_bytes(
         offset_of!(BootArgs, info_page),

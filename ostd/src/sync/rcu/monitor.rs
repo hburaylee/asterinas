@@ -36,10 +36,11 @@ impl RcuMonitor {
         }
 
         let callbacks = {
-            // Restoring IRQs below must not reenter a scheduler that is still
+            // Restoring virtual IRQs must not reenter a scheduler that is still
             // reporting this quiescent state. Keep the mark until the IRQ
             // guard is dropped, but release it before running callbacks,
             // whose destructors may sleep or yield.
+            #[cfg(feature = "kernelet")]
             let _scheduling_guard =
                 (!crate::task::scheduling_in_progress()).then(crate::task::SchedulingGuard::new);
             let mut state = self.state.disable_irq().lock();
@@ -149,8 +150,13 @@ impl State {
 
     fn advance_completed_periods(&mut self) {
         while self.current_gp.is_complete() {
-            self.ready_callbacks
-                .extend(self.current_gp.take_callbacks());
+            let completed = self.current_gp.take_callbacks();
+            if self.ready_callbacks.is_empty() {
+                // Transfer the allocation instead of copying into a new batch.
+                self.ready_callbacks = completed;
+            } else {
+                self.ready_callbacks.extend(completed);
+            }
             if self.next_callbacks.is_empty() {
                 break;
             }
@@ -274,5 +280,30 @@ mod test {
         assert_eq!(state.ready_callbacks.len(), 1);
         assert!(!state.can_park_idle(idle_cpu));
         assert!(!state.idle_cpus.contains(idle_cpu));
+    }
+}
+
+#[cfg(ktest)]
+mod batch_test {
+    use super::*;
+    use crate::prelude::ktest;
+
+    #[ktest]
+    fn completed_callbacks_keep_fifo_across_periods() {
+        let calls = Arc::new(core::sync::atomic::AtomicUsize::new(0));
+        let mut state = State::new();
+        for expected in 0..3 {
+            let calls = calls.clone();
+            state.current_gp.callbacks.push_back(Box::new(move || {
+                assert_eq!(calls.fetch_add(1, Relaxed), expected);
+            }));
+            // Simulate completed consecutive periods before callback dispatch.
+            state.advance_completed_periods();
+        }
+        assert_eq!(state.ready_callbacks.len(), 3);
+        for callback in state.ready_callbacks {
+            callback();
+        }
+        assert_eq!(calls.load(Relaxed), 3);
     }
 }

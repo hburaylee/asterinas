@@ -4,34 +4,34 @@ use crate::prelude::Vaddr;
 
 #[repr(C)]
 struct ExTableItem {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernelet"))]
     inst_offset: i64,
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernelet"))]
     recovery_offset: i64,
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(all(target_arch = "x86_64", feature = "kernelet")))]
     inst_addr: Vaddr,
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(all(target_arch = "x86_64", feature = "kernelet")))]
     recovery_inst_addr: Vaddr,
 }
 
 impl ExTableItem {
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernelet"))]
     fn inst_addr(&self) -> Vaddr {
         (&self.inst_offset as *const i64 as usize).wrapping_add_signed(self.inst_offset as isize)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(all(target_arch = "x86_64", feature = "kernelet")))]
     fn inst_addr(&self) -> Vaddr {
         self.inst_addr
     }
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(all(target_arch = "x86_64", feature = "kernelet"))]
     fn recovery_inst_addr(&self) -> Vaddr {
         (&self.recovery_offset as *const i64 as usize)
             .wrapping_add_signed(self.recovery_offset as isize)
     }
 
-    #[cfg(not(target_arch = "x86_64"))]
+    #[cfg(not(all(target_arch = "x86_64", feature = "kernelet")))]
     fn recovery_inst_addr(&self) -> Vaddr {
         self.recovery_inst_addr
     }
@@ -46,15 +46,15 @@ unsafe extern "C" {
 /// This table is used for recovering from specific exception handling faults
 /// occurring at known points in the code.
 ///
-/// On x86-64, entries use offsets relative to their own fields so that the
-/// table can reside in the relocation-free text segment. To add a recovery
-/// instruction, use the following statements:
+/// Native kernels use absolute instruction addresses. x86-64 Kernelet images
+/// use offsets relative to their own fields so that the table can reside in
+/// relocation-free text. To add a native recovery instruction, use:
 ///
 /// ```
 /// .pushsection .ex_table, "a"
 /// .align 8
-/// .quad target_label - .
-/// .quad recovery_label - .
+/// .quad target_label
+/// .quad recovery_label
 /// .popsection
 /// ```
 ///
@@ -76,13 +76,13 @@ unsafe extern "C" {
 /// ```
 /// .pushsection .ex_table, "a"
 /// .align 8
-/// .quad .label1 - .
-/// .quad .label2 - .
+/// .quad .label1
+/// .quad .label2
 /// .popsection
 /// ```
 ///
-/// Other architectures retain absolute address entries. `ExTable` decodes
-/// either form before searching for a recovery instruction.
+/// In x86-64 Image assembly, select `.quad label - .` instead. The matching
+/// table layout is selected at build time; Native lookup needs no decoding.
 pub(super) struct ExTable;
 
 impl ExTable {

@@ -188,10 +188,21 @@ impl FairAttr {
 
     fn update_vruntime(&self, delta: u64, weight: u64) -> u64 {
         #[cfg(feature = "kernelet-host")]
-        let delta = u64::try_from(
-            u128::from(delta) * u128::from(WEIGHT_0 * WEIGHT_SCALE) / u128::from(weight),
-        )
-        .expect("fair vruntime delta overflow");
+        let delta = {
+            // Ordinary threads have integral nice weights. Cancel the shared
+            // queue's scale so they use the upstream vruntime formula.
+            let (numerator_weight, weight) = if self.weight_divisor == NonZeroU16::MIN {
+                (WEIGHT_0, weight / WEIGHT_SCALE)
+            } else {
+                (WEIGHT_0 * WEIGHT_SCALE, weight)
+            };
+            if let Some(numerator) = delta.checked_mul(numerator_weight) {
+                numerator / weight
+            } else {
+                u64::try_from(u128::from(delta) * u128::from(numerator_weight) / u128::from(weight))
+                    .expect("fair vruntime delta overflow")
+            }
+        };
         #[cfg(not(feature = "kernelet-host"))]
         let delta = delta * WEIGHT_0 / weight;
         self.vruntime.fetch_add(delta, Ordering::Relaxed) + delta
@@ -318,9 +329,25 @@ impl FairClassRq {
     fn time_slice(&self, cur_weight: u64) -> u64 {
         #[cfg(feature = "kernelet-host")]
         {
+            let period = self.period();
+            // Cancel the fixed-point scale whenever both operands are integral.
+            // This includes ordinary-only queues, without adding queue accounting
+            // or inspecting any other task. Mixed fractional sums stay exact.
+            let (cur_weight, total_weight) =
+                if (cur_weight | self.total_weight).is_multiple_of(WEIGHT_SCALE) {
+                    (cur_weight / WEIGHT_SCALE, self.total_weight / WEIGHT_SCALE)
+                } else {
+                    (cur_weight, self.total_weight)
+                };
+            if let (Some(numerator), Some(total_weight)) = (
+                period.checked_mul(cur_weight),
+                total_weight.checked_add(cur_weight),
+            ) {
+                return numerator / total_weight;
+            }
             // The quotient is at most the period, so it fits in `u64`.
-            (u128::from(self.period()) * u128::from(cur_weight)
-                / (u128::from(self.total_weight) + u128::from(cur_weight))) as u64
+            (u128::from(period) * u128::from(cur_weight)
+                / (u128::from(total_weight) + u128::from(cur_weight))) as u64
         }
         #[cfg(not(feature = "kernelet-host"))]
         {
@@ -519,5 +546,49 @@ mod test {
         assert_eq!(divided.fair.vruntime.load(Ordering::Relaxed), 1 << 46);
         assert!(rq.pick_next().is_some());
         assert_eq!(rq.total_weight, 0);
+    }
+
+    #[cfg(feature = "kernelet-host")]
+    #[ktest]
+    fn fair_runtime_preserves_rounding_and_large_deltas() {
+        for value in -20..=19 {
+            let nice = Nice::try_from(value).unwrap();
+            for divisor in [1, 2, 3, 64] {
+                for delta in [0, 1, 13, 137, 1 << 40, 1 << 44] {
+                    let attr =
+                        FairAttr::new_with_weight_divisor(nice, NonZeroU16::new(divisor).unwrap());
+                    let (_, weight) = attr.fetch_weight();
+                    let expected = u64::try_from(
+                        u128::from(delta) * u128::from(WEIGHT_0 * WEIGHT_SCALE)
+                            / u128::from(weight),
+                    )
+                    .unwrap();
+                    assert_eq!(attr.update_vruntime(delta, weight), expected);
+                }
+            }
+
+            // The upstream numerator can overflow even when the quotient fits.
+            for delta in [u64::MAX / WEIGHT_0, u64::MAX / WEIGHT_0 + 1] {
+                let attr = FairAttr::new(nice);
+                let (_, weight) = attr.fetch_weight();
+                let expected = u64::try_from(
+                    u128::from(delta) * u128::from(WEIGHT_0) / u128::from(nice_to_weight(nice)),
+                )
+                .unwrap();
+                assert_eq!(attr.update_vruntime(delta, weight), expected);
+            }
+        }
+    }
+
+    #[cfg(feature = "kernelet-host")]
+    #[ktest]
+    fn fair_time_slice_preserves_large_weight_ratios() {
+        let mut rq = FairClassRq::new(CpuId::current_racy());
+        let period = rq.period();
+        // Exercise intermediate multiplication and addition overflow separately.
+        assert_eq!(rq.time_slice(u64::MAX), period);
+        rq.total_weight = u64::MAX;
+        assert_eq!(rq.time_slice(u64::MAX), period / 2);
+        assert_eq!(rq.time_slice(1), 0);
     }
 }

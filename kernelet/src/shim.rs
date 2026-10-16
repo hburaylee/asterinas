@@ -62,6 +62,13 @@ struct Task {
     deleting: BTreeSet<String>,
     processes: BTreeMap<String, ProcessRecord>,
 }
+impl Task {
+    fn is_creating(&self) -> bool {
+        self.processes
+            .get("")
+            .is_some_and(|process| matches!(process.state, ProcessState::Creating))
+    }
+}
 #[derive(Clone)]
 struct ProcessRecord {
     // Cloned snapshots retain this identity even if an exec ID is reused.
@@ -82,6 +89,7 @@ struct ProcessRecord {
 }
 #[derive(Clone, Copy)]
 enum ProcessState {
+    Creating,
     Created,
     Starting,
     Stopping,
@@ -172,6 +180,7 @@ impl Service {
         let task = self.task.lock().unwrap();
         let task = task.as_ref().context("sandbox has not been created")?;
         ensure!(task.id == id, "unknown sandbox");
+        ensure!(!task.is_creating(), "sandbox creation in progress");
         Ok(self.root.join(id))
     }
     fn process(&self, id: &str, exec_id: &str) -> Result<(PathBuf, ProcessRecord)> {
@@ -184,6 +193,64 @@ impl Service {
             .cloned()
             .context("unknown process")?;
         Ok((self.root.join(id), process))
+    }
+
+    /// Reserves the sandbox identity while external creation work runs unlocked.
+    fn create_sandbox(
+        &self,
+        req: &api::CreateTaskRequest,
+        prepare_fn: impl FnOnce() -> Result<()>,
+    ) -> Result<()> {
+        let identity = Arc::new(());
+        {
+            let mut slot = self.task.lock().unwrap();
+            ensure!(slot.is_none(), "shim already owns a sandbox");
+            *slot = Some(Task {
+                id: req.id.clone(),
+                bundle: req.bundle.clone(),
+                deleting: BTreeSet::new(),
+                processes: BTreeMap::from([(
+                    String::new(),
+                    ProcessRecord {
+                        identity: identity.clone(),
+                        start_generation: 0,
+                        spec: None,
+                        stdin: req.stdin.clone(),
+                        stdout: req.stdout.clone(),
+                        stderr: req.stderr.clone(),
+                        terminal: req.terminal,
+                        agent_id: None,
+                        state: ProcessState::Creating,
+                        exited_at: None,
+                        exit_pending: false,
+                        exit_error: None,
+                    },
+                )]),
+            });
+        }
+
+        // Hooks may query State through this shim. The reservation prevents
+        // concurrent Create/Start/Delete from taking ownership during that RPC.
+        let result = prepare_fn();
+        let mut slot = self.task.lock().unwrap();
+        let process = slot
+            .as_mut()
+            .filter(|task| task.id == req.id)
+            .and_then(|task| task.processes.get_mut(""))
+            .filter(|process| Arc::ptr_eq(&process.identity, &identity))
+            .context("sandbox changed during creation")?;
+        ensure!(
+            matches!(process.state, ProcessState::Creating),
+            "sandbox changed during creation"
+        );
+        if result.is_ok() {
+            process.state = ProcessState::Created;
+        } else {
+            *slot = None;
+        }
+        drop(slot);
+        self.changed.notify_all();
+        result
     }
     /// Restores the created state after a start attempt failed before the
     /// holder acknowledged any guest process.
@@ -741,36 +808,17 @@ impl shim::Task for Service {
                 req.checkpoint.is_empty() && req.parent_checkpoint.is_empty(),
                 "checkpoint restore is unsupported"
             );
-            let mut slot = self.task.lock().unwrap();
-            ensure!(slot.is_none(), "shim already owns a sandbox");
-            let snapshot = SnapshotMount::prepare(&req)?;
-            runtime::create_for_shim(&self.root, &req.id, Path::new(&req.bundle))?;
-            if let Err(error) = snapshot.unmount() {
-                let _ =
-                    runtime::request(&self.root.join(&req.id), &Control::Delete { force: true });
-                return Err(error);
-            }
-            let process = ProcessRecord {
-                identity: Arc::new(()),
-                start_generation: 0,
-                spec: None,
-                stdin: req.stdin.clone(),
-                stdout: req.stdout.clone(),
-                stderr: req.stderr.clone(),
-                terminal: req.terminal,
-                agent_id: None,
-                state: ProcessState::Created,
-                exited_at: None,
-                exit_pending: false,
-                exit_error: None,
-            };
-            *slot = Some(Task {
-                id: req.id.clone(),
-                bundle: req.bundle.clone(),
-                deleting: BTreeSet::new(),
-                processes: BTreeMap::from([(String::new(), process)]),
-            });
-            drop(slot);
+            self.create_sandbox(&req, || {
+                let snapshot = SnapshotMount::prepare(&req)?;
+                runtime::create_for_shim(&self.root, &req.id, Path::new(&req.bundle))?;
+                if let Err(error) = snapshot.unmount() {
+                    if let Err(cleanup) = runtime::delete(&self.root.join(&req.id), true) {
+                        return Err(error.context(format!("sandbox cleanup failed: {cleanup:#}")));
+                    }
+                    return Err(error);
+                }
+                Ok(())
+            })?;
             let mut event = task::TaskCreate::new();
             event.set_container_id(req.id);
             event.set_bundle(req.bundle);
@@ -810,6 +858,7 @@ impl shim::Task for Service {
             let mut slot = self.task.lock().unwrap();
             let task = slot.as_mut().context("sandbox has not been created")?;
             ensure!(task.id == req.id, "unknown sandbox");
+            ensure!(!task.is_creating(), "sandbox creation in progress");
             ensure!(!task.deleting.contains(""), "sandbox deletion in progress");
             let processes = &mut task.processes;
             ensure!(processes.len() < 256, "too many live exec records");
@@ -853,9 +902,10 @@ impl shim::Task for Service {
                     .get(&req.exec_id)
                     .context("unknown process")?;
                 let (status, code) = match process.state {
-                    ProcessState::Created | ProcessState::Starting | ProcessState::Stopping => {
-                        (api::Status::CREATED, 0)
-                    }
+                    ProcessState::Creating
+                    | ProcessState::Created
+                    | ProcessState::Starting
+                    | ProcessState::Stopping => (api::Status::CREATED, 0),
                     ProcessState::Running => (api::Status::RUNNING, 0),
                     ProcessState::Exited(code) => (api::Status::STOPPED, code),
                 };
@@ -896,6 +946,7 @@ impl shim::Task for Service {
                 let slot = self.task.lock().unwrap();
                 let task = slot.as_ref().context("sandbox has not been created")?;
                 ensure!(task.id == req.id, "unknown sandbox");
+                ensure!(!task.is_creating(), "sandbox creation in progress");
                 ensure!(task.processes.contains_key(&req.exec_id), "unknown process");
                 if req.all {
                     task.processes.keys().cloned().collect::<Vec<_>>()
@@ -1102,10 +1153,13 @@ impl shim::Task for Service {
             };
             let metrics = metrics::Metrics {
                 cpu: MessageField::some(metrics::CPUStat {
-                    usage: MessageField::some(metrics::CPUUsage {
-                        total: stats.cpu_time_ns,
-                        ..Default::default()
-                    }),
+                    usage: stats
+                        .cpu_time_ns
+                        .map(|total| metrics::CPUUsage {
+                            total,
+                            ..Default::default()
+                        })
+                        .into(),
                     throttling: MessageField::some(metrics::Throttle {
                         throttled_time: stats.throttled_ns,
                         ..Default::default()
@@ -1200,8 +1254,9 @@ impl SnapshotMount {
         })
     }
     fn unmount(mut self) -> Result<()> {
-        if let Some(target) = self.target.take() {
-            nix::mount::umount(&target)?;
+        if let Some(target) = &self.target {
+            nix::mount::umount(target)?;
+            self.target = None;
         }
         Ok(())
     }
@@ -1784,6 +1839,128 @@ mod tests {
             exit_pending: false,
             exit_error: None,
         }
+    }
+
+    #[test]
+    fn creation_callback_can_query_state_and_cannot_start_or_replace_the_sandbox() {
+        let root = temp_root("create-callback");
+        let service = service(&root, "c1");
+        let address = format!("unix://{}", root.join("shim.sock").display());
+        let mut server = ttrpc::Server::new()
+            .bind(&address)
+            .unwrap()
+            .register_service(create_task(Arc::new(service.clone())));
+        server.start().unwrap();
+        let client = TaskClient::new(ttrpc::Client::connect(&address).unwrap());
+        let request = api::CreateTaskRequest {
+            id: "c1".into(),
+            bundle: "/bundle".into(),
+            stdin: "/input".into(),
+            ..Default::default()
+        };
+        // This callback occupies the same unlocked region as real prestart /
+        // createRuntime hooks. It performs real synchronous shim RPCs.
+        service
+            .create_sandbox(&request, || {
+                let state = client.state(
+                    ttrpc::context::with_timeout(1_000_000_000),
+                    &api::StateRequest {
+                        id: "c1".into(),
+                        ..Default::default()
+                    },
+                )?;
+                assert_eq!(state.status.enum_value().unwrap(), api::Status::CREATED);
+                assert_eq!(state.bundle, "/bundle");
+                assert_eq!(state.stdin, "/input");
+                assert!(
+                    client
+                        .create(ttrpc::context::with_timeout(1_000_000_000), &request)
+                        .is_err()
+                );
+                assert!(
+                    client
+                        .start(
+                            ttrpc::context::with_timeout(1_000_000_000),
+                            &api::StartRequest {
+                                id: "c1".into(),
+                                ..Default::default()
+                            },
+                        )
+                        .is_err()
+                );
+                assert!(
+                    client
+                        .kill(
+                            ttrpc::context::with_timeout(1_000_000_000),
+                            &api::KillRequest {
+                                id: "c1".into(),
+                                signal: libc::SIGKILL as u32,
+                                ..Default::default()
+                            },
+                        )
+                        .is_err()
+                );
+                assert!(
+                    client
+                        .delete(
+                            ttrpc::context::with_timeout(1_000_000_000),
+                            &api::DeleteRequest {
+                                id: "c1".into(),
+                                ..Default::default()
+                            },
+                        )
+                        .is_err()
+                );
+                assert!(
+                    client
+                        .exec(
+                            ttrpc::context::with_timeout(1_000_000_000),
+                            &api::ExecProcessRequest {
+                                id: "c1".into(),
+                                exec_id: "e1".into(),
+                                spec: Some(shim::protos::protobuf::well_known_types::any::Any {
+                                    value: br#"{"args":["/bin/sh"],"cwd":"/"}"#.to_vec(),
+                                    ..Default::default()
+                                })
+                                .into(),
+                                ..Default::default()
+                            },
+                        )
+                        .is_err()
+                );
+                Ok(())
+            })
+            .unwrap();
+        assert!(matches!(
+            service.process("c1", "").unwrap().1.state,
+            ProcessState::Created
+        ));
+        server.shutdown();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_creation_releases_its_reservation_for_retry() {
+        let root = temp_root("create-retry");
+        let service = service(&root, "c1");
+        let request = api::CreateTaskRequest {
+            id: "c1".into(),
+            ..Default::default()
+        };
+        let result = service.create_sandbox(&request, || bail!("creation hook failed"));
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("creation hook failed")
+        );
+        assert!(service.task.lock().unwrap().is_none());
+        service.create_sandbox(&request, || Ok(())).unwrap();
+        assert!(matches!(
+            service.process("c1", "").unwrap().1.state,
+            ProcessState::Created
+        ));
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

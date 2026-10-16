@@ -15,6 +15,7 @@ use ostd::kernelet::tlb_profile::{
 };
 
 use crate::{
+    dispatch_ioctl,
     events::IoEvents,
     fs::{
         file::{AccessMode, PerOpenFileOps, StatusFlags, file_table::FileDesc, mkmod},
@@ -26,11 +27,11 @@ use crate::{
     },
     prelude::*,
     process::signal::{PollHandle, Pollable},
-    util::ioctl::{RawIoctl, dispatch_ioctl},
+    util::ioctl::RawIoctl,
 };
 
 mod ioctl_defs {
-    use crate::util::ioctl::{InData, ioc};
+    use crate::{ioc, util::ioctl::InData};
 
     // Private to the Host RQ1 diagnostic node; mirrored in runtime/tlb_capture.rs.
     pub(super) type ArmCapture = ioc!(KERNELET_RQ1_TLB_ARM, b'K', 0xe1, InData<i32>);

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::boxed::Box;
+use core::ops::Deref;
 
 use align_ext::AlignExt;
 use aster_util::mem_obj_slice::Slice;
@@ -13,7 +14,7 @@ use io_util::{
 use ostd::{
     Error,
     mm::{
-        HasSize, Infallible, USegment, VmReader, VmWriter,
+        Daddr, HasDaddr, HasSize, Infallible, USegment, VmReader, VmWriter,
         dma::{DmaStream, FromAndToDevice},
         io::util::{HasVmReaderWriter, VmReaderWriterResult},
     },
@@ -378,7 +379,7 @@ pub struct BioSegment {
 struct BioSegmentInner {
     /// Internal DMA slice.
     // TODO: The direction is currently `FromAndToDevice`. Implement compile-time checking.
-    storage: Slice<DmaBuffer<FromAndToDevice>>,
+    storage: Slice<BioBuffer>,
     direction: BioDirection,
 }
 
@@ -391,6 +392,66 @@ pub enum BioDirection {
     ToDevice,
 }
 
+/// The owning DMA storage of a BIO segment.
+///
+/// Shared backing is confined to BIO views; general DMA buffers retain their
+/// native representation, including network and VirtIO filesystem buffers.
+#[derive(Debug)]
+pub struct BioBuffer(BioBufferInner);
+
+#[derive(Debug)]
+enum BioBufferInner {
+    Owned(DmaBuffer<FromAndToDevice>),
+    #[cfg(feature = "kernelet-host")]
+    Shared(Arc<DmaBuffer<FromAndToDevice>>),
+}
+
+impl BioBuffer {
+    fn new<const SHARED: bool>(buffer: DmaBuffer<FromAndToDevice>) -> Self {
+        #[cfg(feature = "kernelet-host")]
+        if SHARED {
+            return Self(BioBufferInner::Shared(Arc::new(buffer)));
+        }
+        Self(BioBufferInner::Owned(buffer))
+    }
+}
+
+impl Deref for BioBuffer {
+    type Target = DmaBuffer<FromAndToDevice>;
+
+    fn deref(&self) -> &Self::Target {
+        match &self.0 {
+            BioBufferInner::Owned(buffer) => buffer,
+            #[cfg(feature = "kernelet-host")]
+            BioBufferInner::Shared(buffer) => buffer,
+        }
+    }
+}
+
+impl HasSize for BioBuffer {
+    fn size(&self) -> usize {
+        self.deref().size()
+    }
+}
+
+impl HasDaddr for BioBuffer {
+    fn daddr(&self) -> Daddr {
+        self.deref().daddr()
+    }
+}
+
+impl HasVmReaderWriter for BioBuffer {
+    type Types = VmReaderWriterResult;
+
+    fn reader(&self) -> Result<VmReader<'_, Infallible>, Error> {
+        self.deref().reader()
+    }
+
+    fn writer(&self) -> Result<VmWriter<'_, Infallible>, Error> {
+        self.deref().writer()
+    }
+}
+
 impl BioSegment {
     /// Allocates a new `BioSegment` with the wanted blocks count and
     /// the bio direction.
@@ -400,14 +461,29 @@ impl BioSegment {
 
     /// Allocates a block-aligned segment, returning allocation failures.
     pub fn try_alloc(nblocks: usize, direction: BioDirection) -> Result<Self, Error> {
+        Self::try_alloc_with_ownership::<false>(nblocks, direction)
+    }
+
+    /// Allocates a buffer whose partial views retain its DMA owner.
+    #[cfg(feature = "kernelet-host")]
+    pub fn try_alloc_shared(nblocks: usize, direction: BioDirection) -> Result<Self, Error> {
+        Self::try_alloc_with_ownership::<true>(nblocks, direction)
+    }
+
+    fn try_alloc_with_ownership<const SHARED: bool>(
+        nblocks: usize,
+        direction: BioDirection,
+    ) -> Result<Self, Error> {
         let len = nblocks.checked_mul(BLOCK_SIZE).ok_or(Error::Overflow)?;
         if len == 0 {
             return Err(Error::InvalidArgs);
         }
-        Self::try_alloc_inner(nblocks, 0, len, direction)
+        Self::try_alloc_inner::<SHARED>(nblocks, 0, len, direction)
     }
 
     /// Returns a sector-aligned view that shares this segment's DMA memory.
+    ///
+    /// Partial views require an owner allocated with `try_alloc_shared`.
     #[cfg(feature = "kernelet-host")]
     pub fn slice(&self, range: Range<usize>) -> Result<Self, Error> {
         if range.start >= range.end
@@ -420,11 +496,14 @@ impl BioSegment {
         if range == (0..self.nbytes()) {
             return Ok(self.clone());
         }
+        let BioBufferInner::Shared(owner) = &self.inner.storage.mem_obj().0 else {
+            return Err(Error::InvalidArgs);
+        };
         let offset = self.inner.storage.offset().start;
         Ok(Self {
             inner: Arc::new(BioSegmentInner {
                 storage: Slice::new(
-                    self.inner.storage.mem_obj().clone_shared(),
+                    BioBuffer(BioBufferInner::Shared(owner.clone())),
                     offset + range.start..offset + range.end,
                 ),
                 direction: self.inner.direction,
@@ -449,10 +528,10 @@ impl BioSegment {
         len: usize,
         direction: BioDirection,
     ) -> Self {
-        Self::try_alloc_inner(nblocks, offset_within_first_block, len, direction).unwrap()
+        Self::try_alloc_inner::<false>(nblocks, offset_within_first_block, len, direction).unwrap()
     }
 
-    fn try_alloc_inner(
+    fn try_alloc_inner<const SHARED: bool>(
         nblocks: usize,
         offset_within_first_block: usize,
         len: usize,
@@ -467,20 +546,21 @@ impl BioSegment {
         );
 
         // The target segment is whether from the pool or newly-allocated
-        let bio_segment_inner =
-            match target_pool(direction).and_then(|pool| pool.alloc(nblocks, offset, len)) {
-                Some(segment) => segment,
-                None => {
-                    let dma_stream = DmaStream::alloc_uninit(nblocks, false)?;
-                    BioSegmentInner {
-                        storage: Slice::new(
-                            share_buffer(DmaBuffer::Direct(dma_stream)),
-                            offset..offset + len,
-                        ),
-                        direction,
-                    }
+        let bio_segment_inner = match target_pool(direction)
+            .and_then(|pool| pool.alloc::<SHARED>(nblocks, offset, len))
+        {
+            Some(segment) => segment,
+            None => {
+                let dma_stream = DmaStream::alloc_uninit(nblocks, false)?;
+                BioSegmentInner {
+                    storage: Slice::new(
+                        BioBuffer::new::<SHARED>(DmaBuffer::Direct(dma_stream)),
+                        offset..offset + len,
+                    ),
+                    direction,
                 }
-            };
+            }
+        };
 
         Ok(Self {
             inner: Arc::new(bio_segment_inner),
@@ -493,7 +573,10 @@ impl BioSegment {
         let dma_stream = DmaStream::map(segment, false).unwrap();
         Self {
             inner: Arc::new(BioSegmentInner {
-                storage: Slice::new(share_buffer(DmaBuffer::Direct(dma_stream)), 0..len),
+                storage: Slice::new(
+                    BioBuffer::new::<false>(DmaBuffer::Direct(dma_stream)),
+                    0..len,
+                ),
                 direction,
             }),
         }
@@ -520,7 +603,7 @@ impl BioSegment {
     }
 
     /// Returns the DMA slice.
-    pub fn dma_slice(&self) -> &Slice<DmaBuffer<FromAndToDevice>> {
+    pub fn dma_slice(&self) -> &Slice<BioBuffer> {
         self.inner.dma_slice()
     }
 }
@@ -544,7 +627,7 @@ impl HasVmReaderWriter for BioSegment {
 }
 
 impl BioSegmentInner {
-    fn dma_slice(&self) -> &Slice<DmaBuffer<FromAndToDevice>> {
+    fn dma_slice(&self) -> &Slice<BioBuffer> {
         &self.storage
     }
 }
@@ -585,7 +668,7 @@ impl BioSegmentPool {
     ///
     /// If the `offset_within_first_block` exceeds the block size, or the `len`
     /// exceeds the total length, this method will panic.
-    fn alloc(
+    fn alloc<const SHARED: bool>(
         &self,
         nblocks: usize,
         offset_within_first_block: usize,
@@ -599,7 +682,7 @@ impl BioSegmentPool {
         let arena = self.arena_pool.alloc(nblocks)?;
         Some(BioSegmentInner {
             storage: Slice::new(
-                share_buffer(DmaBuffer::Arena(arena)),
+                BioBuffer::new::<SHARED>(DmaBuffer::Arena(arena)),
                 offset_within_first_block..offset_within_first_block + len,
             ),
             direction: self.direction,
@@ -633,24 +716,38 @@ pub(crate) fn is_sector_aligned(offset: usize) -> bool {
     offset.is_multiple_of(SECTOR_SIZE)
 }
 
-// Native buffers retain the upstream ownership and layout. Host views share the
-// owning DMA buffer, including its arena slot, until the last view is dropped.
-fn share_buffer(buffer: DmaBuffer<FromAndToDevice>) -> DmaBuffer<FromAndToDevice> {
-    #[cfg(feature = "kernelet-host")]
-    {
-        DmaBuffer::Shared(Arc::new(buffer))
-    }
-    #[cfg(not(feature = "kernelet-host"))]
-    {
-        buffer
-    }
-}
-
 #[cfg(all(feature = "kernelet-host", ktest))]
 mod test {
-    use ostd::{mm::HasDaddr, prelude::*};
+    use ostd::prelude::*;
 
     use super::*;
+
+    #[ktest]
+    fn ordinary_bio_keeps_full_views_and_rejects_partial_views() {
+        let segment = BioSegment::try_alloc(1, BioDirection::ToDevice).unwrap();
+        let full = segment.slice(0..segment.nbytes()).unwrap();
+        assert!(matches!(
+            segment.slice(0..SECTOR_SIZE),
+            Err(Error::InvalidArgs)
+        ));
+        drop(segment);
+        let data = [0xa5u8; SECTOR_SIZE];
+        assert_eq!(
+            full.writer()
+                .unwrap()
+                .write(&mut VmReader::from(data.as_slice())),
+            data.len()
+        );
+        let mut output = [0; SECTOR_SIZE];
+        assert_eq!(
+            full.dma_slice()
+                .reader()
+                .unwrap()
+                .read(&mut VmWriter::from(output.as_mut_slice())),
+            data.len()
+        );
+        assert_eq!(output, data);
+    }
 
     #[ktest]
     fn bio_views_keep_arena_pages_until_last_view_is_dropped() {
@@ -661,7 +758,7 @@ mod test {
         };
         let segment = BioSegment {
             inner: Arc::new(
-                pool.alloc(2, SECTOR_SIZE, 2 * BLOCK_SIZE - SECTOR_SIZE)
+                pool.alloc::<true>(2, SECTOR_SIZE, 2 * BLOCK_SIZE - SECTOR_SIZE)
                     .unwrap(),
             ),
         };

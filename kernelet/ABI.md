@@ -145,22 +145,64 @@ so the shared table carries no relocation.
 Entries are strictly sorted by unique decoded fault address,
 and every decoded target lies in the executable text.
 
-### Clock snapshot
+### Deferred Task CPU accounting
 
-The Host appends two nanosecond anchors to the immutable `BootArgs`:
-`realtime_base_ns` is its Unix time,
-and `monotonic_base_ns` is the Host monotonic time sampled immediately before it.
-vOSTD extends the realtime anchor by the elapsed time in the shared,
-read-only monotonic `ClockPage`.
-The kernel's RTC driver consumes that value through the existing RTC interface;
-its elapsed-time clocksource also reads `ClockPage` through vOSTD's `read_tsc()`.
-That function converts the Host's monotonic nanoseconds into cycle units using
-`BootArgs::tsc_freq_hz`, so the existing clocksource conversion remains usable.
-The realtime snapshot is taken when the instance is created.
-Later changes to the Host realtime clock do not update this snapshot.
-The Guest does not expose the prebuilt native vDSO:
-its raw-TSC extrapolation and idle-stale cached timestamps do not implement this clock.
-Libc time calls therefore use the ordinary kernel clock syscalls.
+`VcpuRecord` remains 128 bytes. The former tail padding at offset 120 now
+contains `task_ticks`: one atomic word with 32-bit user and kernel sample
+counts. A full subcounter terminates the Image rather than wrapping or carrying
+into the other privilege count. The separate `tick_user`, `tick_kernel` and
+`tick_l2` counters continue to drive virtual timer callbacks.
+
+Host execution sampling increments only per-vCPU counters and publishes the
+TICK pending bit. It does not locate an internal Task or access its stack pool.
+Upcall redirection still validates the interrupted stack and available reserve
+against the Host-owned live pool; removing sampling does not remove this check.
+The Host retains fixed pool geometry and an atomic live bitmap independently
+of the allocator lock. Upcall reserve and service-record range checks read this
+layout without taking that lock; allocation, release, and quota updates remain
+serialized. This does not pin a Task identity or authorize arbitrary typed
+bytes. See [`Stack live validation`](decisions/0012-stack-live-validation.md).
+No sample record is stored at the top of a Task stack.
+
+The Image consumes execution samples at virtual timer upcalls, current-Task
+exit flushing, and Task handoff. With virtual IRQs disabled, one atomic take
+immediately before current-Task publication defines the logical handoff:
+preceding samples belong to the outgoing Task; following samples belong to the
+incoming Task. An Image-private per-vCPU cell retains the outgoing batch across
+the stack switch. The new stack settles that batch before releasing the old
+Task's execution ownership, so migration cannot transfer its accumulated CPU
+time to another Task. It never takes the new owner's pending samples on the
+old owner's behalf. Bootstrap samples without an adopted Task are discarded.
+Nested interrupt samples remain L2 timer events without Task CPU-clock credit.
+
+This is sampled CPU time, with a logical handoff boundary rather than exact
+interrupted-RSP ownership during the short switching sequence. It refines the
+book's pending/upcall model; see
+[`Image pending CPU accounting`](decisions/0011-image-pending-cpu-accounting.md).
+Host and Image must be rebuilt together under the existing source-hash check.
+
+### Local TSC clock
+
+The immutable, read-only `BootArgs` publishes `clock_origin_tsc` and
+`tsc_freq_hz`. All instances use the same Host-boot origin. vOSTD reads the
+local physical TSC through OSTD's ordered read and converts the elapsed cycles
+to nanoseconds. An instance-private atomic watermark keeps returned time from
+regressing; it does not require a Host service or a stack switch. There is no
+dynamic clock page or periodic Host clock publication.
+
+Elapsed-time accuracy requires a stable frequency and synchronized TSCs on
+the configured Host CPUs. The watermark prevents backwards readings but does
+not repair clock skew or frequency changes. Host-side deadline waits retain
+the conversion between the calibrated Host-boot epoch and the raw-TSC epoch.
+
+`realtime_base_ns` and `monotonic_base_ns` retain the instance-creation realtime
+snapshot. vOSTD extends it by elapsed local monotonic time; subsequent Host
+realtime adjustments do not change the snapshot. The existing RTC interface
+consumes this value. The Guest continues to use kernel clock syscalls rather
+than the native prebuilt vDSO, whose clock-page layout is a separate contract.
+
+The BootArgs layout changed; matching Host and Image builds are required.
+Entry checks the exact structure size, common source hash and nonzero frequency.
 
 ## Build contract
 
@@ -270,3 +312,20 @@ Each violation message names its item with the number below:
 | Entry-table offsets mirrored for the audit | `osdk/src/kernelet/abi.rs` |
 | Linker script template | `osdk/src/base_crate/x86_64-kernelet.ld.template` |
 | Host-side embedding of the audited image | `kernel/core/build.rs` |
+
+### Local carrier TLB invalidation
+
+`tlb_shootdown(root=0, start=0, len=u64::MAX)` invalidates every local
+translation, including global entries, on the physical CPU serving the calling
+carrier. The Host preserves the carrier's selected registered root and restores
+it through the normal service epilogue. All other root-zero argument pairs return
+`-INVALID`. Registered-root requests retain their existing validation,
+generation and synchronous remote acknowledgement contracts.
+
+Image full-TLB operations use this explicit service instead of writing CR3 or
+CR4. Image kernel-range remote flushes use existing virtual IPI queues and kick
+services; callers wait for their acknowledgements before retiring protected
+frames. Image user-root flushes continue using the registered-root Host service.
+The Host performs ordinary physical APIC and TLB operations unchanged. This is
+an ABI semantic extension to the implementation relative to kernelet-book
+`2d0d5769be63f465aebfe8312dfa558453502821`; no service-table field or layout changes.

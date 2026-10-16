@@ -3,10 +3,13 @@
 #define _GNU_SOURCE
 
 #include <fcntl.h>
+#include <sched.h>
+#include <sys/mount.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "../../common/test.h"
@@ -116,6 +119,96 @@ FN_TEST(at_empty_path_on_o_path_symlink_updates_symlink)
 
 	TEST_SUCC(close(sym_fd));
 	TEST_SUCC(unlink(symlink_path));
+}
+END_TEST()
+
+/* Explicit times require ownership even when a non-owner can write. */
+FN_TEST(nonowner_timestamp_permissions)
+{
+	SKIP_TEST_IF(geteuid() != 0);
+	CHECK(fchmod(fd, 0666));
+	pid_t child = CHECK(fork());
+	if (child == 0) {
+		CHECK(setresuid(65534, 65534, 65534));
+		struct timespec explicit[2] = { { 100, 0 }, { 101, 0 } };
+		struct timespec now[2] = { { 0, UTIME_NOW }, { 0, UTIME_NOW } };
+		struct timespec mixed[2] = { { 0, UTIME_NOW }, { 0, UTIME_OMIT } };
+		TEST_ERRNO(futimens(fd, explicit), EPERM);
+		TEST_ERRNO(futimens(fd, mixed), EPERM);
+		TEST_SUCC(futimens(fd, now));
+		TEST_SUCC(futimens(fd, NULL));
+		_exit(__tests_failed != 0);
+	}
+	int status;
+	CHECK(waitpid(child, &status, 0));
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	CHECK(fchmod(fd, 0644));
+}
+END_TEST()
+
+FN_TEST(nonowner_without_write_cannot_set_current_time)
+{
+	SKIP_TEST_IF(geteuid() != 0);
+	pid_t child = CHECK(fork());
+	if (child == 0) {
+		CHECK(setresuid(65534, 65534, 65534));
+		TEST_ERRNO(futimens(fd, NULL), EACCES);
+		_exit(__tests_failed != 0);
+	}
+	int status;
+	CHECK(waitpid(child, &status, 0));
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
+END_TEST()
+
+FN_TEST(owner_without_write_can_set_explicit_times)
+{
+	SKIP_TEST_IF(geteuid() != 0);
+	CHECK(fchown(fd, 65534, -1));
+	CHECK(fchmod(fd, 0000));
+	pid_t child = CHECK(fork());
+	if (child == 0) {
+		CHECK(setresuid(65534, 65534, 65534));
+		struct timespec explicit[2] = { { 100, 0 }, { 101, 0 } };
+		TEST_SUCC(futimens(fd, explicit));
+		TEST_SUCC(futimens(fd, NULL));
+		_exit(__tests_failed != 0);
+	}
+	int status;
+	CHECK(waitpid(child, &status, 0));
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	CHECK(fchown(fd, 0, -1));
+	CHECK(fchmod(fd, 0644));
+}
+END_TEST()
+
+FN_TEST(readonly_mount_rejects_timestamp_updates)
+{
+	SKIP_TEST_IF(geteuid() != 0);
+	const char *target = "/tmp/utimensat_readonly";
+	CHECK(mkdir(target, 0700));
+	pid_t child = CHECK(fork());
+	if (child == 0) {
+		CHECK(unshare(CLONE_NEWNS));
+		CHECK(mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL));
+		CHECK(mount("tmpfs", target, "tmpfs", 0, NULL));
+		char path[128];
+		snprintf(path, sizeof(path), "%s/file", target);
+		int ro_fd = CHECK(open(path, O_CREAT | O_RDWR, 0600));
+		CHECK(close(ro_fd));
+		CHECK(mount(NULL, target, NULL, MS_REMOUNT | MS_RDONLY, NULL));
+		ro_fd = CHECK(open(path, O_RDONLY));
+		struct timespec explicit[2] = { { 100, 0 }, { 101, 0 } };
+		TEST_ERRNO(futimens(ro_fd, explicit), EROFS);
+		TEST_ERRNO(futimens(ro_fd, NULL), EROFS);
+		CHECK(close(ro_fd));
+		CHECK(umount(target));
+		_exit(__tests_failed != 0);
+	}
+	int status;
+	CHECK(waitpid(child, &status, 0));
+	TEST_RES(status, WIFEXITED(status) && WEXITSTATUS(status) == 0);
+	CHECK(rmdir(target));
 }
 END_TEST()
 

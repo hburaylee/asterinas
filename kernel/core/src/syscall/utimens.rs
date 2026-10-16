@@ -9,12 +9,14 @@ use crate::{
     fs,
     fs::{
         file::{
-            StatusFlags,
+            Permission, StatusFlags,
             file_table::{RawFileDesc, get_file_fast},
         },
         vfs::path::{AT_FDCWD, EmptyPathStr, FsPath, Path},
     },
     prelude::*,
+    process::credentials::capabilities::CapSet,
+    security::lsm::hooks as lsm_hooks,
     time::{clocks::RealTimeCoarseClock, timespec_t, timeval_t},
 };
 
@@ -258,10 +260,32 @@ fn do_utimes(
         file.path().clone()
     };
 
-    vfs_utimes(&path, times)
+    vfs_utimes(&path, times, ctx)
 }
 
-fn vfs_utimes(path: &Path, times: Option<TimeSpecPair>) -> Result<SyscallReturn> {
+fn vfs_utimes(path: &Path, times: Option<TimeSpecPair>, ctx: &Context) -> Result<SyscallReturn> {
+    // Linux treats two UTIME_NOW values like a null times pointer: write
+    // access suffices. Any explicit or mixed NOW/OMIT request requires ownership
+    // or CAP_FOWNER; write permission alone does not authorize it.
+    let both_now = times.as_ref().is_none_or(|times| {
+        matches!(times.atime, TimeSpec::Now) && matches!(times.mtime, TimeSpec::Now)
+    });
+    let credentials = ctx.posix_thread.credentials();
+    if credentials.fsuid() != path.owner()? {
+        let user_ns = ctx.thread_local.borrow_user_ns();
+        let capable = lsm_hooks::on_capable(lsm_hooks::CapableContext::new(
+            user_ns.as_ref(),
+            ctx.posix_thread,
+            CapSet::FOWNER,
+        ));
+        if both_now {
+            if capable.is_err() {
+                path.inode().check_permission(Permission::MAY_WRITE)?;
+            }
+        } else {
+            capable?;
+        }
+    }
     let now = RealTimeCoarseClock::get().read_time();
     let (atime, mtime, ctime) = match times {
         Some(times) => {

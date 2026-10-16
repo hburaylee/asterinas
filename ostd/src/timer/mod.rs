@@ -210,19 +210,13 @@ pub(crate) fn enable_local_and_halt() {
 }
 
 pub(crate) fn call_timer_callback_functions(_: &TrapFrame) {
-    #[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
+    #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
     crate::task::scheduler::runtime_ticks();
-    #[cfg(feature = "kernelet-host")]
-    crate::kernelet::host_run::on_host_tick();
     let irq_guard = irq::disable_local();
 
     if irq_guard.current_cpu() == CpuId::bsp() {
         #[cfg(not(feature = "kernelet"))]
         jiffies::ELAPSED.fetch_add(1, Ordering::Relaxed);
-        #[cfg(feature = "kernelet-host")]
-        crate::kernelet::account::on_timer_tick();
-        #[cfg(feature = "kernelet-host")]
-        crate::kernelet::clock::publish();
     }
 
     let callbacks_guard = INTERRUPT_CALLBACKS.get_with(&irq_guard);

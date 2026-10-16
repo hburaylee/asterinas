@@ -152,7 +152,13 @@ fn negotiate_features(transport: &mut Box<dyn VirtioTransport>) {
         _ => device_specified_features,
     };
     let mut support_feature = Feature::from_bits_truncate(features);
-    support_feature.remove(Feature::RING_EVENT_IDX);
+    // VirtQueue implements split rings and only sends the queue index.
+    support_feature.remove(
+        Feature::RING_EVENT_IDX
+            | Feature::RING_PACKED
+            | Feature::NOTIFICATION_DATA
+            | Feature::NOTIF_CONFIG_DATA,
+    );
     transport
         .write_driver_features(features & (support_feature.bits | device_support_features))
         .unwrap();

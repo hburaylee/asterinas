@@ -95,7 +95,7 @@ impl BlockDevice for Rq1Ram {
         };
         for segment in bio.segments() {
             let transferred = match kind {
-                BioType::Read => segment.inner_dma_slice().writer().map(|mut writer| {
+                BioType::Read => segment.dma_slice().writer().map(|mut writer| {
                     let mut reader = self.memory.reader();
                     reader.skip(offset);
                     reader.limit(segment.nbytes());
@@ -108,7 +108,7 @@ impl BlockDevice for Rq1Ram {
                     #[cfg(not(all(kernelet_rq1_diagnostics, feature = "kernelet-host")))]
                     writer.write(&mut reader)
                 }),
-                BioType::Write => segment.inner_dma_slice().reader().map(|mut reader| {
+                BioType::Write => segment.dma_slice().reader().map(|mut reader| {
                     let mut writer = self.memory.writer();
                     writer.skip(offset);
                     #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]

@@ -14,14 +14,18 @@ use core::{
     time::Duration,
 };
 
-pub use super::account::CpuBudget;
 use super::{
     abi::{BootArgs, CpuSlot, DeviceEntry, META_SECTION_BYTES, MmioResult, VIRQ_LINES, VcpuRecord},
     account::Account,
+    deadline::Deadline,
     guest_memory::GuestMemory,
     host_grant::Grant,
     host_image::{ImageInstance, RegisteredImage},
     host_run,
+};
+pub use super::{
+    account::CpuBudget,
+    deadline::{HostTimer, register_host_timer},
 };
 use crate::{
     Error,
@@ -249,11 +253,13 @@ impl KerneletKind {
             .checked_mul(
                 crate::task::native_stack_reservation_bytes()
                     + size_of::<Task>()
-                    + 4 * crate::mm::PAGE_SIZE,
+                    + 8 * crate::mm::PAGE_SIZE,
             )
             .ok_or(Error::Overflow)?;
         // Control/identity/accounting/queues and Arc headers are bounded by
         // the Task/device limits; retain a conservative page per such owner.
+        // The vCPU page includes its cache-line-isolated counters and at most
+        // one live Host deadline registration; cancellation removes that node.
         let owners = (config.max_tasks as usize)
             .checked_add(config.devices.len())
             .and_then(|n| n.checked_add(vcpus + 8))
@@ -302,15 +308,14 @@ impl KerneletKind {
         control = RunControl::new(
             identity,
             grant.dying_address(),
-            Account::new(grant.drain_queue(), config.budget, config.policy),
+            Account::new(grant.drain_queue(), config.policy),
             cpus,
             execution,
         );
         grant.bind_identity(control.identity.clone());
         let mut boot = boot_args(image, config, control.cpu_slot(0))?;
-        // Initialize the clock page before sampling either clock. The image
-        // extends this immutable realtime snapshot using Host monotonic time.
-        super::clock::frame()?;
+        // Both sides use the immutable TSC calibration in this boot page to
+        // extend the realtime snapshot in the same Host-boot clock domain.
         boot.monotonic_base_ns = super::clock::now_ns();
         boot.realtime_base_ns = hooks
             .realtime_now()
@@ -392,7 +397,7 @@ pub struct KerneletConfig<'a> {
     pub max_grains: u32,
     /// Lifetime bound on distinct physical 128 MiB metadata sections.
     pub max_meta_sections: u32,
-    /// Host fair weight and aggregate instance CPU quota.
+    /// Host fair weight; hard CPU quota requests are rejected.
     pub budget: CpuBudget,
     /// Immutable panic, logging and memory-exhaustion policy.
     pub policy: KerneletPolicy,
@@ -466,7 +471,7 @@ pub struct ExitStatus {
     pub reason: ExitReason,
     /// Elapsed Host time from construction through carrier detachment.
     pub uptime: Duration,
-    /// CPU time charged to carriers and adopted Host workers.
+    /// CPU time, currently `STATS_UNAVAILABLE` nanoseconds in Host builds.
     pub cpu_time: Duration,
 }
 
@@ -515,8 +520,8 @@ pub enum BudgetError {
     State(KerneletState),
     /// Nice lies outside -20..=19.
     InvalidNice,
-    /// Quota is zero or its period does not exceed one Host tick.
-    InvalidQuota,
+    /// This Host build supports weights but no aggregate CPU bandwidth limit.
+    UnsupportedQuota,
     /// The endovisor could not apply the validated fair scheduling weight.
     Rejected,
 }
@@ -524,7 +529,8 @@ pub enum BudgetError {
 /// Value returned for an observation not collected by this build.
 ///
 /// Duration observations use `Duration::from_nanos(STATS_UNAVAILABLE)`.
-/// Aggregate CPU, memory, quota and log-limit accounting remain available.
+/// Aggregate CPU time is currently unavailable in Host builds.
+/// Memory and log-limit accounting remain available in every Host build.
 pub const STATS_UNAVAILABLE: u64 = u64::MAX;
 
 /// Host-observed counters for one instance, retained through destruction.
@@ -542,7 +548,7 @@ pub struct KerneletStats {
     pub host_bytes_charged: usize,
     /// Currently allocated boot and internal Task stacks.
     pub stacks_allocated: u32,
-    /// Carrier and adopted-worker CPU time.
+    /// Carrier and adopted-worker CPU time, or `STATS_UNAVAILABLE` nanoseconds.
     pub cpu_time: Duration,
     /// Device completion CPU time explicitly attributed by the endovisor.
     pub completion_cpu_time: Duration,
@@ -550,7 +556,7 @@ pub struct KerneletStats {
     pub ingress_copy_cpu_time: Duration,
     /// Admitted service crossings.
     pub service_calls: u64,
-    /// Trap-return yields requested at the cooperation bound or by quota.
+    /// Trap-return yields requested at the cooperation bound.
     pub forced_yields: u64,
     /// Validated MMIO service requests.
     pub mmio_accesses: u64,
@@ -564,11 +570,23 @@ pub struct KerneletStats {
     pub oopses: u32,
     /// Private resident data, metadata, shared protocol, and stack frames.
     pub host_overhead_bytes: usize,
-    /// Carrier time spent waiting for CPU quota replenishment.
+    /// Reserved throttle duration; currently zero because quotas are unsupported.
     pub throttled: Duration,
 }
 
+// Observation only. Each carrier writes its own cache line; readers aggregate
+// without stopping carriers. Admission, resource limits and lifetime counters
+// remain in Account and keep their existing synchronization.
+#[repr(align(64))]
+#[derive(Default)]
+pub(crate) struct CarrierCounters {
+    pub(crate) service_calls: AtomicU64,
+    pub(crate) mmio_accesses: AtomicU64,
+    pub(crate) irqs_raised: AtomicU64,
+}
+
 pub(crate) struct CarrierControl {
+    pub(crate) counters: CarrierCounters,
     // Written only by this carrier with physical IRQs masked, until its Task
     // has disappeared and the reaper publishes DETACHED.
     pub(crate) run_state: AtomicU32,
@@ -600,7 +618,7 @@ pub(crate) struct RunControl {
     /// Reaper-owned weak references, retained until every native Task drops.
     retired_tasks: SpinLock<Option<Vec<Weak<Task>>>, LocalIrqDisabled>,
     /// Wakes the reaper if a native Task still held its stack at the last scan.
-    reap_retry: SpinLock<Option<super::account::Deadline>, LocalIrqDisabled>,
+    reap_retry: SpinLock<Option<Deadline>, LocalIrqDisabled>,
     /// Serializes task-context reaping; true after carrier stop dispatch.
     reaping: Mutex<bool>,
     active: AtomicU32,
@@ -637,6 +655,8 @@ impl RunControl {
         cpus: Vec<CpuId>,
         execution: host_run::ExecutionResources,
     ) -> Arc<Self> {
+        #[cfg(ktest)]
+        super::deadline::test::init();
         let control = Arc::new(Self {
             identity: Arc::new(identity),
             #[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
@@ -654,6 +674,7 @@ impl RunControl {
                 .into_iter()
                 .enumerate()
                 .map(|(index, cpu)| CarrierControl {
+                    counters: CarrierCounters::default(),
                     run_state: AtomicU32::new(host_run::PREPARED),
                     active_root: AtomicU64::new(0),
                     cpu,
@@ -790,7 +811,7 @@ impl RunControl {
 
     /// Runs once under `reaping`, before native Tasks can be retired. Each
     /// wait checks the sticky instance stop bit after waking, so a carrier
-    /// entering idle or quota sleep concurrently cannot miss termination.
+    /// entering idle sleep concurrently cannot miss termination.
     fn stop_carriers(&self) {
         for carrier in &self.carriers {
             carrier.wait.wake_all();
@@ -798,7 +819,6 @@ impl RunControl {
             // observes the instance stop bit at the physical trap boundary.
             crate::smp::inter_processor_call(&carrier.cpu.into(), || {});
         }
-        self.account.cancel_wait();
     }
 
     pub(crate) fn boot_vcpu(&self, vcpu: u32) -> crate::Result<()> {
@@ -864,8 +884,10 @@ impl RunControl {
             .iter()
             .any(|task| task.upgrade().is_some())
         {
-            let retry_at = crate::task::accounting::now_ns().saturating_add(REAPER_RETRY_NS);
-            *self.reap_retry.lock() = Some(super::account::Deadline::new(retry_at, &self.exited));
+            *self.reap_retry.lock() = Some(Deadline::after(
+                Duration::from_nanos(REAPER_RETRY_NS),
+                &self.exited,
+            ));
             return false;
         }
         self.reap_retry.lock().take();
@@ -1046,7 +1068,7 @@ impl Kernelet {
         })
     }
 
-    /// Applies a validated fair weight and vCPU quota as one serialized update.
+    /// Applies a validated fair weight as one serialized update.
     pub fn set_budget(&self, budget: CpuBudget) -> Result<(), BudgetError> {
         budget.validate()?;
         let _resources = self.admit(false).map_err(BudgetError::State)?;
@@ -1060,7 +1082,6 @@ impl Kernelet {
         hooks
             .set_vcpu_nice(budget.nice)
             .map_err(|_| BudgetError::Rejected)?;
-        self.control.account.set_budget(budget);
         Ok(())
     }
 
@@ -1072,7 +1093,7 @@ impl Kernelet {
             max_grains: account.ceiling.load(Ordering::Acquire),
             host_bytes_charged: account.host_bytes.load(Ordering::Acquire),
             stacks_allocated: account.stacks.load(Ordering::Acquire),
-            cpu_time: account.cpu_time(),
+            cpu_time: Duration::from_nanos(STATS_UNAVAILABLE),
             #[cfg(kernelet_rq1_diagnostics)]
             completion_cpu_time: Duration::from_nanos(
                 account.completion_ns.load(Ordering::Acquire),
@@ -1083,19 +1104,34 @@ impl Kernelet {
             ingress_copy_cpu_time: Duration::from_nanos(account.ingress_ns.load(Ordering::Acquire)),
             #[cfg(not(kernelet_rq1_diagnostics))]
             ingress_copy_cpu_time: Duration::from_nanos(STATS_UNAVAILABLE),
-            service_calls: account.service_calls.load(Ordering::Relaxed),
+            service_calls: self
+                .control
+                .carriers
+                .iter()
+                .map(|carrier| carrier.counters.service_calls.load(Ordering::Relaxed))
+                .fold(0u64, u64::wrapping_add),
             #[cfg(kernelet_rq1_diagnostics)]
             forced_yields: account.forced_yields.load(Ordering::Relaxed),
             #[cfg(not(kernelet_rq1_diagnostics))]
             forced_yields: STATS_UNAVAILABLE,
-            mmio_accesses: account.mmio_accesses.load(Ordering::Relaxed),
-            irqs_raised: account.irqs_raised.load(Ordering::Relaxed),
+            mmio_accesses: self
+                .control
+                .carriers
+                .iter()
+                .map(|carrier| carrier.counters.mmio_accesses.load(Ordering::Relaxed))
+                .fold(0u64, u64::wrapping_add),
+            irqs_raised: self
+                .control
+                .carriers
+                .iter()
+                .map(|carrier| carrier.counters.irqs_raised.load(Ordering::Relaxed))
+                .fold(0u64, u64::wrapping_add),
             log_bytes: account.log_bytes.load(Ordering::Relaxed),
             log_records_dropped: account.logs_dropped.load(Ordering::Relaxed),
             oopses: account.oopses.load(Ordering::Relaxed),
             host_overhead_bytes: account.overhead.load(Ordering::Acquire)
                 + account.grant_overhead.load(Ordering::Acquire),
-            throttled: Duration::from_nanos(account.throttled_ns.load(Ordering::Acquire)),
+            throttled: Duration::ZERO,
         }
     }
 
@@ -1156,7 +1192,7 @@ impl Kernelet {
         result
     }
 
-    /// Charges a Host worker until disown or Task exit, without making it a vCPU.
+    /// Retains a Host worker until disown or Task exit, without making it a vCPU.
     pub fn adopt_current_task(&self) -> crate::Result<()> {
         {
             let _resources = self.resources.lock();
@@ -1175,36 +1211,8 @@ impl Kernelet {
                 .map_err(|_| Error::Overflow)?;
         }
         // The reservation prevents destroy while attaching. A rejected attach
-        // drops its TaskCharge and refunds this reference outside admission.
+        // drops its AdoptedTask and refunds this reference outside admission.
         self.control.account.attach_adopted()
-    }
-
-    /// Waits for the aggregate instance CPU budget between bounded worker batches.
-    ///
-    /// The caller must be an adopted Task in sleepable context, without device
-    /// locks or in-flight queue claims. Stop cancels a finite-budget wait with
-    /// an error. Instances without a quota take a single atomic fast path;
-    /// workers continue to check their device cancellation state as usual.
-    pub fn wait_for_cpu_budget(&self) -> crate::Result<()> {
-        let account = &self.control.account;
-        if !account.is_limited() {
-            return Ok(());
-        }
-        crate::task::Task::current()
-            .ok_or(Error::InvalidArgs)?
-            .sample_cpu_account(Arc::as_ptr(account) as usize)?;
-        let stopped = || {
-            !matches!(
-                self.state(),
-                KerneletState::Created | KerneletState::Running
-            )
-        };
-        account.wait_for_budget(stopped);
-        if stopped() {
-            Err(Error::AccessDenied)
-        } else {
-            Ok(())
-        }
     }
 
     /// Ends this Task's adoption and wakes pending destroy retries.
@@ -1263,8 +1271,8 @@ impl Kernelet {
         let record = unsafe { &*record };
         record.pending_lines[(line / 64) as usize].fetch_or(1u64 << (line % 64), Ordering::Release);
         record.pending.fetch_or(VIRQ_LINES, Ordering::Release);
-        self.control
-            .account
+        self.control.carriers[vcpu]
+            .counters
             .irqs_raised
             .fetch_add(1, Ordering::Relaxed);
         self.control.carriers[vcpu].wait.wake_all();
@@ -1380,7 +1388,7 @@ impl Kernelet {
             let reason = self.stop_reason();
             *status = Some(ExitStatus {
                 reason,
-                cpu_time: self.control.account.cpu_time(),
+                cpu_time: Duration::from_nanos(STATS_UNAVAILABLE),
                 uptime: crate::timer::Jiffies::new(
                     self.control.detached_at.load(Ordering::Acquire),
                 )
@@ -1415,13 +1423,11 @@ impl Kernelet {
 
     /// Waits for a once-published exit status, bounded by a Host deadline.
     pub fn wait_exited_timeout(&self, timeout: Duration) -> Option<ExitStatus> {
-        let deadline = crate::task::accounting::now_ns()
-            .saturating_add(timeout.as_nanos().min(u64::MAX as u128) as u64);
-        let _alarm = super::account::Deadline::new(deadline, &self.control.exited);
+        let alarm = Deadline::after(timeout, &self.control.exited);
         self.control.exited.wait_until(|| {
             self.exit_status()
                 .map(Some)
-                .or_else(|| (crate::task::accounting::now_ns() >= deadline).then_some(None))
+                .or_else(|| alarm.is_expired().then_some(None))
         })
     }
 
@@ -1690,7 +1696,7 @@ mod test {
     use crate::{mm::PAGE_SIZE, prelude::*};
 
     #[unsafe(no_mangle)]
-    static KERNELET_TEST_ROOT: AtomicU64 = AtomicU64::new(0);
+    static KERNELET_TEST_ROOTS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
     #[unsafe(no_mangle)]
     static KERNELET_TEST_SERVICE_RETURNED: AtomicBool = AtomicBool::new(false);
     static STOPPED_IMAGE_IRQ_CALLS: AtomicUsize = AtomicUsize::new(0);
@@ -1703,6 +1709,7 @@ mod test {
         fault: super::super::abi::CopyFaultRecord,
         stack_base: usize,
         stop_state: usize,
+        host_root: usize,
     }
 
     core::arch::global_asm!(
@@ -1714,6 +1721,23 @@ mod test {
         "jmp kernelet_host_exit",
         ".global kernelet_test_exit_end",
         "kernelet_test_exit_end:",
+        ".global kernelet_test_initial_root",
+        "kernelet_test_initial_root:",
+        "cli",
+        // Check before the first service can repair the root on its own.
+        "mov rax, cr3",
+        "cmp rax, [rsi + {probe_host_root}]",
+        "jne 2f",
+        "sub rsp, 8",
+        "mov r12, rdi",
+        "mov edi, {stop_exit}",
+        "mov esi, 42",
+        "xor edx, edx",
+        "xor ecx, ecx",
+        "call [r12 + {stop}]",
+        "2: ud2",
+        ".global kernelet_test_initial_root_end",
+        "kernelet_test_initial_root_end:",
         ".global kernelet_test_invalid_rsp",
         "kernelet_test_invalid_rsp:",
         "xor rsp, rsp",
@@ -1731,21 +1755,59 @@ mod test {
         "kernelet_test_bounded_service:",
         "sub rsp, 8",
         "mov r12, rdi",
-        "mov rdi, [rip + KERNELET_TEST_ROOT]",
+        "lea r15, [rip + KERNELET_TEST_ROOTS]",
+        "xor r14d, r14d",
+        // A, B, A, same A, invalid, Host root, then A again. Every successful
+        // service return must expose the committed hardware root to the hook.
+        "4:",
+        "mov rdi, [r15 + r14 * 8]",
         "call [r12 + {activate}]",
+        "cmp r14d, 4",
+        "jne 5f",
+        "cmp rax, -{invalid}",
+        "jne 2f",
+        "jmp 6f",
+        "5:",
         "test rax, rax",
         "jnz 2f",
+        "6:",
         "mov r13, cr3",
-        "xor edi, edi",
+        "mov edi, r14d",
         "xor esi, esi",
         "mov edx, 4",
         "call [r12 + {mmio}]",
-        "mov byte ptr [rip + KERNELET_TEST_SERVICE_RETURNED], 1",
         "test rax, rax",
         "jnz 2f",
         "mov rax, cr3",
         "cmp rax, r13",
         "jne 2f",
+        // Root zero accepts only a full local invalidation. Neither rejection
+        // nor success may replace the carrier's selected root.
+        "xor edi, edi",
+        "xor esi, esi",
+        "mov edx, 4096",
+        "call [r12 + {shootdown}]",
+        "cmp rax, -{invalid}",
+        "jne 2f",
+        "xor edi, edi",
+        "mov esi, 1",
+        "mov rdx, -1",
+        "call [r12 + {shootdown}]",
+        "cmp rax, -{invalid}",
+        "jne 2f",
+        "xor edi, edi",
+        "xor esi, esi",
+        "mov rdx, -1",
+        "call [r12 + {shootdown}]",
+        "test rax, rax",
+        "jnz 2f",
+        "mov rax, cr3",
+        "cmp rax, r13",
+        "jne 2f",
+        "inc r14d",
+        "cmp r14d, 7",
+        "jb 4b",
+        "mov byte ptr [rip + KERNELET_TEST_SERVICE_RETURNED], 1",
         // An invalid request still completes the admitted return protocol.
         "xor edi, edi",
         "xor esi, esi",
@@ -1785,6 +1847,7 @@ mod test {
         ".global kernelet_test_stopped_irq_end",
         "kernelet_test_stopped_irq_end:",
         activate = const core::mem::offset_of!(super::super::abi::ServiceTable, pt_activate),
+        shootdown = const core::mem::offset_of!(super::super::abi::ServiceTable, tlb_shootdown),
         mmio = const core::mem::offset_of!(super::super::abi::ServiceTable, mmio_read),
         idle = const core::mem::offset_of!(super::super::abi::ServiceTable, vcpu_idle),
         vcpu_records = const core::mem::offset_of!(BootArgs, vcpu_records),
@@ -1796,10 +1859,13 @@ mod test {
         stopped_irq = const STOPPED_IMAGE_IRQ,
         probe_stack = const core::mem::offset_of!(TrapProbeBoot, stack_base),
         probe_state = const core::mem::offset_of!(TrapProbeBoot, stop_state),
+        probe_host_root = const core::mem::offset_of!(TrapProbeBoot, host_root),
     );
     unsafe extern "C" {
         fn kernelet_test_exit();
         fn kernelet_test_exit_end();
+        fn kernelet_test_initial_root();
+        fn kernelet_test_initial_root_end();
         fn kernelet_test_invalid_rsp();
         fn kernelet_test_invalid_rsp_end();
         fn kernelet_test_stack_guard();
@@ -1877,11 +1943,7 @@ mod test {
         control = RunControl::new(
             identity,
             grant.dying_address(),
-            Account::new(
-                grant.drain_queue(),
-                CpuBudget::default(),
-                KerneletPolicy::default(),
-            ),
+            Account::new(grant.drain_queue(), KerneletPolicy::default()),
             alloc::vec![cpu],
             resources,
         );
@@ -1903,6 +1965,7 @@ mod test {
             fault: super::super::abi::CopyFaultRecord::default(),
             stack_base: execution.boot_stack_base(),
             stop_state: core::ptr::addr_of!(control.active) as usize,
+            host_root: crate::mm::VmSpace::kernel_root_paddr(),
         };
         assert_eq!(
             core::mem::offset_of!(TrapProbeBoot, fault),
@@ -1918,16 +1981,16 @@ mod test {
         if stop_before_entry {
             control.stop(ExitReason::Killed(KillReason::Requested));
         }
-        let temporary_space = stop_before_entry.then(|| Arc::new(crate::mm::VmSpace::new()));
-        let preempt = stop_before_entry.then(crate::task::disable_preempt);
-        if let Some(space) = temporary_space.as_ref() {
-            space.activate();
-            assert_ne!(
-                crate::arch::mm::current_page_table_paddr(),
-                crate::mm::VmSpace::kernel_root_paddr()
-            );
-            assert_eq!(Arc::strong_count(space), 2);
-        }
+        // These entry/fault fixtures do not block. Retain this CPU so each
+        // starts with a live ordinary Host space, including early stop.
+        let temporary_space = Arc::new(crate::mm::VmSpace::new());
+        let preempt = crate::task::disable_preempt();
+        temporary_space.activate();
+        assert_ne!(
+            crate::arch::mm::current_page_table_paddr(),
+            crate::mm::VmSpace::kernel_root_paddr()
+        );
+        assert_eq!(Arc::strong_count(&temporary_space), 2);
         // SAFETY: The static assembly fixture is RX and its exact instruction
         // range is supplied below. The complete boot arguments, record/fault
         // storage, stacks and grant stay live until the fixed exit returns.
@@ -1955,16 +2018,25 @@ mod test {
             )
         };
         assert!(result.is_ok());
-        if let Some(space) = temporary_space.as_ref() {
-            // The stopped STARTING commit takes the real fixed exit without
-            // executing the image. Its cleanup must leave the permanent root
-            // active and release the CPU's reference to the previous space.
-            assert_eq!(
-                crate::arch::mm::current_page_table_paddr(),
-                crate::mm::VmSpace::kernel_root_paddr()
-            );
-            assert_eq!(Arc::strong_count(space), 1);
-        }
+        assert!(
+            host_run::test_carrier_context_is_clear(),
+            "fixed exit retained a carrier identity"
+        );
+        // Normal, fault and stopped fixed exits must release the previous
+        // native identity. Reactivating that same object must install its root.
+        assert_eq!(
+            crate::arch::mm::current_page_table_paddr(),
+            crate::mm::VmSpace::kernel_root_paddr()
+        );
+        assert_eq!(Arc::strong_count(&temporary_space), 1);
+        temporary_space.activate();
+        assert_ne!(
+            crate::arch::mm::current_page_table_paddr(),
+            crate::mm::VmSpace::kernel_root_paddr()
+        );
+        assert_eq!(Arc::strong_count(&temporary_space), 2);
+        crate::mm::VmSpace::deactivate();
+        assert_eq!(Arc::strong_count(&temporary_space), 1);
         drop(preempt);
         if entry == kernelet_test_stopped_irq as *const () as usize {
             // The assembly fixture injects only the active word's stop bit. Complete the
@@ -2028,8 +2100,15 @@ mod test {
     fn stopped_image_irq_runs_host_callback_before_exit() {
         let mut irq = crate::irq::IrqLine::alloc_specific(STOPPED_IMAGE_IRQ).unwrap();
         STOPPED_IMAGE_IRQ_CALLS.store(0, Ordering::Release);
-        irq.on_active(|_| {
+        irq.on_active(|frame| {
             STOPPED_IMAGE_IRQ_CALLS.fetch_add(1, Ordering::Relaxed);
+            // This real carrier already has a stop request, but its IRQ
+            // callback is still L1. Only the outer trap return may redirect it.
+            let mut during_irq = *frame;
+            host_run::finish_image_trap(&mut during_irq);
+            assert_eq!(during_irq.rip, frame.rip);
+            assert_eq!(during_irq.rsp, frame.rsp);
+            assert_eq!(during_irq.rflags, frame.rflags);
         });
         let reason = run_entry_fixture(
             kernelet_test_stopped_irq as *const () as usize,
@@ -2038,6 +2117,16 @@ mod test {
         );
         assert!(matches!(reason, ExitReason::Killed(KillReason::Requested)));
         assert_eq!(STOPPED_IMAGE_IRQ_CALLS.load(Ordering::Acquire), 1);
+    }
+
+    #[ktest]
+    fn initial_entry_leaves_the_previous_native_root() {
+        let reason = run_entry_fixture(
+            kernelet_test_initial_root as *const () as usize,
+            kernelet_test_initial_root_end as *const () as usize,
+            false,
+        );
+        assert!(matches!(reason, ExitReason::Exited(42)));
     }
 
     #[ktest]
@@ -2055,11 +2144,7 @@ mod test {
         let control = RunControl::new(
             identity::Registration::new().unwrap(),
             0,
-            Account::new(
-                Arc::new(WaitQueue::new()),
-                CpuBudget::default(),
-                KerneletPolicy::default(),
-            ),
+            Account::new(Arc::new(WaitQueue::new()), KerneletPolicy::default()),
             alloc::vec![CpuId::bsp()],
             host_run::ExecutionResources::new(4, 1).unwrap(),
         );
@@ -2097,11 +2182,7 @@ mod test {
         let control = RunControl::new(
             identity::Registration::new().unwrap(),
             0,
-            Account::new(
-                Arc::new(WaitQueue::new()),
-                CpuBudget::default(),
-                KerneletPolicy::default(),
-            ),
+            Account::new(Arc::new(WaitQueue::new()), KerneletPolicy::default()),
             alloc::vec![CpuId::bsp()],
             host_run::ExecutionResources::new(4, 1).unwrap(),
         );
@@ -2118,11 +2199,7 @@ mod test {
         let control = RunControl::new(
             identity::Registration::new().unwrap(),
             0,
-            Account::new(
-                Arc::new(WaitQueue::new()),
-                CpuBudget::default(),
-                KerneletPolicy::default(),
-            ),
+            Account::new(Arc::new(WaitQueue::new()), KerneletPolicy::default()),
             alloc::vec![CpuId::bsp()],
             host_run::ExecutionResources::new(1, 1).unwrap(),
         );
@@ -2183,11 +2260,7 @@ mod test {
         control = RunControl::new(
             identity,
             grant.dying_address(),
-            Account::new(
-                grant.drain_queue(),
-                CpuBudget::default(),
-                KerneletPolicy::default(),
-            ),
+            Account::new(grant.drain_queue(), KerneletPolicy::default()),
             alloc::vec![cpu],
             execution,
         );
@@ -2213,6 +2286,22 @@ mod test {
             device_lines: Vec::new(),
             control,
         })
+    }
+
+    #[ktest]
+    fn stats_aggregate_private_carrier_counters() {
+        let owner = created_fixture(1);
+        let counters = &owner.control.carriers[0].counters;
+        assert_eq!((counters as *const CarrierCounters as usize) % 64, 0);
+        counters.service_calls.store(17, Ordering::Relaxed);
+        counters.mmio_accesses.store(11, Ordering::Relaxed);
+        counters.irqs_raised.store(3, Ordering::Relaxed);
+        let stats = owner.stats();
+        assert_eq!(stats.service_calls, 17);
+        assert_eq!(stats.mmio_accesses, 11);
+        assert_eq!(stats.irqs_raised, 3);
+        drive_to_exited(&owner);
+        owner.destroy().unwrap();
     }
 
     fn drive_to_exited(kernelet: &Kernelet) {
@@ -2287,13 +2376,11 @@ mod test {
 
     impl CreationCleanupProbe {
         fn wait(&self, seconds: u64, condition: impl Fn() -> bool) -> bool {
-            let deadline = crate::task::accounting::now_ns()
-                .saturating_add(Duration::from_secs(seconds).as_nanos() as u64);
-            let _alarm = super::super::account::Deadline::new(deadline, &self.events);
+            let alarm = Deadline::after(Duration::from_secs(seconds), &self.events);
             self.events.wait_until(|| {
                 condition()
                     .then_some(true)
-                    .or_else(|| (crate::task::accounting::now_ns() >= deadline).then_some(false))
+                    .or_else(|| alarm.is_expired().then_some(false))
             })
         }
     }
@@ -2553,12 +2640,11 @@ mod test {
     }
 
     fn wait_for_reaper_flag(flag: &AtomicBool, queue: &Arc<WaitQueue>) {
-        let deadline = crate::task::accounting::now_ns().saturating_add(2_000_000_000);
-        let _alarm = super::super::account::Deadline::new(deadline, queue);
+        let alarm = Deadline::after(Duration::from_secs(2), queue);
         let completed = queue.wait_until(|| {
             flag.load(Ordering::Acquire)
                 .then_some(true)
-                .or_else(|| (crate::task::accounting::now_ns() >= deadline).then_some(false))
+                .or_else(|| alarm.is_expired().then_some(false))
         });
         assert!(
             completed,
@@ -2876,20 +2962,8 @@ mod test {
         kernelet.destroy().unwrap();
     }
 
-    fn reaper_releases_blocked_carrier(quota_wait: bool) {
+    fn reaper_releases_blocked_carrier() {
         let kernelet = created_fixture(1);
-        if quota_wait {
-            kernelet.control.account.set_budget(CpuBudget {
-                nice: 0,
-                quota: Some((1, 60_000_000)),
-            });
-            kernelet
-                .control
-                .account
-                .vcpu_ns
-                .store(1_000, Ordering::Release);
-            assert!(kernelet.control.account.exhausted());
-        }
         kernelet.control.active.store(1, Ordering::Release);
         kernelet
             .control
@@ -2905,13 +2979,9 @@ mod test {
                 let control = &worker_kernelet.control;
                 let stopped = || control.stop_requested();
                 worker_started.store(true, Ordering::Release);
-                if quota_wait {
-                    control.account.wait_for_budget(stopped);
-                } else {
-                    control.carriers[0]
-                        .wait
-                        .wait_until(|| stopped().then_some(()));
-                }
+                control.carriers[0]
+                    .wait
+                    .wait_until(|| stopped().then_some(()));
                 worker_finished.store(true, Ordering::Release);
                 control.carriers[0]
                     .run_state
@@ -2925,7 +2995,7 @@ mod test {
         kernelet.control.tasks.lock().push(task.clone());
         task.run();
         // The OSTD FIFO scheduler clears this CPU tag when a Task parks.
-        // Wait for that transition so both cases exercise a registered,
+        // Wait for that transition so the test exercises a registered,
         // blocked waiter rather than stopping before it enters the wait.
         while !started.load(Ordering::Acquire) || task.schedule_info().cpu.get().is_some() {
             Task::yield_now();
@@ -2953,12 +3023,7 @@ mod test {
 
     #[ktest]
     fn reaper_releases_idle_carrier() {
-        reaper_releases_blocked_carrier(false);
-    }
-
-    #[ktest]
-    fn reaper_cancels_carrier_quota_wait() {
-        reaper_releases_blocked_carrier(true);
+        reaper_releases_blocked_carrier();
     }
 
     #[ktest]
@@ -3022,6 +3087,10 @@ mod test {
                     )
                 }
                 .unwrap();
+                assert!(
+                    host_run::test_carrier_context_is_clear(),
+                    "carrier exit retained CPU-local state"
+                );
                 assert_eq!(result, (-super::super::abi::STATE) as u32);
                 worker_kernelet.control.detach_carrier();
                 worker_finished.store(true, Ordering::Release);
@@ -3040,6 +3109,10 @@ mod test {
         assert!(!finished.load(Ordering::Acquire));
         // The real idle service is suspended with no external operation
         // admission. Stop and destroy must still retain its live frames.
+        assert!(
+            host_run::test_carrier_context_is_clear(),
+            "native Task inherited the parked carrier identity"
+        );
         assert_eq!(kernelet.control.admitted.load(Ordering::Acquire), 0);
         assert_eq!(kernelet.control.active.load(Ordering::Acquire), 1);
         assert!(matches!(
@@ -3090,7 +3163,8 @@ mod test {
 
     struct RootProbeHooks {
         kernelet: Arc<Kernelet>,
-        root: usize,
+        roots: [usize; 2],
+        host_root: usize,
         execution: Arc<host_run::ExecutionResources>,
         calls: AtomicUsize,
         panic_in_hook: bool,
@@ -3111,20 +3185,56 @@ mod test {
         ) -> Result<Arc<Task>> {
             Err(Error::InvalidArgs)
         }
-        fn mmio_read(&self, _: u16, _: u32, _: u32) -> MmioResult {
-            assert_eq!(crate::arch::mm::current_page_table_paddr(), self.root);
-            assert!(
-                self.execution.test_root_is_active(
-                    self.root as u64,
-                    crate::irq::disable_local().current_cpu(),
-                )
-            );
+        fn mmio_read(&self, stage: u16, _: u32, _: u32) -> MmioResult {
+            let stage = usize::from(stage);
+            assert!(stage < KERNELET_TEST_ROOTS.len());
+            let [root_a, root_b] = self.roots;
+            let expected_root = match stage {
+                1 => root_b,
+                5 => self.host_root,
+                _ => root_a,
+            };
+            {
+                let _irq_guard = crate::irq::disable_local();
+                assert_eq!(
+                    super::super::vcpu_slot::current(),
+                    self.kernelet.control.cpu_slot(0)
+                );
+                let cpu = _irq_guard.current_cpu();
+                assert_eq!(crate::arch::mm::current_page_table_paddr(), expected_root);
+                for root in self.roots {
+                    assert_eq!(
+                        self.execution.test_root_is_active(root as u64, cpu),
+                        root == expected_root
+                    );
+                }
+                if stage != 5 {
+                    let expected_previous = match stage {
+                        0 | 6 => self.host_root,
+                        2 => root_b,
+                        _ => root_a,
+                    };
+                    // The direct-commit probe survives unrelated carrier
+                    // restoration and checks the actual CR3 before its write.
+                    assert_eq!(
+                        self.execution
+                            .test_root_last_direct_activation_from(expected_root as u64),
+                        Some(expected_previous)
+                    );
+                }
+                assert_eq!(
+                    self.kernelet.control.carriers[0]
+                        .active_root
+                        .load(Ordering::Acquire),
+                    if stage == 5 { 0 } else { expected_root as u64 }
+                );
+            }
             assert_eq!(self.kernelet.control.admitted.load(Ordering::Acquire), 0);
             self.kernelet.charge_host_bytes(8).unwrap();
             self.kernelet.uncharge_host_bytes(8);
             assert_eq!(self.kernelet.control.admitted.load(Ordering::Acquire), 0);
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            if self.stop_in_hook {
+            assert_eq!(self.calls.fetch_add(1, Ordering::Relaxed), stage);
+            if self.stop_in_hook && stage == 6 {
                 self.kernelet
                     .control
                     .stop(ExitReason::Killed(KillReason::Requested));
@@ -3137,7 +3247,7 @@ mod test {
                     host_run::SERVICE
                 );
             }
-            if self.panic_in_hook {
+            if self.panic_in_hook && stage == 6 {
                 let _nested = self
                     .kernelet
                     .control
@@ -3178,6 +3288,7 @@ mod test {
         let resources = kernelet.resources.lock().as_ref().unwrap().clone();
         let native_root = crate::arch::mm::current_page_table_paddr();
         let root = FrameAllocOptions::new().alloc_frame().unwrap();
+        let second_root = FrameAllocOptions::new().alloc_frame().unwrap();
         // SAFETY: The current root is live and linearly mapped. The fixture
         // retains both this copy and every shared kernel mapping through exit.
         let bytes = unsafe {
@@ -3187,15 +3298,28 @@ mod test {
             )
         };
         root.write_bytes(0, bytes).unwrap();
-        KERNELET_TEST_ROOT.store(root.paddr() as u64, Ordering::Release);
+        second_root.write_bytes(0, bytes).unwrap();
+        for (request, value) in KERNELET_TEST_ROOTS.iter().zip([
+            root.paddr(),
+            second_root.paddr(),
+            root.paddr(),
+            root.paddr(),
+            1,
+            0,
+            root.paddr(),
+        ]) {
+            request.store(value as u64, Ordering::Release);
+        }
         KERNELET_TEST_SERVICE_RETURNED.store(false, Ordering::Release);
-        let mut execution = host_run::ExecutionResources::new(1, 1).unwrap();
+        let mut execution = host_run::ExecutionResources::new(2, 1).unwrap();
         execution.prepare().unwrap();
         execution.register_test_root(root.paddr() as u64);
+        execution.register_test_root(second_root.paddr() as u64);
         let execution = Arc::new(execution);
         let hooks = Arc::new(RootProbeHooks {
             kernelet: kernelet.clone(),
-            root: root.paddr(),
+            roots: [root.paddr(), second_root.paddr()],
+            host_root: crate::mm::VmSpace::kernel_root_paddr(),
             execution: execution.clone(),
             calls: AtomicUsize::new(0),
             panic_in_hook,
@@ -3213,7 +3337,8 @@ mod test {
         let end = kernelet_test_bounded_service_end as *const () as usize;
         // SAFETY: The RX assembly fixture, real boot/record mappings and
         // private stacks are live. The copied root has identical mappings;
-        // this test exercises activation/crossing, not registration validation.
+        // this test exercises activation/crossing, not registration validation
+        // or actual root-frame reclamation: both copied frames remain owned here.
         let result = unsafe {
             host_run::enter(
                 entry,
@@ -3246,11 +3371,18 @@ mod test {
                 42
             }
         );
+        assert!(
+            host_run::test_carrier_context_is_clear(),
+            "service exit retained CPU-local carrier state"
+        );
         assert_eq!(
             KERNELET_TEST_SERVICE_RETURNED.load(Ordering::Acquire),
             !panic_in_hook && !stop_in_hook
         );
-        assert_eq!(hooks.calls.load(Ordering::Acquire), 1);
+        assert_eq!(
+            hooks.calls.load(Ordering::Acquire),
+            KERNELET_TEST_ROOTS.len()
+        );
         assert_eq!(kernelet.control.admitted.load(Ordering::Acquire), 0);
         assert_eq!(Arc::strong_count(&hooks), 1);
         assert_eq!(Arc::strong_count(&execution), 2);
@@ -3271,7 +3403,13 @@ mod test {
         } else {
             assert!(matches!(status.reason, ExitReason::Exited(42)));
         }
-        drop((execution, hooks, resources, root));
+        {
+            let irq_guard = crate::irq::disable_local();
+            for root in hooks.roots {
+                assert!(!execution.test_root_is_active(root as u64, irq_guard.current_cpu()));
+            }
+        }
+        drop((execution, hooks, resources, root, second_root));
         kernelet.destroy().unwrap();
     }
 
@@ -3356,6 +3494,82 @@ mod test {
         let report = kernelet.destroy().unwrap();
         assert_eq!(report.grains_released, 1);
         assert_eq!(kernelet.state(), KerneletState::Destroyed);
+    }
+
+    #[ktest]
+    fn adopted_worker_exit_releases_ownership_before_task_drop() {
+        let kernelet = created_fixture(1);
+        let runner_kernelet = created_fixture(1);
+        let ready = Arc::new(AtomicBool::new(false));
+        let release = Arc::new(AtomicBool::new(false));
+        let events = Arc::new(WaitQueue::new());
+        let mut runner_adoption = TestAdoption::new(&runner_kernelet);
+        // An assertion unwind must also let the worker finish.
+        runner_adoption.gate = Some((release.clone(), events.clone()));
+
+        let worker_kernelet = kernelet.clone();
+        let worker_ready = ready.clone();
+        let worker_release = release.clone();
+        let worker_events = events.clone();
+        let worker = crate::task::TaskOptions::new(move || {
+            worker_kernelet.adopt_current_task().unwrap();
+            worker_ready.store(true, Ordering::Release);
+            worker_events.wake_all();
+            worker_events.wait_until(|| worker_release.load(Ordering::Acquire).then_some(()));
+            // Deliberately leave adoption to the normal Task exit cleanup.
+        })
+        .data(())
+        .spawn()
+        .unwrap();
+
+        events.wait_until(|| ready.load(Ordering::Acquire).then_some(()));
+        drive_to_exited(&kernelet);
+        assert!(matches!(
+            kernelet.destroy(),
+            Err(DestroyError::Zombie {
+                pins: 0,
+                adopted: 1
+            })
+        ));
+        assert_eq!(
+            runner_kernelet
+                .control
+                .account
+                .adopted
+                .load(Ordering::Acquire),
+            1
+        );
+
+        release.store(true, Ordering::Release);
+        events.wake_all();
+        kernelet.control.account.drained.wait_until(|| {
+            (kernelet.control.account.adopted.load(Ordering::Acquire) == 0).then_some(())
+        });
+        // Retaining the Task Arc proves this was exit cleanup, not Task Drop.
+        let report = kernelet.destroy().unwrap();
+        assert_eq!(report.grains_released, 1);
+        assert_eq!(kernelet.state(), KerneletState::Destroyed);
+        assert_eq!(
+            runner_kernelet
+                .control
+                .account
+                .adopted
+                .load(Ordering::Acquire),
+            1
+        );
+        drop(worker);
+
+        drop(runner_adoption);
+        assert_eq!(
+            runner_kernelet
+                .control
+                .account
+                .adopted
+                .load(Ordering::Acquire),
+            0
+        );
+        drive_to_exited(&runner_kernelet);
+        runner_kernelet.destroy().unwrap();
     }
 
     #[ktest]

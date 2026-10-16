@@ -63,11 +63,11 @@ pub struct Taskless {
     callback: Box<dyn Fn() + Send + Sync + 'static>,
     /// Whether this `Taskless` is disabled.
     is_disabled: AtomicBool,
-    link: Arc<ArcQueueLink<Self>>,
+    link: ArcQueueLink<Self>,
 }
 
 impl ArcQueueItem for Taskless {
-    fn queue_link(&self) -> &Arc<ArcQueueLink<Self>> {
+    fn queue_link(&self) -> &ArcQueueLink<Self> {
         &self.link
     }
 }

@@ -8,7 +8,11 @@ use std::{
     io::{Read, Write},
     os::{fd::AsRawFd, unix::process::CommandExt},
     process::{Command, Stdio},
-    sync::{Arc, Condvar, Mutex, mpsc},
+    sync::{
+        Arc, Condvar, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc,
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -51,13 +55,15 @@ struct ProcessState {
 struct Running {
     pid: Pid,
     input: Option<mpsc::SyncSender<Option<Vec<u8>>>>,
+    input_cancelled: Arc<AtomicBool>,
+    input_thread: Option<thread::JoinHandle<()>>,
     output_threads: Vec<thread::JoinHandle<()>>,
     outputs: Arc<Outputs>,
     terminal: Option<File>,
 }
 
 struct ProcessIo {
-    input: Box<dyn Write + Send>,
+    input: File,
     outputs: Vec<(Stream, File)>,
     terminal_control: Option<File>,
 }
@@ -620,13 +626,13 @@ fn start(id: u64, process: Process, writer: &Writer, processes: &ProcessTable) -
     let pid = child.id();
     let io = if let Some((input_master, control_master, master)) = terminal {
         ProcessIo {
-            input: Box::new(input_master),
+            input: input_master,
             outputs: vec![(Stream::Stdout, master)],
             terminal_control: Some(control_master),
         }
     } else {
         ProcessIo {
-            input: Box::new(child.stdin.take().unwrap()),
+            input: File::from(std::os::fd::OwnedFd::from(child.stdin.take().unwrap())),
             outputs: vec![
                 (
                     Stream::Stdout,
@@ -645,8 +651,15 @@ fn start(id: u64, process: Process, writer: &Writer, processes: &ProcessTable) -
         outputs,
         terminal_control,
     } = io;
+    if let Err(error) = nonblocking(&input) {
+        // The process is not published yet; a setup failure must retire it.
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error.context("make process stdin nonblocking"));
+    }
     // One data chunk may be in flight when a close request arrives.
     let (input_sender, input_receiver) = mpsc::sync_channel(2);
+    let input_cancelled = Arc::new(AtomicBool::new(false));
     let output_state = Arc::new(Outputs::new());
     state.outputs.insert(id, output_state.clone());
     state.running.insert(
@@ -654,6 +667,8 @@ fn start(id: u64, process: Process, writer: &Writer, processes: &ProcessTable) -
         Running {
             pid: Pid::from_raw(pid as i32),
             input: Some(input_sender),
+            input_cancelled: input_cancelled.clone(),
+            input_thread: None,
             output_threads: Vec::new(),
             outputs: output_state.clone(),
             terminal: terminal_control,
@@ -663,31 +678,14 @@ fn start(id: u64, process: Process, writer: &Writer, processes: &ProcessTable) -
     // Publish Started before output forwarding can fill the host's subscriber
     // queue. The process lock prevents the reaper from publishing Exited first.
     transmit(writer, Message::Started { id, pid })?;
-    let input_writer = writer.clone();
-    thread::spawn(move || {
-        let mut input = input;
-        for data in input_receiver {
-            let Some(data): Option<Vec<u8>> = data else {
-                if process.terminal {
-                    let _ = input.write_all(&[4]);
-                }
-                break;
-            };
-            if let Err(error) = input.write_all(&data) {
-                let _ = transmit(
-                    &input_writer,
-                    Message::RequestFailed {
-                        request: Request::Data { id },
-                        detail: format!("stdin write failed: {error}"),
-                    },
-                );
-                break;
-            }
-            if transmit(&input_writer, Message::InputReady { id }).is_err() {
-                break;
-            }
-        }
-    });
+    state.running.get_mut(&id).unwrap().input_thread = Some(copy_input(
+        id,
+        input,
+        input_receiver,
+        input_cancelled,
+        process.terminal,
+        writer.clone(),
+    ));
     state.running.get_mut(&id).unwrap().output_threads = outputs
         .into_iter()
         .map(|(stream, output)| {
@@ -696,6 +694,94 @@ fn start(id: u64, process: Process, writer: &Writer, processes: &ProcessTable) -
         .collect();
     processes.started.notify_one();
     Ok(())
+}
+
+fn nonblocking(file: &File) -> Result<()> {
+    use nix::fcntl::{FcntlArg, OFlag, fcntl};
+    let flags = OFlag::from_bits_retain(fcntl(file.as_raw_fd(), FcntlArg::F_GETFL)?);
+    fcntl(
+        file.as_raw_fd(),
+        FcntlArg::F_SETFL(flags | OFlag::O_NONBLOCK),
+    )?;
+    Ok(())
+}
+
+fn copy_input(
+    id: u64,
+    mut input: File,
+    receiver: mpsc::Receiver<Option<Vec<u8>>>,
+    cancelled: Arc<AtomicBool>,
+    terminal: bool,
+    writer: Writer,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let result = (|| -> Result<()> {
+            while !cancelled.load(Ordering::Acquire) {
+                let data = match receiver.recv_timeout(OUTPUT_POLL_INTERVAL) {
+                    Ok(data) => data,
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                };
+                let close = data.is_none();
+                let data = match data {
+                    Some(data) => data,
+                    None if terminal => vec![4],
+                    None => return Ok(()),
+                };
+                let mut remaining = data.as_slice();
+                while !remaining.is_empty() {
+                    if cancelled.load(Ordering::Acquire) {
+                        return Ok(());
+                    }
+                    let mut descriptor = libc::pollfd {
+                        fd: input.as_raw_fd(),
+                        events: libc::POLLOUT,
+                        revents: 0,
+                    };
+                    // SAFETY: the descriptor and single pollfd remain live.
+                    let ready = unsafe {
+                        libc::poll(&mut descriptor, 1, OUTPUT_POLL_INTERVAL.as_millis() as i32)
+                    };
+                    if ready < 0 {
+                        let error = std::io::Error::last_os_error();
+                        if error.kind() == std::io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        return Err(error.into());
+                    }
+                    if ready == 0 {
+                        continue;
+                    }
+                    match input.write(remaining) {
+                        Ok(0) => bail!("stdin write made no progress"),
+                        Ok(length) => remaining = &remaining[length..],
+                        Err(error)
+                            if matches!(
+                                error.kind(),
+                                std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                            ) => {}
+                        Err(error) => return Err(error.into()),
+                    }
+                }
+                if close || cancelled.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                transmit(&writer, Message::InputReady { id })?;
+            }
+            Ok(())
+        })();
+        if let Err(error) = result
+            && !cancelled.load(Ordering::Acquire)
+        {
+            let _ = transmit(
+                &writer,
+                Message::RequestFailed {
+                    request: Request::Data { id },
+                    detail: format!("stdin write failed: {error:#}"),
+                },
+            );
+        }
+    })
 }
 
 fn copy_output(
@@ -743,6 +829,9 @@ fn copy_output(
                         )?;
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    // PTY input/output clones share O_NONBLOCK. Readiness may
+                    // change between poll and read, so retry without failing.
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => continue,
                     // The PTY master reports EIO after the last slave closes.
                     Err(error) if error.raw_os_error() == Some(libc::EIO) => return Ok(()),
                     Err(error) => return Err(error.into()),
@@ -867,12 +956,23 @@ fn finish_child(processes: &ProcessTable, writer: &Writer, pid: Pid, code: i32) 
     // exit for a process the agent did not start through this protocol.
 }
 
-fn report_exit(processes: &ProcessTable, writer: &Writer, id: u64, code: i32, process: Running) {
+fn report_exit(
+    processes: &ProcessTable,
+    writer: &Writer,
+    id: u64,
+    code: i32,
+    mut process: Running,
+) {
     let _ = signal::killpg(process.pid, Signal::SIGKILL);
+    process.input_cancelled.store(true, Ordering::Release);
+    process.input.take();
     process.outputs.finish();
     let writer = writer.clone();
     let processes = processes.clone();
     thread::spawn(move || {
+        if let Some(handle) = process.input_thread {
+            let _ = handle.join();
+        }
         for handle in process.output_threads {
             let _ = handle.join();
         }
@@ -886,6 +986,115 @@ mod tests {
     use std::os::{fd::OwnedFd, unix::net::UnixStream};
 
     use super::*;
+
+    #[test]
+    fn stdin_worker_cancels_with_an_idle_sender_or_full_pipe() {
+        for full in [false, true] {
+            let (read, write) = unistd::pipe().unwrap();
+            let mut input = File::from(write);
+            nonblocking(&input).unwrap();
+            if full {
+                let bytes = [1; 4096];
+                loop {
+                    match input.write(&bytes) {
+                        Ok(_) => {}
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(error) => panic!("fill stdin pipe: {error}"),
+                    }
+                }
+            }
+            let (server, _client) = UnixStream::pair().unwrap();
+            let writer = Arc::new(Mutex::new(File::from(OwnedFd::from(server))));
+            let (sender, receiver) = mpsc::sync_channel(0);
+            let cancelled = Arc::new(AtomicBool::new(false));
+            let worker = copy_input(1, input, receiver, cancelled.clone(), false, writer);
+            if full {
+                // A rendezvous proves the worker received the chunk before
+                // cancellation, instead of only testing its startup check.
+                sender.send(Some(vec![2; 4096])).unwrap();
+            }
+            // The receiving end stays open and never reads. Cancellation must
+            // retire the worker without EOF or killing an escaped descendant.
+            cancelled.store(true, Ordering::Release);
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !worker.is_finished() {
+                assert!(Instant::now() < deadline, "stdin worker did not cancel");
+                thread::sleep(Duration::from_millis(5));
+            }
+            worker.join().unwrap();
+            drop(sender);
+            drop(read);
+        }
+    }
+
+    #[test]
+    fn stdin_credit_follows_complete_chunk_delivery() {
+        let (read, write) = unistd::pipe().unwrap();
+        let input = File::from(write);
+        nonblocking(&input).unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let writer = Arc::new(Mutex::new(File::from(OwnedFd::from(server))));
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let worker = copy_input(7, input, receiver, cancelled, false, writer);
+        let expected = vec![3; 4 * protocol::STREAM_CHUNK_BYTES];
+        let length = expected.len();
+        let reader = thread::spawn(move || {
+            let mut received = vec![0; length];
+            File::from(read).read_exact(&mut received).unwrap();
+            received
+        });
+        sender.send(Some(expected.clone())).unwrap();
+        assert!(matches!(
+            protocol::receive(&mut client).unwrap(),
+            Message::InputReady { id: 7 }
+        ));
+        sender.send(None).unwrap();
+        worker.join().unwrap();
+        assert_eq!(reader.join().unwrap(), expected);
+    }
+
+    #[test]
+    fn terminal_stdin_delivers_a_line_and_closes_without_blocking() {
+        let pty = nix::pty::openpty(None, None).unwrap();
+        let master = File::from(pty.master);
+        let mut slave = File::from(pty.slave);
+        nonblocking(&master).unwrap();
+        let (server, mut client) = UnixStream::pair().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let writer = Arc::new(Mutex::new(File::from(OwnedFd::from(server))));
+        let (sender, receiver) = mpsc::sync_channel(2);
+        let worker = copy_input(
+            8,
+            master,
+            receiver,
+            Arc::new(AtomicBool::new(false)),
+            true,
+            writer,
+        );
+        sender.send(Some(b"hello\n".to_vec())).unwrap();
+        assert!(matches!(
+            protocol::receive(&mut client).unwrap(),
+            Message::InputReady { id: 8 }
+        ));
+        // InputReady confirms the full line was written. Canonical PTY input
+        // makes it available to the slave independently of the master echo.
+        let mut line = [0; 6];
+        slave.read_exact(&mut line).unwrap();
+        assert_eq!(&line, b"hello\n");
+        sender.send(None).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !worker.is_finished() {
+            assert!(Instant::now() < deadline, "terminal stdin did not close");
+            thread::sleep(Duration::from_millis(5));
+        }
+        worker.join().unwrap();
+    }
 
     #[test]
     fn signal_all_refuses_to_broadcast_from_a_host_fixture() {
@@ -1052,6 +1261,9 @@ mod tests {
             unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
             0
         );
+        let (stdin_read, stdin_write) = unistd::pipe().unwrap();
+        let input_pipe =
+            fs::read_link(format!("/proc/self/fd/{}", stdin_write.as_raw_fd())).unwrap();
         let (stdout_read, stdout_write) = unistd::pipe().unwrap();
         let (stderr_read, stderr_write) = unistd::pipe().unwrap();
         let (pid_read, pid_write) = unistd::pipe().unwrap();
@@ -1060,6 +1272,7 @@ mod tests {
         let leader = unsafe {
             let leader = libc::fork();
             if leader == 0 {
+                libc::close(stdin_write.as_raw_fd());
                 libc::close(stdout_read.as_raw_fd());
                 libc::close(stderr_read.as_raw_fd());
                 libc::close(pid_read.as_raw_fd());
@@ -1090,6 +1303,7 @@ mod tests {
             leader
         };
         assert!(leader > 0);
+        drop(stdin_read);
         drop(stdout_write);
         drop(stderr_write);
         drop(pid_write);
@@ -1131,9 +1345,31 @@ mod tests {
         let outputs = Arc::new(Outputs::new());
         outputs.ready(Stream::Stdout);
         outputs.ready(Stream::Stderr);
+        let mut input = File::from(stdin_write);
+        nonblocking(&input).unwrap();
+        loop {
+            match input.write(&[1; 4096]) {
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(error) => panic!("fill escaped descendant's stdin: {error}"),
+            }
+        }
+        let (input_sender, input_receiver) = mpsc::sync_channel(0);
+        let input_cancelled = Arc::new(AtomicBool::new(false));
+        let input_thread = copy_input(
+            7,
+            input,
+            input_receiver,
+            input_cancelled.clone(),
+            false,
+            writer.clone(),
+        );
+        input_sender.send(Some(vec![2; 4096])).unwrap();
         let process = Running {
             pid: Pid::from_raw(leader),
-            input: None,
+            input: Some(input_sender),
+            input_cancelled,
+            input_thread: Some(input_thread),
             output_threads: vec![
                 copy_output(
                     7,
@@ -1190,6 +1426,14 @@ mod tests {
                     break;
                 }
                 message => panic!("unexpected lifecycle message: {message:?}"),
+            }
+        }
+        for entry in fs::read_dir("/proc/self/fd").unwrap() {
+            if let Ok(target) = fs::read_link(entry.unwrap().path()) {
+                assert_ne!(
+                    target, input_pipe,
+                    "stdin fd survived the process exit report"
+                );
             }
         }
         assert_eq!(received, b"before exit\n");

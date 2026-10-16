@@ -119,7 +119,6 @@ extern "C" fn kernelet_host_pt_activate_impl(root: u64) -> i64 {
     let Some(_admission) = state.admit_service() else {
         return -STATE;
     };
-    state.install_host_root();
     let roots = state.execution.roots.lock();
     let table = if root == 0 {
         Some(None)
@@ -130,14 +129,27 @@ extern "C" fn kernelet_host_pt_activate_impl(root: u64) -> i64 {
             .map(|index| Some(roots[index].table.clone()))
     };
     let result = if let Some(table) = table {
-        // Keep the Host root through the service epilogue. The final assembly
-        // transition installs this registered root immediately before entry.
-        state.active_root.set(root as usize);
-        state.vm_space.set_registered_root(table);
-        state.control.carriers[state.vcpu as usize]
-            .active_root
-            .store(root, Ordering::Release);
-        0
+        let activated = if let Some(table) = table {
+            // The registry lock pins both registrations through the synchronous
+            // CR3 commit. The carrier keeps its old active reservation until the
+            // new root has been installed; no intermediate Host root is needed.
+            let irq_guard = crate::irq::disable_local();
+            state.vm_space.activate_registered_root(table, &irq_guard)
+        } else {
+            // Explicit deactivation still leaves the old root through HostRoot.
+            state.install_host_root();
+            state.vm_space.set_registered_root(None);
+            true
+        };
+        if activated {
+            state.active_root.set(root as usize);
+            state.control.carriers[state.vcpu as usize]
+                .active_root
+                .store(root, Ordering::Release);
+            0
+        } else {
+            -STATE
+        }
     } else {
         -INVALID
     };
@@ -155,7 +167,12 @@ extern "C" fn kernelet_host_tlb_shootdown_impl(root: u64, start: u64, len: u64) 
         return -STATE;
     };
     state.enter_schedulable_service();
-    let result = if let Some(op) = shootdown_op(start, len) {
+    let result = if root == 0 {
+        // A local invalidation has no root registry or remote wait. Keep IRQs
+        // masked so this physical CPU performs it before the fixed epilogue
+        // restores the carrier's unchanged desired root.
+        flush_local_carrier_tlb(start, len)
+    } else if let Some(op) = shootdown_op(start, len) {
         // The service has installed the Host root and left the active set.
         // Keep physical IRQs enabled during the snapshot and IPI acknowledgement.
         crate::arch::irq::enable_local();
@@ -208,6 +225,14 @@ extern "C" fn kernelet_host_tlb_shootdown_impl(root: u64, start: u64, len: u64) 
     result
 }
 
+fn flush_local_carrier_tlb(start: u64, len: u64) -> i64 {
+    if start != 0 || len != u64::MAX {
+        return -INVALID;
+    }
+    crate::arch::mm::tlb_flush_all_including_global();
+    0
+}
+
 fn shootdown_op(start: u64, len: u64) -> Option<TlbFlushOp> {
     if len == u64::MAX {
         return Some(TlbFlushOp::for_all());
@@ -226,8 +251,17 @@ fn shootdown_op(start: u64, len: u64) -> Option<TlbFlushOp> {
 
 #[cfg(ktest)]
 mod test {
-    use super::{MAX_USERSPACE_VADDR, PAGE_SIZE, TlbFlushOp, shootdown_op};
+    use super::{
+        INVALID, MAX_USERSPACE_VADDR, PAGE_SIZE, TlbFlushOp, flush_local_carrier_tlb, shootdown_op,
+    };
     use crate::prelude::ktest;
+
+    #[ktest]
+    fn local_carrier_flush_rejects_partial_or_offset_ranges() {
+        for (start, len) in [(0, 0), (0, PAGE_SIZE as u64), (1, u64::MAX)] {
+            assert_eq!(flush_local_carrier_tlb(start, len), -INVALID);
+        }
+    }
 
     #[ktest]
     fn shootdown_accepts_user_ranges_and_full_flush() {

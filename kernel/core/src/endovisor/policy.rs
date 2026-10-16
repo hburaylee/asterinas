@@ -33,6 +33,16 @@ const MAX_ENDPOINT_BYTES_PER_USER: usize = 16 * 1024 * 1024;
 
 static LEDGER: SpinLock<Ledger, LocalIrqDisabled> = SpinLock::new(Ledger::new());
 
+#[cfg(ktest)]
+pub(super) fn endpoint_bytes_for_test(owner: Uid) -> usize {
+    LEDGER
+        .lock()
+        .users
+        .iter()
+        .find(|entry| entry.owner == Some(owner))
+        .map_or(0, |entry| entry.endpoint_bytes)
+}
+
 /// A charge retained by the sandbox and its retry reaper until destruction.
 pub(super) struct Admission {
     slot: usize,

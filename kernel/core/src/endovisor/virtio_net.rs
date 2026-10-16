@@ -28,7 +28,7 @@ use super::{
 };
 #[cfg(all(kernelet_rq1_diagnostics, not(feature = "kernelet")))]
 use crate::endovisor::io_copy_profile::{self, Category};
-use crate::{prelude::*, thread::kernel_thread::ThreadOptions};
+use crate::prelude::*;
 
 mod endpoint;
 mod nat;
@@ -116,6 +116,7 @@ struct Registers {
     driver_features: u64,
     queue_select: u32,
     queues: [Queue<QUEUE_SIZE>; NUM_QUEUES],
+    notified: [bool; NUM_QUEUES],
     generation: u64,
     active: usize,
     resetting: bool,
@@ -132,6 +133,7 @@ impl Registers {
             driver_features: 0,
             queue_select: 0,
             queues: [Queue::<QUEUE_SIZE>::default(); NUM_QUEUES],
+            notified: [false; NUM_QUEUES],
             generation: 1,
             active: 0,
             resetting: false,
@@ -141,6 +143,7 @@ impl Registers {
     }
 
     fn reset(&mut self) {
+        self.notified.fill(false);
         self.generation = self.generation.wrapping_add(1);
         self.inbox.clear();
         for queue in &mut self.queues {
@@ -160,7 +163,7 @@ impl Registers {
     }
 }
 
-/// One virtio-net device. MMIO hooks validate and enqueue; the worker moves frames.
+/// One virtio-net device. Notify wakes a worker to validate chains and move frames.
 pub(super) struct VirtioNet {
     kernelet: Arc<Kernelet>,
     memory: GuestMemory,
@@ -189,9 +192,9 @@ impl VirtioNet {
         })
     }
 
-    pub(super) fn start_worker(self: &Arc<Self>) {
+    pub(super) fn start_worker(self: &Arc<Self>, execution: &super::scheduling::ExecutionThreads) {
         let device = self.clone();
-        ThreadOptions::new(move || device.worker()).spawn();
+        execution.spawn_worker(move || device.worker());
     }
 
     pub(super) fn cancel(&self) {
@@ -279,7 +282,7 @@ impl VirtioNet {
                 if index >= NUM_QUEUES || !registers.queues[index].ready || registers.resetting {
                     return -INVALID;
                 }
-                self.collect_requests(&mut registers, index);
+                registers.notified[index] = true;
                 self.endpoint.wake_backend();
             }
             0x64 => {
@@ -304,15 +307,6 @@ impl VirtioNet {
                 None => return -INVALID,
             },
             _ => return -INVALID,
-        }
-        let irq = offset == 0x50 && self.interrupt_status.load(Ordering::Acquire) != 0;
-        drop(registers);
-        if irq {
-            // Completion category: reporting the invalid chains completed
-            // during the notify above, charged to the owning instance.
-            let _ = ChargedSpan::measure(&self.kernelet, WorkCategory::Completion, || {
-                self.kernelet.raise_irq(self.irq)
-            });
         }
         0
     }
@@ -345,41 +339,51 @@ impl VirtioNet {
         )
     }
 
-    fn collect_requests(&self, r: &mut Registers, index: usize) {
+    fn collect_requests(&self, r: &mut Registers, index: usize) -> bool {
+        r.notified[index] = false;
         let (avail, num) = {
             let queue = &r.queues[index];
             (queue.avail, queue.num)
         };
         let Ok(avail_idx) = self.read_u16(avail + 2) else {
             r.status |= DEVICE_NEEDS_RESET;
-            return;
+            return false;
         };
         if avail_idx.wrapping_sub(r.queues[index].last_avail) as u32 > num {
             r.status |= DEVICE_NEEDS_RESET;
-            return;
+            return false;
         }
-        while r.queues[index].last_avail != avail_idx && r.inbox.len() < INBOX_SLOTS {
+        let mut has_failed_completion = false;
+        let mut budget = 1;
+        while budget != 0 && r.queues[index].last_avail != avail_idx && r.inbox.len() < INBOX_SLOTS
+        {
+            budget -= 1;
             let slot = r.queues[index].last_avail as u32 % num;
             let Some(head_addr) = avail.checked_add(4 + slot as u64 * 2) else {
                 r.status |= DEVICE_NEEDS_RESET;
-                return;
+                return false;
             };
             let Ok(head) = self.read_u16(head_addr) else {
                 r.status |= DEVICE_NEEDS_RESET;
-                return;
+                return false;
             };
             if !r.queues[index].head_acceptable(head) {
                 r.status |= DEVICE_NEEDS_RESET;
                 self.complete_invalid(r, index, head);
+                has_failed_completion = true;
             } else if let Some(request) = self.collect_chain(r, index, head) {
                 r.queues[index].mark_accepted(head);
                 r.inbox.push_back(request);
             } else {
                 r.status |= DEVICE_NEEDS_RESET;
                 self.complete_invalid(r, index, head);
+                has_failed_completion = true;
             }
             r.queues[index].last_avail = r.queues[index].last_avail.wrapping_add(1);
         }
+        r.notified[index] =
+            r.queues[index].last_avail != avail_idx && r.status & DEVICE_NEEDS_RESET == 0;
+        has_failed_completion
     }
 
     fn collect_chain(&self, r: &Registers, queue_index: usize, head: u16) -> Option<Request> {
@@ -525,7 +529,39 @@ impl VirtioNet {
         self.kernelet.disown_current_task();
     }
 
+    fn collect_notified(&self) -> bool {
+        let mut registers = self.registers.lock();
+        if registers.cancelled || registers.resetting || registers.status & DEVICE_NEEDS_RESET != 0
+        {
+            return false;
+        }
+        let mut progressed = false;
+        let mut has_failed_completion = false;
+        for index in 0..NUM_QUEUES {
+            if !registers.notified[index] {
+                continue;
+            }
+            let before = registers.queues[index].last_avail;
+            has_failed_completion |= self.collect_requests(&mut registers, index);
+            progressed = registers.queues[index].last_avail != before;
+            if progressed || registers.status & DEVICE_NEEDS_RESET != 0 {
+                break;
+            }
+        }
+        drop(registers);
+        if has_failed_completion && self.interrupt_status.load(Ordering::Acquire) != 0 {
+            let _ = self.kernelet.raise_irq(self.irq);
+        }
+        if progressed && ostd::task::Task::need_yield() {
+            ostd::task::Task::yield_now();
+        }
+        progressed
+    }
+
     fn take_work(&self) -> Option<Work> {
+        if self.collect_notified() {
+            return Some(Work::Progress);
+        }
         let has_input = self.endpoint.input_available();
         let has_output_room = self.endpoint.output_has_space();
         let mut r = self.registers.lock();

@@ -226,7 +226,7 @@ pub(crate) enum Reply {
 
 #[derive(Deserialize, Serialize)]
 pub(crate) struct Stats {
-    pub cpu_time_ns: u64,
+    pub cpu_time_ns: Option<u64>,
     pub throttled_ns: u64,
     pub completion_cpu_ns: Option<u64>,
     pub ingress_copy_cpu_ns: Option<u64>,
@@ -687,10 +687,23 @@ mod tests {
             serde_json::to_vec(&record).unwrap(),
         )
         .unwrap();
-        // A listener left in the filesystem but no longer held by a process.
-        let listener =
-            std::os::unix::net::UnixListener::bind(directory.join("control.sock")).unwrap();
-        drop(listener);
+        // Leave a stream-socket inode with no listener. Unlike UnixListener,
+        // this never accepts connections even if a concurrent fork briefly
+        // inherits its FD before exec. That made the old fixture race with
+        // parallel child-process tests and intermittently report ECONNRESET.
+        let socket = nix::sys::socket::socket(
+            nix::sys::socket::AddressFamily::Unix,
+            nix::sys::socket::SockType::Stream,
+            nix::sys::socket::SockFlag::SOCK_CLOEXEC,
+            None,
+        )
+        .unwrap();
+        nix::sys::socket::bind(
+            std::os::fd::AsRawFd::as_raw_fd(&socket),
+            &nix::sys::socket::UnixAddr::new(&directory.join("control.sock")).unwrap(),
+        )
+        .unwrap();
+        drop(socket);
         let recovered = state(&directory).unwrap();
         assert_eq!(recovered.status, "stopped");
         assert_eq!(recovered.pid, 42);

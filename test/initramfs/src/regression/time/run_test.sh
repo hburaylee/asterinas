@@ -4,6 +4,9 @@
 
 set -e
 
+./clock_tsc
+./cpu_tick_accounting
+
 ./clock_nanosleep/nanosleep_err
 
 ./gettimeofday/gettimeofday

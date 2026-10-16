@@ -88,8 +88,7 @@ pub(super) struct TcpErrorDiagnostic {
 
 impl TcpStream {
     pub(super) fn connect(remote: SocketAddrV4, charge: NativeTcpBufferCharge) -> Result<Self> {
-        let socket = StreamSocket::new(true, IpAddressFamily::IPv4);
-        socket.retain_nat_charge(charge)?;
+        let socket = StreamSocket::new_nat(true, IpAddressFamily::IPv4, charge);
         configure_tcp_stream(socket.as_ref())?;
         let connecting = match socket.connect(address(remote)) {
             Ok(()) => None,
@@ -279,7 +278,7 @@ impl TcpListener {
         #[cfg(kernelet_nat_failure_diag_host)] model: &VirtioNet,
         #[cfg(kernelet_nat_failure_diag_host)] context: NatContext,
     ) -> Result<TcpStream> {
-        let accepted = self.0.accept(true);
+        let accepted = self.0.accept_nat(true, charge);
         #[cfg(kernelet_nat_failure_diag_host)]
         if let Err(error) = &accepted
             && error.error() != Errno::EAGAIN
@@ -297,23 +296,6 @@ impl TcpListener {
             self.record_accept_failure(model, NatEvent::AcceptLinger, context, Some(&_peer), error);
         }
         configured?;
-        let stream = file
-            .downcast_ref::<StreamSocket>()
-            .ok_or_else(|| Error::with_message(Errno::EINVAL, "invalid native NAT TCP socket"));
-        #[cfg(kernelet_nat_failure_diag_host)]
-        if let Err(error) = &stream {
-            let mut context = context;
-            context.stage = "accepted_socket_type";
-            self.record_accept_failure(model, NatEvent::AcceptType, context, Some(&_peer), error);
-        }
-        let attached = stream?.retain_nat_charge(charge);
-        #[cfg(kernelet_nat_failure_diag_host)]
-        if let Err(error) = &attached {
-            let mut context = context;
-            context.stage = "accepted_retain_nat_charge";
-            self.record_accept_failure(model, NatEvent::AcceptCharge, context, Some(&_peer), error);
-        }
-        attached?;
         Ok(TcpStream {
             file,
             connecting: None,

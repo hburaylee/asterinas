@@ -2,8 +2,6 @@
 
 //! Virtual device slots, device-model dispatch, and the sandbox's Host hooks.
 
-use core::num::NonZeroU16;
-
 use kernelet_abi::KILL_INTERNAL_ERROR;
 use ostd::{
     kernelet::{
@@ -19,6 +17,7 @@ use crate::{
         log_endpoint::LogEndpoint,
         placement::CpuReservation,
         policy::{Admission, PrestartEndpointReservation},
+        scheduling::ExecutionThreads,
         virtio_block::VirtioBlock,
         virtio_console::{ConsoleEndpoint, VirtioConsole},
         virtio_net::{NetEndpoint, VirtioNet},
@@ -26,10 +25,8 @@ use crate::{
         virtio_vsock::VirtioVsock,
     },
     prelude::*,
-    sched::{Nice, SchedPolicy},
-    thread::{AsThread, Thread, kernel_thread::ThreadOptions},
+    thread::kernel_thread::ThreadOptions,
     time::clocks::RealTimeClock,
-    vm::vmar::Vmar,
 };
 
 /// Size and command-line spelling of each virtual MMIO register window.
@@ -105,13 +102,13 @@ pub(super) enum DeviceModel<'a> {
     Net(&'a Arc<VirtioNet>),
 }
 impl DeviceModel<'_> {
-    pub(super) fn start_worker(self) {
+    pub(super) fn start_worker(self, execution: &ExecutionThreads) {
         match self {
-            Self::Block(x) => x.start_worker(),
-            Self::Console(x) => x.start_worker(),
-            Self::Vsock(x) => x.start_worker(),
-            Self::Rng(x) => x.start_worker(),
-            Self::Net(x) => x.start_worker(),
+            Self::Block(x) => x.start_worker(execution),
+            Self::Console(x) => x.start_worker(execution),
+            Self::Vsock(x) => x.start_worker(execution),
+            Self::Rng(x) => x.start_worker(execution),
+            Self::Net(x) => x.start_worker(execution),
         }
     }
     fn cancel(self) {
@@ -181,7 +178,7 @@ pub(super) struct SandboxHooks {
     pub(super) _endpoint_reservations: Vec<Arc<PrestartEndpointReservation>>,
     pub(super) admission: Arc<Admission>,
     pub(super) _placement: CpuReservation,
-    pub(super) carriers: SpinLock<Vec<Weak<Thread>>>,
+    pub(super) execution: ExecutionThreads,
 }
 
 pub(super) struct SandboxDevices {
@@ -228,37 +225,28 @@ impl KerneletHooks for SandboxHooks {
         kernelet: &Arc<Kernelet>,
         vcpu: u16,
         host_cpu: ostd::cpu::CpuId,
-        nice: i8,
+        _nice: i8,
     ) -> ostd::Result<Arc<Task>> {
-        let vmar = Vmar::from_vm_space(kernelet.carrier_vm_space(vcpu)?);
-        // Divide by the configured carrier count, including carriers that are
-        // asleep or have not been built yet. The count is fixed for this instance.
-        let weight_divisor =
-            NonZeroU16::new(kernelet.num_vcpus()).ok_or(ostd::Error::InvalidArgs)?;
+        let vm_space = kernelet.carrier_vm_space(vcpu)?;
         let kernelet = Arc::downgrade(kernelet);
-        let nice = Nice::try_from(nice).map_err(|_| ostd::Error::InvalidArgs)?;
-        let task = ThreadOptions::new(move || {
-            let Some(kernelet) = kernelet.upgrade() else {
-                return;
-            };
-            if let Err(error) = kernelet.run_vcpu(vcpu)
-                && matches!(
-                    kernelet.state(),
-                    KerneletState::Created | KerneletState::Running
-                )
-            {
-                ostd::error!("kernelet carrier {} failed: {:?}", vcpu, error);
-                let _ = kernelet.kill(KillReason::HostPolicy(KILL_INTERNAL_ERROR));
-            }
-        })
-        .vmar(vmar)
-        .cpu_affinity(host_cpu.into())
-        .sched_policy(SchedPolicy::Fair(nice))
-        .fair_weight_divisor(weight_divisor)
-        .build();
-        self.carriers
-            .lock()
-            .push(Arc::downgrade(task.as_thread().unwrap()));
+        let task = self.execution.build(
+            ThreadOptions::new(move || {
+                let Some(kernelet) = kernelet.upgrade() else {
+                    return;
+                };
+                if let Err(error) = kernelet.run_vcpu(vcpu)
+                    && matches!(
+                        kernelet.state(),
+                        KerneletState::Created | KerneletState::Running
+                    )
+                {
+                    ostd::error!("kernelet carrier {} failed: {:?}", vcpu, error);
+                    let _ = kernelet.kill(KillReason::HostPolicy(KILL_INTERNAL_ERROR));
+                }
+            })
+            .carrier_vm_space(vm_space)
+            .cpu_affinity(host_cpu.into()),
+        );
         Ok(task)
     }
 
@@ -271,15 +259,7 @@ impl KerneletHooks for SandboxHooks {
     }
 
     fn set_vcpu_nice(&self, nice: i8) -> ostd::Result<()> {
-        let nice = Nice::try_from(nice).map_err(|_| ostd::Error::InvalidArgs)?;
-        let carriers = self.carriers.lock();
-        if carriers.is_empty() {
-            return Err(ostd::Error::InvalidArgs);
-        }
-        for thread in carriers.iter().filter_map(Weak::upgrade) {
-            thread.sched_attr().set_policy(SchedPolicy::Fair(nice));
-        }
-        Ok(())
+        self.execution.set_nice(nice)
     }
 
     fn mmio_read(&self, device: u16, offset: u32, width: u32) -> MmioResult {

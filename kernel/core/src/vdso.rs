@@ -3,13 +3,13 @@
 //! Virtual Dynamic Shared Object (vDSO) mappings.
 //!
 //! The Host initializes a Linux vDSO from its machine clocksource. Images leave
-//! the vDSO absent and use clock syscalls backed by the Host clock page.
+//! the vDSO absent and use clock syscalls with local TSC conversion.
 
 #[cfg(not(feature = "kernelet"))]
 pub(crate) use host::{init_in_first_kthread, vdso_vmo};
 use ostd::{const_assert, mm::PAGE_SIZE};
 
-// A prebuilt vDSO caches coarse timestamps and cannot consume the Host page.
+// The prebuilt vDSO expects Host-managed vvar data, which Images do not publish.
 // Images leave it absent so every clock read uses the existing syscall path.
 #[cfg(feature = "kernelet")]
 pub(super) fn init_in_first_kthread() {}
@@ -436,7 +436,7 @@ pub(crate) const VDSO_VMO_LAYOUT: VdsoVmoLayout = VdsoVmoLayout {
     size: 5 * PAGE_SIZE,
 };
 
-#[cfg(target_arch = "riscv64")]
+#[cfg(any(target_arch = "riscv64", target_arch = "aarch64"))]
 pub(crate) const VDSO_VMO_LAYOUT: VdsoVmoLayout = VdsoVmoLayout {
     // https://elixir.bootlin.com/linux/v6.2.10/source/arch/riscv/kernel/vdso.c#L247
     data_segment_offset: 0,

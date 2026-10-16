@@ -8,3 +8,5 @@ SUBDIRS := \
 	timerfd \
 
 include ../common/Makefile
+
+$(OBJ_OUTPUT_DIR)/cpu_tick_accounting: EXTRA_C_FLAGS += -pthread

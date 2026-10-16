@@ -97,13 +97,15 @@ impl RawUserContext {
     ///
     /// If `trap_num` is `0x100`, it will go user by `sysret` (`rcx` and `r11` are dropped),
     /// otherwise it will use `iret`.
+    /// Returns the captured page-fault address, or zero for another exit,
+    /// without publishing Kernelet-specific shared fault metadata.
     // Keep the small Host entry wrapper inside its hot caller; optional
     // per-call profiling has a separate, larger body.
     #[cfg_attr(
         all(feature = "kernelet-host", not(kernelet_getpid_profile)),
         inline(always)
     )]
-    pub(in crate::arch) fn run(&mut self, guard: DisabledLocalIrqGuard) {
+    pub(in crate::arch) fn run(&mut self, guard: DisabledLocalIrqGuard) -> usize {
         #[cfg(kernelet_getpid_profile)]
         let raw_span = if profile::enabled() {
             profile::event(profile::event_id::RAW_RUN);
@@ -142,14 +144,13 @@ impl RawUserContext {
         // The interrupt guard keeps entry atomic, and the context stays live
         // until the matching syscall/trap has saved the register file in it.
         unsafe { syscall_return(self) };
-        #[cfg(feature = "kernelet-host")]
-        {
-            self.fault_addr = if self.trap_num == 14 {
-                x86_64::registers::control::Cr2::read_raw() as usize
-            } else {
-                0
-            };
-        }
+        // Capture CR2 before profiling or any caller-side work can overwrite
+        // it. Only the Kernelet user gate publishes this in the shared context.
+        let fault_addr = if self.trap_num == 14 {
+            x86_64::registers::control::Cr2::read_raw() as usize
+        } else {
+            0
+        };
         #[cfg(kernelet_getpid_profile)]
         {
             let _ = profile::end(raw_span);
@@ -163,5 +164,6 @@ impl RawUserContext {
                 });
             }
         }
+        fault_addr
     }
 }

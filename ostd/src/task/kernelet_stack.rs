@@ -8,7 +8,7 @@ use crate::{
     Error, Result,
     irq::DisabledLocalIrqGuard,
     kernelet::{
-        abi::{KSTACK_MAPPING_BYTES, KSTACK_USABLE_BYTES, StackTickRecord},
+        abi::{KSTACK_MAPPING_BYTES, KSTACK_USABLE_BYTES},
         entry,
     },
     mm::{PAGE_SIZE, Vaddr},
@@ -88,15 +88,6 @@ impl KernelStack {
 
     pub(crate) fn lower_bound(&self) -> Vaddr {
         self.start_vaddr
-    }
-
-    /// Drains the physical samples retained with this live stack.
-    /// The caller owns its execution, or its outgoing ownership before release.
-    pub(crate) fn take_ticks(&self) -> (u64, u64) {
-        assert!(!self.retired.load(Ordering::Acquire));
-        // SAFETY: The Host initialized this fixed record before returning the
-        // slot. This owner retains the mapped stack until retirement/Drop.
-        unsafe { &*(self.end_vaddr() as *const StackTickRecord) }.take()
     }
 }
 

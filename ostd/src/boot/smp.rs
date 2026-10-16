@@ -2,29 +2,33 @@
 
 //! Symmetric multiprocessing (SMP) boot support.
 
+#[cfg(not(feature = "kernelet"))]
 use alloc::{boxed::Box, collections::btree_map::BTreeMap, vec::Vec};
 #[cfg(feature = "kernelet")]
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use spin::Once;
 
+use crate::util::id_set::Id;
 #[cfg(not(feature = "kernelet"))]
-use crate::mm::{FrameAllocOptions, HasPaddrRange, paddr_to_vaddr};
 use crate::{
     arch::irq::HwCpuId,
     mm::{
-        PAGE_SIZE,
+        FrameAllocOptions, HasPaddrRange, PAGE_SIZE,
         frame::{Segment, meta::KernelMeta},
+        paddr_to_vaddr,
     },
     sync::SpinLock,
     task::Task,
-    util::id_set::Id,
 };
 
+#[cfg(not(feature = "kernelet"))]
 static AP_BOOT_INFO: Once<ApBootInfo> = Once::new();
 
+#[cfg(not(feature = "kernelet"))]
 const AP_BOOT_STACK_SIZE: usize = PAGE_SIZE * 64;
 
+#[cfg(not(feature = "kernelet"))]
 struct ApBootInfo {
     /// Raw boot information for each AP.
     per_ap_raw_info: Box<[PerApRawInfo]>,
@@ -33,6 +37,7 @@ struct ApBootInfo {
     per_ap_info: Box<[PerApInfo]>,
 }
 
+#[cfg(not(feature = "kernelet"))]
 struct PerApInfo {
     // TODO: When the AP starts up and begins executing tasks, the boot stack will
     // no longer be used, and the `Segment` can be deallocated (this problem also
@@ -49,6 +54,7 @@ struct PerApInfo {
 /// layout is important. **Update the assembly code if the layout is changed!**
 #[repr(C)]
 #[derive(Clone, Copy)]
+#[cfg(not(feature = "kernelet"))]
 pub(crate) struct PerApRawInfo {
     stack_top: *mut u8,
     cpu_local: *mut u8,
@@ -57,9 +63,12 @@ pub(crate) struct PerApRawInfo {
 // SAFETY: This information (i.e., the pointer addresses) can be shared safely
 // among multiple threads. However, it is the responsibility of the user to
 // ensure that the contained pointers are used safely.
+#[cfg(not(feature = "kernelet"))]
 unsafe impl Send for PerApRawInfo {}
+#[cfg(not(feature = "kernelet"))]
 unsafe impl Sync for PerApRawInfo {}
 
+#[cfg(not(feature = "kernelet"))]
 static HW_CPU_ID_MAP: SpinLock<BTreeMap<u32, HwCpuId>> = SpinLock::new(BTreeMap::new());
 #[cfg(feature = "kernelet")]
 static ONLINE_VCPUS: AtomicU64 = AtomicU64::new(0);
@@ -236,6 +245,7 @@ pub(crate) unsafe extern "C" fn ap_early_entry(cpu_id: u32) -> ! {
     unreachable!("`yield_now` in the boot context should not return");
 }
 
+#[cfg(not(feature = "kernelet"))]
 fn report_online_and_hw_cpu_id(cpu_id: u32) {
     // There are no races because this method will only be called in the boot
     // context, where preemption won't occur.
@@ -245,6 +255,7 @@ fn report_online_and_hw_cpu_id(cpu_id: u32) {
     assert!(old_val.is_none());
 }
 
+#[cfg(not(feature = "kernelet"))]
 fn wait_for_all_aps_started(num_cpus: usize) {
     fn is_all_aps_started(num_cpus: usize) -> bool {
         HW_CPU_ID_MAP.lock().len() == num_cpus
@@ -262,6 +273,7 @@ fn wait_for_all_aps_started(num_cpus: usize) {
 /// This method will panic if it is called either before all APs have booted or more than once.
 ///
 /// [`CpuId`]: crate::cpu::CpuId
+#[cfg(not(feature = "kernelet"))]
 pub(crate) fn construct_hw_cpu_id_mapping() -> Box<[HwCpuId]> {
     let mut hw_cpu_id_map = HW_CPU_ID_MAP.lock();
     assert_eq!(hw_cpu_id_map.len(), crate::cpu::num_cpus());

@@ -17,6 +17,7 @@ mod elf;
 mod external_sources;
 mod host_audit;
 pub(crate) mod rustc_wrapper;
+mod snapshot;
 mod unsafe_allowlist;
 
 use std::{
@@ -52,6 +53,7 @@ pub(crate) struct KerneletImage {
     path: PathBuf,
     source_hash: [u8; 32],
     toolchain: Option<OsString>,
+    cargo_home: Option<PathBuf>,
 }
 
 struct GuestBuildContext<'a> {
@@ -60,6 +62,7 @@ struct GuestBuildContext<'a> {
     base_crate_path: &'a Path,
     exemption_log: &'a Path,
     toolchain: Option<&'a std::ffi::OsStr>,
+    cargo_home: Option<&'a Path>,
 }
 
 impl KerneletImage {
@@ -73,11 +76,73 @@ impl KerneletImage {
             ),
             (KERNELET_SOURCE_HASH_ENV.to_string(), hash.into()),
         ];
+        if let Some(home) = &self.cargo_home {
+            envs.push(("CARGO_HOME".into(), home.as_os_str().to_owned()));
+            envs.push(("CARGO_NET_OFFLINE".into(), "true".into()));
+        }
         if let Some(toolchain) = &self.toolchain {
             envs.push(("RUSTUP_TOOLCHAIN".to_string(), toolchain.clone()));
         }
         envs
     }
+}
+
+pub(crate) fn host_overrides(image: Option<&KerneletImage>, overrides: &[String]) -> Vec<String> {
+    match image.and_then(|image| image.cargo_home.as_deref()) {
+        Some(home) => snapshot::frozen_overrides(home, overrides).unwrap_or_else(|error| {
+            error_msg!("Cannot freeze Host Cargo overrides: {error}");
+            process::exit(Errno::BuildCrate as _);
+        }),
+        None => overrides.to_vec(),
+    }
+}
+
+pub(crate) fn validate_host_dependencies(
+    image: &KerneletImage,
+    features: &[String],
+    no_default_features: bool,
+    overrides: &[String],
+) {
+    if let Some(home) = &image.cargo_home {
+        snapshot::validate_dependencies(
+            home,
+            &std::env::current_dir().unwrap(),
+            features,
+            no_default_features,
+            overrides,
+            image.toolchain.as_deref(),
+        )
+        .unwrap_or_else(|error| {
+            error_msg!("Host dependencies are not frozen: {error}");
+            process::exit(Errno::BuildCrate as _);
+        });
+    }
+}
+
+pub(crate) fn capture_build_if_requested(
+    config: &Config,
+    action: ActionChoice,
+    target: &CrateInfo,
+    output: &Path,
+    build_output: &Path,
+) -> Option<snapshot::BuildSnapshot> {
+    image_build(config, action).kernelet.then(|| {
+        let options = image_build(config, action);
+        let mut features = options.features.clone();
+        features.extend(["kernelet".into(), "kernelet-host".into()]);
+        snapshot::BuildSnapshot::capture(
+            target,
+            output,
+            Some(build_output),
+            &options.override_configs,
+            &features,
+            options.no_default_features,
+        )
+        .unwrap_or_else(|error| {
+            error_msg!("Cannot freeze paired build inputs: {error}");
+            process::exit(Errno::BuildCrate as _);
+        })
+    })
 }
 
 /// Builds the kernelet image if the manifest asks for it, and returns the
@@ -88,6 +153,7 @@ pub(crate) fn build_image_if_requested(
     target_crate: &CrateInfo,
     osdk_output_directory: &Path,
     cargo_target_directory: &Path,
+    cargo_home: Option<PathBuf>,
 ) -> Option<KerneletImage> {
     let build = image_build(config, action);
     if !build.kernelet {
@@ -99,6 +165,7 @@ pub(crate) fn build_image_if_requested(
         target_crate,
         osdk_output_directory,
         cargo_target_directory,
+        cargo_home,
     ))
 }
 
@@ -119,12 +186,19 @@ fn build_kernelet_image(
     target_crate: &CrateInfo,
     osdk_output_directory: &Path,
     cargo_target_directory: &Path,
+    cargo_home: Option<PathBuf>,
 ) -> KerneletImage {
     if config.target_arch != Arch::X86_64 {
         error_msg!("The `kernelet` build option currently supports only the x86-64 architecture");
         process::exit(Errno::Cli as _);
     }
 
+    let mut frozen_build = build.clone();
+    if let Some(home) = &cargo_home {
+        frozen_build.override_configs = snapshot::frozen_overrides(home, &build.override_configs)
+            .expect("Cargo override sources are present in the paired snapshot");
+    }
+    let build = &frozen_build;
     let ostd_directory = ostd_source_directory(target_crate);
     let source_hash = compute_source_hash(&ostd_directory);
     // The generated base crate may live outside the source tree. Preserve the
@@ -153,8 +227,23 @@ fn build_kernelet_image(
         base_crate_path: &base_crate_path,
         exemption_log: &exemption_log,
         toolchain: toolchain.as_deref(),
+        cargo_home: cargo_home.as_deref(),
     };
     let _dir_guard = DirGuard::change_dir(&base_crate_path);
+    if let Some(home) = &cargo_home {
+        snapshot::validate_dependencies(
+            home,
+            &base_crate_path,
+            &["kernelet".into()],
+            true,
+            &build.override_configs,
+            toolchain.as_deref(),
+        )
+        .unwrap_or_else(|error| {
+            error_msg!("Image dependencies are not frozen: {error}");
+            process::exit(Errno::BuildCrate as _);
+        });
+    }
     let linked_elf_path = build_kernelet_elf(
         build,
         &target_crate.name,
@@ -167,6 +256,7 @@ fn build_kernelet_image(
         &base_crate_path,
         &features,
         toolchain.as_deref(),
+        cargo_home.as_deref(),
     )
     .expect("the kernelet rustc audit log is readable");
 
@@ -188,6 +278,7 @@ fn build_kernelet_image(
             .expect("the built kernelet image exists"),
         source_hash,
         toolchain,
+        cargo_home,
     }
 }
 
@@ -218,6 +309,11 @@ fn build_kernelet_elf(
     ];
 
     let mut command = cargo();
+    if let Some(home) = build.cargo_home {
+        command
+            .env("CARGO_HOME", home)
+            .env("CARGO_NET_OFFLINE", "true");
+    }
     command.env("RUSTFLAGS", RUSTFLAGS.join(" "));
     command.env("RUSTC_WRAPPER", std::env::current_exe().unwrap());
     command.env(rustc_wrapper::MODE_ENV, "1");

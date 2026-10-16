@@ -6,6 +6,7 @@
 // to more suitable locations.
 
 pub(super) mod acpi;
+#[cfg(not(feature = "kernelet"))]
 pub(super) mod apic;
 #[cfg(not(feature = "kernelet"))]
 pub(super) mod kvm_clock;

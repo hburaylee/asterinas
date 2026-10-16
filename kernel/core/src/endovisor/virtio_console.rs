@@ -11,8 +11,8 @@
 //!
 //! The guest drives this device with the kernel proper's own virtio console
 //! driver: queue 0 parks one device-writable receive buffer, and queue 1
-//! offers device-readable transmit buffers. The notify hook validates
-//! descriptor chains into a preallocated inbox only; the worker thread moves
+//! offers device-readable transmit buffers. The notify hook records a doorbell;
+//! the worker validates chains into a preallocated inbox and moves
 //! the bytes between guest memory and the [`ConsoleEndpoint`] and publishes
 //! completions through the used ring.
 
@@ -34,7 +34,6 @@ use super::{
         CONFIG_OFFSET, Queue, ReadyWrite, feature_word, invalid_read, write_driver_feature_word,
     },
 };
-use crate::thread::kernel_thread::ThreadOptions;
 
 mod endpoint;
 
@@ -77,6 +76,7 @@ struct Registers {
     driver_features: u64,
     queue_select: u32,
     queues: [Queue<QUEUE_SIZE>; NUM_QUEUES],
+    notified: [bool; NUM_QUEUES],
     /// Bumps on every reset; a request only touches its own generation.
     generation: u64,
     /// Requests held by the worker, each through one reset drain reference.
@@ -101,6 +101,7 @@ impl Registers {
             driver_features: 0,
             queue_select: 0,
             queues: [Queue::<QUEUE_SIZE>::default(); NUM_QUEUES],
+            notified: [false; NUM_QUEUES],
             generation: 1,
             active: 0,
             resetting: false,
@@ -111,6 +112,7 @@ impl Registers {
     }
 
     fn reset(&mut self) {
+        self.notified.fill(false);
         self.generation = self.generation.wrapping_add(1);
         self.inbox.clear();
         if self.suspended.take().is_some() {
@@ -235,9 +237,9 @@ impl VirtioConsole {
         })
     }
 
-    pub(super) fn start_worker(self: &Arc<Self>) {
+    pub(super) fn start_worker(self: &Arc<Self>, execution: &super::scheduling::ExecutionThreads) {
         let device = self.clone();
-        ThreadOptions::new(move || device.worker()).spawn();
+        execution.spawn_worker(move || device.worker());
     }
 
     /// Asks the worker to abandon its work and exit, waking it if parked.
@@ -323,9 +325,9 @@ impl VirtioConsole {
                 if index >= NUM_QUEUES || !registers.queues[index].ready || registers.resetting {
                     return -INVALID;
                 }
-                self.collect_requests(&mut registers, index);
+                registers.notified[index] = true;
                 // The worker blocks on the endpoint's change queue alone; the
-                // hook wakes it for the inbox work recorded above, so one
+                // hook wakes it for the doorbell recorded above, so one
                 // wait covers every wakeup source.
                 self.endpoint.changes().wake_all();
             }
@@ -382,6 +384,7 @@ impl VirtioConsole {
     }
 
     fn collect_requests(&self, r: &mut Registers, index: usize) {
+        r.notified[index] = false;
         let (avail, num) = {
             let queue = &r.queues[index];
             (queue.avail, queue.num)
@@ -394,7 +397,10 @@ impl VirtioConsole {
             r.status |= DEVICE_NEEDS_RESET;
             return;
         }
-        while r.queues[index].last_avail != avail_idx && r.inbox.len() < INBOX_SLOTS {
+        let mut budget = 1;
+        while budget != 0 && r.queues[index].last_avail != avail_idx && r.inbox.len() < INBOX_SLOTS
+        {
+            budget -= 1;
             let last_avail = r.queues[index].last_avail;
             let slot = last_avail as u32 % num;
             let Some(head_addr) = avail.checked_add(4 + slot as u64 * 2) else {
@@ -414,6 +420,8 @@ impl VirtioConsole {
             }
             r.queues[index].last_avail = last_avail.wrapping_add(1);
         }
+        r.notified[index] =
+            r.queues[index].last_avail != avail_idx && r.status & DEVICE_NEEDS_RESET == 0;
     }
 
     fn collect_chain(&self, r: &Registers, queue_index: usize, head: u16) -> Option<Request> {
@@ -469,9 +477,6 @@ impl VirtioConsole {
         // source without busy spinning.
         let changes = self.endpoint.changes();
         loop {
-            if self.kernelet.wait_for_cpu_budget().is_err() {
-                break;
-            }
             match changes.wait_until(|| self.take_work()) {
                 Work::Cancel => break,
                 Work::Progress => {}
@@ -482,7 +487,35 @@ impl VirtioConsole {
 
     /// Performs one bounded unit of work, or `None` when the device must
     /// block. Endpoint moves happen without the device lock held.
+    fn collect_notified(&self) -> bool {
+        let mut registers = self.registers.lock();
+        if registers.cancelled || registers.resetting || registers.status & DEVICE_NEEDS_RESET != 0
+        {
+            return false;
+        }
+        let mut progressed = false;
+        for index in 0..NUM_QUEUES {
+            if !registers.notified[index] {
+                continue;
+            }
+            let before = registers.queues[index].last_avail;
+            self.collect_requests(&mut registers, index);
+            progressed = registers.queues[index].last_avail != before;
+            if progressed || registers.status & DEVICE_NEEDS_RESET != 0 {
+                break;
+            }
+        }
+        drop(registers);
+        if progressed && ostd::task::Task::need_yield() {
+            ostd::task::Task::yield_now();
+        }
+        progressed
+    }
+
     fn take_work(&self) -> Option<Work> {
+        if self.collect_notified() {
+            return Some(Work::Progress);
+        }
         poll_queues(
             &self.registers,
             |request, index, offset| self.transmit(request, index, offset),
@@ -518,7 +551,7 @@ impl VirtioConsole {
                 .read(buffer.paddr + offset as u64, &mut chunk[..count])
                 .is_err()
             {
-                // Cannot happen for a chain the hook validated; fail safely.
+                // Cannot happen for a chain the worker validated; fail safely.
                 self.registers.lock().status |= DEVICE_NEEDS_RESET;
                 self.complete(request, 0);
                 return progressed;

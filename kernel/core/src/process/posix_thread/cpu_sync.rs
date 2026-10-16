@@ -80,11 +80,15 @@ use ostd::kernelet::fpu_profile::Event;
 /// and uses `Cell`/`RefCell` for interior mutability accordingly.
 /// It is **not** `Sync` and must not be accessed across threads.
 ///
-/// Host-enabled native execution and kernelet execution can be preempted by
-/// timer interrupts. In these modes the accessors hold a preemption guard
-/// across their location transition and any borrow of `reg`. Host-off retains
-/// upstream scheduling boundaries without these accessor guards. The two
-/// lifecycle hooks are called with local interrupts disabled.
+/// Native execution, including ordinary Host tasks, retains upstream
+/// non-preemptible kernel boundaries. Restoring physical IRQs or releasing a
+/// preemption guard does not schedule these tasks. The accessors rely on their
+/// register operations, including `Clone`, `Drop`, allocation and logging, not
+/// voluntarily switching tasks while `reg` is borrowed or `location` is changing.
+///
+/// Image execution can switch internal Tasks at virtual IRQ delivery. Its
+/// accessors therefore hold a preemption guard across the complete borrow and
+/// location transition. The two lifecycle hooks run with local IRQs disabled.
 ///
 /// [`before_schedule`]: Self::before_schedule
 /// [`before_user_exec`]: Self::before_user_exec
@@ -118,7 +122,7 @@ impl<R: UserReg> CpuSync<R> {
     where
         R: Clone,
     {
-        #[cfg(any(feature = "kernelet-host", feature = "kernelet"))]
+        #[cfg(feature = "kernelet")]
         let _preempt_guard = ostd::task::disable_preempt();
 
         let loc = self.location.get();
@@ -153,7 +157,7 @@ impl<R: UserReg> CpuSync<R> {
     ///
     /// [`before_user_exec`]: Self::before_user_exec
     pub(crate) fn set(&self, new_reg: R) {
-        #[cfg(any(feature = "kernelet-host", feature = "kernelet"))]
+        #[cfg(feature = "kernelet")]
         let _preempt_guard = ostd::task::disable_preempt();
 
         #[cfg(kernelet_rq1_diagnostics)]
@@ -220,6 +224,10 @@ impl<R: UserReg> CpuSync<R> {
 /// Implementors typically wrap one or a small bundle of registers/MSRs
 /// (e.g. the user FS base, the user GS base, or the FPU XSAVE area)
 /// into a struct that implements this trait.
+///
+/// Register operations and the type's `Clone` and `Drop` implementations must
+/// not voluntarily switch the owning Task. Native [`CpuSync`] accessors rely
+/// on this property while borrowing the register and updating its location.
 pub(crate) trait UserReg {
     /// Only FpuContext participates; other register types erase this hook.
     #[cfg(kernelet_rq1_diagnostics)]

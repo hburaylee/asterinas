@@ -9,13 +9,18 @@
 //! interrupt-context execution and return a [`PendingIpis`] handle that can be
 //! waited on when the caller needs completion.
 
-use alloc::{boxed::Box, collections::VecDeque};
+#[cfg(not(feature = "kernelet"))]
+use alloc::boxed::Box;
+use alloc::collections::VecDeque;
 use core::sync::atomic::{AtomicBool, Ordering};
 
+#[cfg(not(feature = "kernelet"))]
 use spin::Once;
 
+#[cfg(not(feature = "kernelet"))]
+use crate::arch::irq::HwCpuId;
 use crate::{
-    arch::{irq::HwCpuId, trap::TrapFrame},
+    arch::trap::TrapFrame,
     cpu::{CpuSet, PinCurrentCpu},
     cpu_local, irq,
     sync::SpinLock,
@@ -91,6 +96,11 @@ impl PendingIpis {
         }
     }
 
+    #[cfg(feature = "kernelet")]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.cpus.is_empty()
+    }
+
     fn add(&mut self, cpu_id: crate::cpu::CpuId) {
         self.cpus.add(cpu_id);
     }
@@ -137,13 +147,16 @@ impl PendingIpis {
 ///
 /// The purpose of exporting this type is to enable the users to check whether
 /// [`IPI_SENDER`] has been initialized.
+#[cfg(not(feature = "kernelet"))]
 pub(crate) struct IpiSender {
     hw_cpu_ids: Box<[HwCpuId]>,
 }
 
 /// The [`IpiSender`] singleton.
+#[cfg(not(feature = "kernelet"))]
 pub(crate) static IPI_SENDER: Once<IpiSender> = Once::new();
 
+#[cfg(not(feature = "kernelet"))]
 impl IpiSender {
     /// Notifies a remote CPU without queuing a callback; does nothing for self.
     /// Callers must publish work and wake its waiters before notifying.
@@ -228,6 +241,7 @@ pub(crate) unsafe fn do_inter_processor_call(_trapframe: &TrapFrame) {
         .store(false, Ordering::Release);
 }
 
+#[cfg(not(feature = "kernelet"))]
 pub(super) fn init() {
     IPI_SENDER.call_once(|| {
         let hw_cpu_ids = crate::boot::smp::construct_hw_cpu_id_mapping();

@@ -809,7 +809,7 @@ fn boot_diagnostics(sandbox: &Sandbox, output: &BootOutput<'_>) -> String {
             stats.max_grains,
             stats.stacks_allocated,
             stats.oopses,
-            stats.cpu_time_ns,
+            diagnostic_counter(stats.cpu_time_ns),
             stats.throttled_ns,
             diagnostic_counter(stats.service_calls),
             diagnostic_counter(stats.mmio_accesses),

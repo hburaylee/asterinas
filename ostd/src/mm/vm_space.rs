@@ -97,6 +97,8 @@ struct RootActivation {
 pub(crate) struct RegisteredPageTable {
     paddr: Paddr,
     state: SpinLock<RegisteredRootState, crate::sync::LocalIrqDisabled>,
+    #[cfg(ktest)]
+    last_direct_activation_from: core::sync::atomic::AtomicUsize,
     #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
     diagnostic_id: Option<u64>,
 }
@@ -131,6 +133,8 @@ impl RegisteredPageTable {
         seen_generation.resize(crate::cpu::num_cpus(), 0);
         Some(Arc::new(Self {
             paddr,
+            #[cfg(ktest)]
+            last_direct_activation_from: core::sync::atomic::AtomicUsize::new(0),
             #[cfg(all(kernelet_rq1_diagnostics, feature = "kernelet-host"))]
             diagnostic_id: crate::kernelet::tlb_profile::next_root_id(),
             state: SpinLock::new(RegisteredRootState {
@@ -192,6 +196,11 @@ impl RegisteredPageTable {
     #[cfg(ktest)]
     pub(crate) fn is_active_on(&self, cpu: crate::cpu::CpuId) -> bool {
         self.state.lock().active.contains(cpu)
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn last_direct_activation_from(&self) -> Paddr {
+        self.last_direct_activation_from.load(Ordering::Relaxed)
     }
 
     pub(crate) fn begin_shootdown(&self) -> Option<RootShootdown> {
@@ -282,6 +291,54 @@ impl VmSpace {
         *activation.root.lock() = root;
     }
 
+    /// Commits a carrier's new root before releasing its old active reservation.
+    ///
+    /// The caller retains the registry lock and the roots' grants throughout
+    /// this synchronous operation. Its IRQ guard excludes native scheduling
+    /// until the carrier's desired-root identity has also been updated.
+    #[cfg(feature = "kernelet-host")]
+    pub(crate) fn activate_registered_root(
+        self: &Arc<Self>,
+        root: Arc<RegisteredPageTable>,
+        irq_guard: &crate::irq::DisabledLocalIrqGuard,
+    ) -> bool {
+        let Some(activation) = self.activation.as_ref() else {
+            return false;
+        };
+        let current = ACTIVATED_VM_SPACE.load();
+        if !current.is_null() && current != Arc::as_ptr(self) {
+            // Carrier entry and pause must release any native address space.
+            // Reject an unexpected owner without changing its root or references.
+            return false;
+        }
+        let cpu = irq_guard.current_cpu();
+        let was_active = current == Arc::as_ptr(self);
+        let mut selected = activation.root.lock();
+        // Keep the old token and active CPU bit until the new CR3 is installed.
+        // activate() serializes validation, CR3 and the new active bit against
+        // shootdown. Failure leaves all old hardware and software state intact.
+        #[cfg(ktest)]
+        let from = current_page_table_paddr();
+        if !root.activate(cpu) {
+            return false;
+        }
+        #[cfg(ktest)]
+        root.last_direct_activation_from
+            .store(from, Ordering::Relaxed);
+        let previous = selected.replace(root);
+        self.record_activation(cpu);
+        activation.restore.store(true, Ordering::Release);
+        if was_active {
+            if let Some(previous) = previous {
+                // Re-selecting the same token must retain its new reservation.
+                if !Arc::ptr_eq(&previous, selected.as_ref().unwrap()) {
+                    previous.leave(cpu);
+                }
+            }
+        }
+        true
+    }
+
     #[cfg(feature = "kernelet-host")]
     pub(crate) fn set_root_restore(&self, restore: bool) {
         self.activation
@@ -343,7 +400,10 @@ impl VmSpace {
         let irq_guard = crate::irq::disable_local();
         #[cfg(not(feature = "kernelet"))]
         {
-            KERNEL_PAGE_TABLE.get().unwrap().activate();
+            KERNEL_PAGE_TABLE.get().unwrap().activate(
+                #[cfg(feature = "kernelet-host")]
+                &irq_guard,
+            );
         }
         #[cfg(feature = "kernelet")]
         {
@@ -442,13 +502,14 @@ impl VmSpace {
 
     /// Activates the page table on the current CPU.
     pub fn activate(self: &Arc<Self>) {
-        #[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+        #[cfg(feature = "kernelet")]
         let _irq_guard = crate::irq::disable_local();
         let preempt_guard = disable_preempt();
         let cpu = preempt_guard.current_cpu();
 
         #[cfg(feature = "kernelet-host")]
         if let Some(activation) = self.activation.as_ref() {
+            let _irq_guard = crate::irq::disable_local();
             if !activation.restore.load(Ordering::Acquire) {
                 Self::deactivate();
                 return;
@@ -482,18 +543,24 @@ impl VmSpace {
         #[cfg(not(feature = "kernelet"))]
         let cached = last_ptr == Arc::as_ptr(self);
 
-        // Image Tasks and Host carriers can borrow another root while their
-        // cached address-space identity remains unchanged.
-        #[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
+        // Image Tasks can borrow another root while their Task-owned cache
+        // remains unchanged. Host carrier boundaries release the native
+        // VmSpace before borrowing CR3, so native cache hits need no CR3 read.
+        #[cfg(feature = "kernelet")]
         let already_active =
             cached && current_page_table_paddr() == self.page_table().unwrap().root_paddr();
-        #[cfg(not(any(feature = "kernelet", feature = "kernelet-host")))]
+        #[cfg(not(feature = "kernelet"))]
         let already_active = cached;
         if already_active {
             #[cfg(feature = "kernelet")]
             self.record_activation(cpu);
             return;
         }
+
+        // Native cache hits only need CPU pinning. Protect an actual root
+        // change and its active-space publication with physical IRQs masked.
+        #[cfg(feature = "kernelet-host")]
+        let _irq_guard = crate::irq::disable_local();
 
         #[cfg(feature = "kernelet")]
         {
@@ -503,7 +570,10 @@ impl VmSpace {
         }
 
         #[cfg(not(feature = "kernelet"))]
-        self.page_table().unwrap().activate();
+        self.page_table().unwrap().activate(
+            #[cfg(feature = "kernelet-host")]
+            &_irq_guard,
+        );
         self.record_activation(cpu);
         #[cfg(feature = "kernelet")]
         if let Some(task) = current_task {
@@ -969,7 +1039,7 @@ pub(super) fn get_activated_vm_space() -> *const VmSpace {
     ACTIVATED_VM_SPACE.load()
 }
 
-#[cfg(all(ktest, not(any(feature = "kernelet", feature = "kernelet-host"))))]
+#[cfg(all(ktest, not(feature = "kernelet")))]
 mod native_activation_test {
     use super::{VmSpace, get_activated_vm_space};
     use crate::{arch::mm::current_page_table_paddr, prelude::*, task::disable_preempt};
@@ -1006,14 +1076,177 @@ mod native_activation_test {
 
 #[cfg(all(ktest, feature = "kernelet-host"))]
 mod activation_test {
-    use super::{RegisteredPageTable, VmSpace, get_activated_vm_space};
+    use core::sync::atomic::Ordering;
+
+    use super::{RegisteredPageTable, RootShootdown, VmSpace, get_activated_vm_space};
     use crate::{
-        arch::mm::current_page_table_paddr, cpu::PinCurrentCpu, mm::PAGE_SIZE, prelude::*,
+        arch::mm::current_page_table_paddr,
+        cpu::PinCurrentCpu,
+        mm::PAGE_SIZE,
+        prelude::*,
+        sync::{LocalIrqDisabled, SpinLock},
         task::disable_preempt,
     };
 
     #[ktest]
-    fn native_root_reference_survives_repeated_deactivation() {
+    fn direct_root_switch_preserves_reservations_and_failure_state() {
+        let owners = [Arc::new(VmSpace::new()), Arc::new(VmSpace::new())];
+        let first = RegisteredPageTable::new(owners[0].page_table().unwrap().root_paddr()).unwrap();
+        let second =
+            RegisteredPageTable::new(owners[1].page_table().unwrap().root_paddr()).unwrap();
+        let retired_owner = Arc::new(VmSpace::new());
+        let retired =
+            RegisteredPageTable::new(retired_owner.page_table().unwrap().root_paddr()).unwrap();
+        retired.invalidate();
+        let carrier = Arc::new(VmSpace::new_activation_only());
+        let _pin = disable_preempt();
+        let guard = crate::irq::disable_local();
+        let cpu = guard.current_cpu();
+        VmSpace::deactivate();
+        let host_root = current_page_table_paddr();
+        let references = Arc::strong_count(&carrier);
+        assert!(carrier.activate_registered_root(first.clone(), &guard));
+        assert_eq!(first.last_direct_activation_from(), host_root);
+        assert_eq!(current_page_table_paddr(), first.paddr);
+        assert!(first.is_active_on(cpu));
+        assert_eq!(Arc::strong_count(&carrier), references + 1);
+
+        // A shootdown published while B is absent must be observed by the
+        // single direct CR3 commit, without first switching to HostRoot.
+        let generation = second.begin_shootdown().unwrap();
+        assert!(generation.active.is_empty());
+        assert!(carrier.activate_registered_root(second.clone(), &guard));
+        assert_eq!(second.last_direct_activation_from(), first.paddr);
+        assert_eq!(current_page_table_paddr(), second.paddr);
+        assert!(!first.is_active_on(cpu));
+        assert!(second.is_active_on(cpu));
+        assert_eq!(get_activated_vm_space(), Arc::as_ptr(&carrier));
+        assert_eq!(Arc::strong_count(&carrier), references + 1);
+        {
+            let state = second.state.lock();
+            assert_eq!(
+                state.seen_generation[u32::from(cpu) as usize],
+                state.generation
+            );
+        }
+        assert_eq!(Arc::strong_count(&first), 1);
+        assert_eq!(Arc::strong_count(&second), 2);
+
+        // Same-token activation must not clear the newly installed active bit.
+        assert!(carrier.activate_registered_root(second.clone(), &guard));
+        assert_eq!(second.last_direct_activation_from(), second.paddr);
+        assert!(second.is_active_on(cpu));
+        assert_eq!(Arc::strong_count(&carrier), references + 1);
+        assert!(!carrier.activate_registered_root(retired, &guard));
+        assert_eq!(current_page_table_paddr(), second.paddr);
+        assert!(second.is_active_on(cpu));
+        assert_eq!(Arc::strong_count(&carrier), references + 1);
+        assert!(Arc::ptr_eq(
+            carrier
+                .activation
+                .as_ref()
+                .unwrap()
+                .root
+                .lock()
+                .as_ref()
+                .unwrap(),
+            &second,
+        ));
+        VmSpace::deactivate();
+        assert_eq!(current_page_table_paddr(), host_root);
+        assert!(!second.is_active_on(cpu));
+        assert_eq!(Arc::strong_count(&carrier), references);
+        carrier.set_registered_root(None);
+        first.invalidate();
+        second.invalidate();
+    }
+
+    static REMOTE_ROOT: SpinLock<Option<Arc<RegisteredPageTable>>, LocalIrqDisabled> =
+        SpinLock::new(None);
+    static REMOTE_SHOOTDOWN: SpinLock<Option<RootShootdown>, LocalIrqDisabled> =
+        SpinLock::new(None);
+    static REMOTE_CPU: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(u32::MAX);
+
+    fn publish_remote_shootdown() {
+        let root = REMOTE_ROOT.lock().as_ref().unwrap().clone();
+        let shootdown = root.begin_shootdown().unwrap();
+        REMOTE_CPU.store(
+            u32::from(crate::cpu::CpuId::current_racy()),
+            Ordering::Relaxed,
+        );
+        *REMOTE_SHOOTDOWN.lock() = Some(shootdown);
+    }
+
+    #[ktest]
+    fn direct_root_switch_serializes_with_remote_shootdown_publication() {
+        let pin = disable_preempt();
+        let cpu = pin.current_cpu();
+        let Some(remote) = crate::cpu::all_cpus().find(|other| *other != cpu) else {
+            crate::early_println!("[skipped: remote root switch requires two CPUs]");
+            return;
+        };
+        let owners = [Arc::new(VmSpace::new()), Arc::new(VmSpace::new())];
+        let roots = [
+            RegisteredPageTable::new(owners[0].page_table().unwrap().root_paddr()).unwrap(),
+            RegisteredPageTable::new(owners[1].page_table().unwrap().root_paddr()).unwrap(),
+        ];
+        let carrier = Arc::new(VmSpace::new_activation_only());
+        {
+            let guard = crate::irq::disable_local();
+            VmSpace::deactivate();
+            assert!(carrier.activate_registered_root(roots[0].clone(), &guard));
+        }
+        for iteration in 0..32 {
+            let next = &roots[(iteration + 1) % 2];
+            let old = &roots[iteration % 2];
+            *REMOTE_ROOT.lock() = Some(next.clone());
+            let pending =
+                crate::smp::inter_processor_call(&remote.into(), publish_remote_shootdown);
+            {
+                let guard = crate::irq::disable_local();
+                assert!(carrier.activate_registered_root(next.clone(), &guard));
+                assert_eq!(next.last_direct_activation_from(), old.paddr);
+                assert_eq!(current_page_table_paddr(), next.paddr);
+                assert!(!old.is_active_on(cpu));
+                assert!(next.is_active_on(cpu));
+            }
+            pending.wait();
+            assert_eq!(REMOTE_CPU.load(Ordering::Relaxed), u32::from(remote));
+            let shootdown = REMOTE_SHOOTDOWN.lock().take().unwrap();
+            {
+                let state = next.state.lock();
+                if !shootdown.active.contains(cpu) {
+                    // Publication preceded activation: the CR3 write must
+                    // already have observed that generation.
+                    assert_eq!(
+                        state.seen_generation[u32::from(cpu) as usize],
+                        state.generation
+                    );
+                }
+            }
+            // If publication followed activation, the snapshot contains this
+            // CPU and a real flush/ack is required before old frames retire.
+            crate::mm::tlb::dispatch_tlb_flush_on_cpus(
+                &shootdown.active,
+                crate::mm::tlb::TlbFlushOp::for_all(),
+                #[cfg(kernelet_rq1_diagnostics)]
+                None,
+            )
+            .wait();
+            assert!(next.is_active_on(cpu));
+        }
+        VmSpace::deactivate();
+        carrier.set_registered_root(None);
+        *REMOTE_ROOT.lock() = None;
+        assert!(REMOTE_SHOOTDOWN.lock().is_none());
+        for root in roots {
+            assert!(!root.is_active());
+            root.invalidate();
+        }
+    }
+
+    #[ktest]
+    fn native_reactivation_after_kernel_boundary_releases_cpu_references() {
         let space = Arc::new(VmSpace::new());
         let table = space.page_table().unwrap();
         let _guard = disable_preempt();
@@ -1024,9 +1257,13 @@ mod activation_test {
             assert_eq!(table.root_reference_count(), references + 1);
             {
                 let _irq_guard = crate::irq::disable_local();
-                // SAFETY: This models a fixed boundary borrowing the permanent
-                // kernel root while the native CPU Frame reference stays held.
-                unsafe { crate::arch::mm::activate_page_table(VmSpace::kernel_root_paddr()) };
+                // The carrier boundary installs the permanent root and clears
+                // the software identity before any fixed stub borrows CR3.
+                VmSpace::deactivate();
+                assert!(get_activated_vm_space().is_null());
+                assert_eq!(Arc::strong_count(&space), 1);
+                assert_eq!(table.root_reference_count(), references);
+                assert_eq!(current_page_table_paddr(), VmSpace::kernel_root_paddr());
                 space.activate();
                 assert_eq!(current_page_table_paddr(), table.root_paddr());
                 assert_eq!(table.root_reference_count(), references + 1);

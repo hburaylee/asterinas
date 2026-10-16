@@ -2,10 +2,7 @@
 
 //! Bounded, nonblocking kernelet log ingress and a readable operator stream.
 
-use core::{
-    fmt::Display,
-    sync::atomic::{AtomicBool, Ordering},
-};
+use core::fmt::Display;
 
 use ostd::kernelet::control::Kernelet;
 
@@ -21,7 +18,7 @@ use crate::{
 
 const RECORD_BYTES: usize = 256;
 const RECORD_COUNT: usize = 32;
-const CHARGED_BYTES: usize = RECORD_BYTES * RECORD_COUNT;
+const CHARGED_BYTES: usize = size_of::<Ring>();
 
 #[derive(Clone, Copy)]
 struct Record {
@@ -117,20 +114,18 @@ impl Ring {
 
 /// The Host hook copies one bounded record without sleeping or allocating.
 pub(super) struct LogEndpoint {
-    ring: SpinLock<Ring>,
+    ring: SpinLock<Option<Box<Ring>>>,
     reader: Mutex<()>,
     pollee: Pollee,
-    revoked: AtomicBool,
     account: SpinLock<Option<Arc<Kernelet>>>,
 }
 
 impl LogEndpoint {
     pub(super) fn new() -> Arc<Self> {
         Arc::new(Self {
-            ring: SpinLock::new(Ring::new()),
+            ring: SpinLock::new(Some(Box::new(Ring::new()))),
             reader: Mutex::new(()),
             pollee: Pollee::new(),
-            revoked: AtomicBool::new(false),
             account: SpinLock::new(None),
         })
     }
@@ -163,10 +158,11 @@ impl LogEndpoint {
     }
 
     pub(super) fn push(&self, level: u32, module: &str, text: &str) -> bool {
-        if self.revoked.load(Ordering::Acquire) {
-            return false;
-        }
-        let pushed = self.ring.lock().push(Record::new(level, module, text));
+        let pushed = self
+            .ring
+            .lock()
+            .as_mut()
+            .is_some_and(|ring| ring.push(Record::new(level, module, text)));
         if pushed {
             self.pollee.notify(IoEvents::IN);
         }
@@ -174,14 +170,12 @@ impl LogEndpoint {
     }
 
     pub(super) fn revoke(&self) {
-        if self.revoked.swap(true, Ordering::AcqRel) {
-            return;
-        }
-        let account = self.account.lock().take();
-        self.ring.lock().len = 0;
-        if let Some(kernelet) = account {
-            kernelet.uncharge_host_bytes(CHARGED_BYTES);
-        }
+        // Serialize readers and concurrent revokers until the payload is freed.
+        // A retained fd only keeps the small, permanently closed endpoint alive.
+        let _reader = self.reader.lock();
+        let ring = self.ring.lock().take();
+        drop(ring);
+        self.unbind_account();
         self.pollee
             .notify(IoEvents::IN | IoEvents::RDHUP | IoEvents::ERR);
     }
@@ -189,6 +183,8 @@ impl LogEndpoint {
 
 impl Drop for LogEndpoint {
     fn drop(&mut self) {
+        let ring = self.ring.lock().take();
+        drop(ring);
         if let Some(kernelet) = self.account.lock().take() {
             kernelet.uncharge_host_bytes(CHARGED_BYTES);
         }
@@ -206,9 +202,9 @@ impl LogEndpointFile {
         let mut buffer = [0; RECORD_BYTES];
         let length = {
             let ring = self.endpoint.ring.lock();
-            if self.endpoint.revoked.load(Ordering::Acquire) {
+            let Some(ring) = ring.as_ref() else {
                 return Ok(0);
-            }
+            };
             if ring.len == 0 {
                 return_errno_with_message!(Errno::EAGAIN, "log endpoint is empty");
             }
@@ -219,23 +215,20 @@ impl LogEndpointFile {
         };
         let mut reader = VmReader::from(&buffer[..length]).to_fallible();
         writer.write_fallible(&mut reader)?;
-        if !self.endpoint.revoked.load(Ordering::Acquire) {
-            let mut ring = self.endpoint.ring.lock();
-            if ring.len != 0 {
-                ring.consumed(length);
-            }
+        let mut ring = self.endpoint.ring.lock();
+        if let Some(ring) = ring.as_mut() {
+            ring.consumed(length);
         }
+        drop(ring);
         self.endpoint.pollee.invalidate();
         Ok(length)
     }
 
     fn events(&self) -> IoEvents {
-        if self.endpoint.revoked.load(Ordering::Acquire) {
-            IoEvents::IN | IoEvents::RDHUP | IoEvents::ERR
-        } else if self.endpoint.ring.lock().len != 0 {
-            IoEvents::IN
-        } else {
-            IoEvents::empty()
+        match self.endpoint.ring.lock().as_ref() {
+            None => IoEvents::IN | IoEvents::RDHUP | IoEvents::ERR,
+            Some(ring) if ring.len != 0 => IoEvents::IN,
+            Some(_) => IoEvents::empty(),
         }
     }
 }
@@ -266,5 +259,29 @@ impl FileLike for LogEndpointFile {
 
     fn dump_proc_fdinfo(self: Arc<Self>, _flags: FdFlags) -> Box<dyn Display> {
         Box::new("kernelet-log:\tendpoint\n".to_string())
+    }
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::*;
+
+    use super::*;
+
+    #[ktest]
+    fn retained_log_fd_is_empty_and_rejects_writes_after_revoke() {
+        crate::time::clocks::init_for_ktest();
+        let endpoint = LogEndpoint::new();
+        let file = endpoint.file();
+        assert!(endpoint.push(1, "test", "before revoke"));
+        endpoint.revoke();
+        endpoint.revoke();
+        drop(endpoint);
+        let mut buffer = [0; RECORD_BYTES];
+        let mut writer = VmWriter::from(buffer.as_mut_slice()).to_fallible();
+        assert_eq!(file.read(&mut writer).unwrap(), 0);
+        assert!(!file.endpoint.push(1, "test", "after revoke"));
+        assert!(file.events().contains(IoEvents::RDHUP));
+        assert!(file.endpoint.ring.lock().is_none());
     }
 }

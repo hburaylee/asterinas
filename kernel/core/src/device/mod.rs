@@ -7,7 +7,7 @@ pub(crate) mod misc;
 mod model;
 mod pty;
 pub mod registry;
-#[cfg(all(kernelet_rq1, not(feature = "kernelet")))]
+#[cfg(all(any(kernelet_rq1, kernelet_rq1_diagnostics), not(feature = "kernelet")))]
 pub(crate) mod rq1_ram;
 pub(crate) mod tty;
 

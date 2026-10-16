@@ -3,7 +3,7 @@
 use alloc::format;
 
 use device_id::{DeviceId, MinorId};
-use ostd::{mm::VmIo, sync::Mutex};
+use ostd::{mm::VmIo, sync::Mutex, warn};
 use ostd_pod::Pod;
 
 use crate::{
@@ -223,26 +223,87 @@ fn parse_gpt(device: &Arc<dyn BlockDevice>) -> Vec<Option<PartitionInfo>> {
 
     // TODO: Check the CRC32 of the header and the partition entries, check the backup GPT header.
 
-    let entry_size = gpt.size_of_partition_entry as usize;
-    let entries_per_sector = SECTOR_SIZE / entry_size;
-    let total_sectors = gpt.nr_partition_entries as usize / entries_per_sector;
-    for i in 0..total_sectors {
-        let mut buf = [0u8; SECTOR_SIZE];
-        let offset = (gpt.partition_entry_lba as usize + i) * SECTOR_SIZE;
-        device.read_bytes(offset, buf.as_mut_slice()).unwrap();
-
-        for j in 0..entries_per_sector {
-            let entry_offset = j * gpt.size_of_partition_entry as usize;
-            let entry = GptEntry::from_first_bytes(&buf[entry_offset..entry_offset + entry_size]);
-            if entry.is_valid() {
-                partitions.push(Some(PartitionInfo::Gpt(entry)));
-            } else {
-                partitions.push(None);
+    let Some((base, count, stride)) = gpt_entry_layout(&gpt, device.metadata().nr_sectors) else {
+        warn!("invalid GPT partition-entry layout");
+        return partitions;
+    };
+    let mut buffer = [0u8; SECTOR_SIZE];
+    let mut cached_sector = None;
+    for index in 0..count {
+        let offset = base + index * stride;
+        let sector = offset / SECTOR_SIZE;
+        if cached_sector != Some(sector) {
+            if device
+                .read_bytes(sector * SECTOR_SIZE, &mut buffer)
+                .is_err()
+            {
+                warn!("cannot read GPT partition entry");
+                return Vec::new();
             }
+            cached_sector = Some(sector);
+        }
+        // The validated power-of-two stride guarantees that the fixed entry
+        // prefix fits in one sector. Reuse that sector for smaller entries.
+        let entry_offset = offset % SECTOR_SIZE;
+        let entry =
+            GptEntry::from_first_bytes(&buffer[entry_offset..entry_offset + size_of::<GptEntry>()]);
+        if entry.is_valid()
+            && entry.start_lba <= entry.end_lba
+            && entry.end_lba < device.metadata().nr_sectors as u64
+        {
+            partitions.push(Some(PartitionInfo::Gpt(entry)));
+        } else {
+            partitions.push(None);
         }
     }
 
     partitions
+}
+
+/// Checks untrusted GPT table geometry before division, indexing or I/O.
+fn gpt_entry_layout(gpt: &GptHeader, disk_sectors: usize) -> Option<(usize, usize, usize)> {
+    let stride = gpt.size_of_partition_entry as usize;
+    let minimum = size_of::<GptEntry>();
+    // GPT entries are 128 * 2^n bytes. Accept large strides without assuming
+    // that an integral number of entries fits in one sector.
+    if stride < minimum || !stride.is_multiple_of(minimum) || !(stride / minimum).is_power_of_two()
+    {
+        return None;
+    }
+    let base = usize::try_from(gpt.partition_entry_lba)
+        .ok()?
+        .checked_mul(SECTOR_SIZE)?;
+    let count = gpt.nr_partition_entries as usize;
+    let end = base.checked_add(count.checked_mul(stride)?)?;
+    let disk_bytes = disk_sectors.checked_mul(SECTOR_SIZE)?;
+    (base >= 2 * SECTOR_SIZE && end <= disk_bytes).then_some((base, count, stride))
+}
+
+#[cfg(ktest)]
+mod tests {
+    use ostd::prelude::*;
+    use ostd_pod::FromZeros;
+
+    use super::*;
+
+    #[ktest]
+    fn malformed_gpt_entry_geometry_is_rejected() {
+        let mut header = GptHeader::new_zeroed();
+        header.partition_entry_lba = 2;
+        header.nr_partition_entries = 5;
+        for size in [0, 1, 64, 127, 129, 192, 384, u32::MAX] {
+            header.size_of_partition_entry = size;
+            assert_eq!(gpt_entry_layout(&header, 32), None);
+        }
+        header.size_of_partition_entry = 128;
+        // The final partial sector still contains the fifth entry.
+        assert_eq!(gpt_entry_layout(&header, 32), Some((1024, 5, 128)));
+        header.size_of_partition_entry = 1024;
+        assert_eq!(gpt_entry_layout(&header, 32), Some((1024, 5, 1024)));
+        assert_eq!(gpt_entry_layout(&header, 3), None);
+        header.partition_entry_lba = u64::MAX;
+        assert_eq!(gpt_entry_layout(&header, 32), None);
+    }
 }
 
 #[derive(Debug)]

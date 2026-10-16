@@ -83,20 +83,20 @@ use crate::{
 
 /// Returns the execution clock used to charge the current Task's runtime.
 ///
-/// Charges elapsed execution to the current Task's attached CPU account using
-/// the same clock reading.
+/// Explicit Image, experiment, or test measurements share this clock reading.
+/// Ordinary Host builds return the native scheduler clock directly.
 ///
 /// On a kernelet vCPU, complete Host off-CPU intervals are removed from this
 /// clock. The offset is local to the current vCPU; a scheduler must retain a
 /// starting value only while the Task runs on that vCPU.
 pub fn runtime_ticks() -> u64 {
-    #[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
+    #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
     {
         Task::current()
             .and_then(|task| task.accounting.sample(true))
             .unwrap_or_else(super::accounting::runtime_ticks)
     }
-    #[cfg(not(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest)))]
+    #[cfg(not(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest)))]
     {
         crate::arch::read_tsc()
     }
@@ -462,6 +462,7 @@ pub(crate) fn might_preempt() {
     if !cpu_local::should_preempt() {
         return;
     }
+    #[cfg(feature = "kernelet")]
     if super::scheduling_in_progress() {
         return;
     }
@@ -680,13 +681,20 @@ where
     // IRQs may run after the runqueue decision and before the context switch.
     // Keep their preemption checks from replacing this Task's unfinished
     // decision. The next Task has its own mark and can still be preempted.
+    #[cfg(feature = "kernelet")]
     let scheduling_guard = super::SchedulingGuard::new();
 
-    reschedule_with_guard(f, scheduling_guard);
+    reschedule_with_guard(
+        f,
+        #[cfg(feature = "kernelet")]
+        scheduling_guard,
+    );
 }
 
-fn reschedule_with_guard<F>(mut f: F, _scheduling_guard: super::SchedulingGuard)
-where
+fn reschedule_with_guard<F>(
+    mut f: F,
+    #[cfg(feature = "kernelet")] _scheduling_guard: super::SchedulingGuard,
+) where
     F: FnMut(&mut dyn LocalRunQueue) -> ReschedAction,
 {
     // Even if the decision below is `DoNothing`, we should clear this flag. Meanwhile, to avoid
@@ -738,6 +746,7 @@ mod test {
 
     use super::*;
 
+    #[cfg(feature = "kernelet")]
     #[ktest]
     fn preemption_waits_for_scheduler_decision() {
         assert!(!super::super::scheduling_in_progress());
@@ -764,6 +773,130 @@ mod test {
         assert!(!super::super::scheduling_in_progress());
     }
 
+    #[cfg(feature = "kernelet-host")]
+    #[ktest]
+    fn host_preempt_guard_drop_keeps_pending_request() {
+        // FIFO workers run on the BSP. One CPU excludes remote progress.
+        if crate::cpu::num_cpus() != 1 {
+            crate::early_println!("skipping Host guard-drop test: requires one CPU");
+            return;
+        }
+        assert!(Task::current().is_some());
+        assert!(crate::arch::irq::is_local_enabled());
+        assert_eq!(cpu_local::get_guard_count(), 0);
+
+        for _ in 0..8 {
+            let ran = Arc::new(AtomicBool::new(false));
+            let worker_ran = ran.clone();
+            let preempt_guard = disable_preempt();
+            let worker = crate::task::TaskOptions::new(move || {
+                worker_ran.store(true, Ordering::Release);
+            })
+            .spawn()
+            .unwrap();
+
+            let irq_enabled_at_drop = crate::arch::irq::is_local_enabled();
+            let before = crate::timer::Jiffies::elapsed().as_u64();
+            cpu_local::set_need_preempt();
+            drop(preempt_guard);
+            let irq_guard = crate::irq::disable_local();
+            let after = crate::timer::Jiffies::elapsed().as_u64();
+            let ran_at_drop = ran.load(Ordering::Acquire);
+            let pending_at_drop = cpu_local::need_preempt();
+            // IRQ enable remains a scheduling point. Remove only this test's
+            // request before restoring IRQs so explicit yield cleans up below.
+            cpu_local::clear_need_preempt();
+            drop(irq_guard);
+
+            for _ in 0..16 {
+                Task::yield_now();
+                if ran.load(Ordering::Acquire) {
+                    break;
+                }
+            }
+            let completed = ran.load(Ordering::Acquire);
+            drop(worker);
+            assert!(
+                completed,
+                "Host worker did not complete after explicit yields"
+            );
+            assert!(
+                irq_enabled_at_drop,
+                "Host guard drop did not run with IRQs enabled"
+            );
+
+            // A timer IRQ may independently schedule after Drop. Retry such
+            // windows after cleanup rather than attributing that switch to Drop.
+            if before != after {
+                continue;
+            }
+            assert!(
+                !ran_at_drop,
+                "Host preemption guard drop ran a worker before explicit yield"
+            );
+            assert!(
+                pending_at_drop,
+                "Host preemption guard drop consumed pending request"
+            );
+            return;
+        }
+        panic!("Host guard-drop test could not observe a window without a timer IRQ");
+    }
+
+    #[cfg(feature = "kernelet-host")]
+    #[ktest]
+    fn host_timer_irq_keeps_native_pending_request() {
+        if crate::cpu::num_cpus() != 1 {
+            crate::early_println!("skipping Host IRQ-return test: requires one CPU");
+            return;
+        }
+        assert!(crate::arch::irq::is_local_enabled());
+        let ran = Arc::new(AtomicBool::new(false));
+        let worker_ran = ran.clone();
+        let preempt_guard = disable_preempt();
+        let worker = crate::task::TaskOptions::new(move || {
+            worker_ran.store(true, Ordering::Release);
+        })
+        .spawn()
+        .unwrap();
+        cpu_local::set_need_preempt();
+        drop(preempt_guard);
+
+        // Exercise physical timer IRQ returns, without yielding or toggling
+        // IRQs in this ordinary Host Task. The FIFO worker must stay queued.
+        let start = crate::timer::Jiffies::elapsed().as_u64();
+        while crate::timer::Jiffies::elapsed()
+            .as_u64()
+            .saturating_sub(start)
+            < 3
+        {
+            core::hint::spin_loop();
+        }
+        let irq_guard = crate::irq::disable_local();
+        let ran_on_irq_return = ran.load(Ordering::Acquire);
+        let pending_on_irq_return = cpu_local::need_preempt();
+        cpu_local::clear_need_preempt();
+        drop(irq_guard);
+
+        // Clean up real queued work before asserting either boundary.
+        for _ in 0..16 {
+            Task::yield_now();
+            if ran.load(Ordering::Acquire) {
+                break;
+            }
+        }
+        assert!(ran.load(Ordering::Acquire), "Host worker did not complete");
+        drop(worker);
+        assert!(
+            !ran_on_irq_return,
+            "ordinary Host timer IRQ return ran a queued worker"
+        );
+        assert!(
+            pending_on_irq_return,
+            "ordinary Host timer IRQ return consumed pending preemption"
+        );
+    }
+
     #[cfg(not(any(feature = "kernelet-host", feature = "kernelet")))]
     #[ktest]
     fn native_pending_preempt_waits_for_explicit_yield() {
@@ -777,7 +910,6 @@ mod test {
         }
         assert!(Task::current().is_some());
         assert!(crate::arch::irq::is_local_enabled());
-        assert!(!super::super::scheduling_in_progress());
 
         fn observe_boundary(reenable_irqs: bool) -> bool {
             let ran = Arc::new(AtomicBool::new(false));
@@ -844,7 +976,6 @@ mod test {
         impl Drop for YieldOnDrop {
             fn drop(&mut self) {
                 assert!(crate::arch::irq::is_local_enabled());
-                assert!(!crate::task::scheduling_in_progress());
                 Task::yield_now();
                 self.0.store(true, Ordering::Release);
             }

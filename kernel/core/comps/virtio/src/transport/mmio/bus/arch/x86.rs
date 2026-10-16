@@ -4,9 +4,9 @@ use alloc::vec::Vec;
 use core::ops::Range;
 
 use aster_cmdline::types::MmioDevice;
-pub(super) use ostd::arch::irq::MappedIrqLine;
 #[cfg(not(feature = "kernelet"))]
 use ostd::arch::irq::IRQ_CHIP;
+pub(super) use ostd::arch::irq::MappedIrqLine;
 use ostd::{debug, info, io::IoMem, irq::IrqLine, warn};
 use spin::Once;
 
@@ -114,7 +114,9 @@ fn try_register_mmio_device(
     #[cfg(feature = "kernelet")]
     let mapped_irq_line = u8::try_from(gsi_index)
         .map_err(|_| MmioRegisterError::IrqUnavailable)
-        .and_then(|irq| IrqLine::alloc_specific(irq).map_err(|_| MmioRegisterError::IrqUnavailable))?;
+        .and_then(|irq| {
+            IrqLine::alloc_specific(irq).map_err(|_| MmioRegisterError::IrqUnavailable)
+        })?;
 
     #[cfg(not(feature = "kernelet"))]
     let mapped_irq_line = if let Ok(irq_line) = IrqLine::alloc()

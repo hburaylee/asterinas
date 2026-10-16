@@ -55,10 +55,13 @@ fn post_schedule_handler() {
             return;
         }
     }
-    if let Some(vmar) = task.as_kernel_thread().and_then(|thread| thread.vmar()) {
-        vmar.vm_space().activate();
+    if let Some(vm_space) = task.as_kernel_thread().and_then(|thread| thread.vm_space()) {
+        vm_space.activate();
         return;
     }
+    // Native kernel-only threads retain the upstream address-space behavior.
+    // Leaving a carrier already installs the Host root at its own boundary.
+    #[cfg(feature = "kernelet")]
     ostd::mm::VmSpace::deactivate();
 }
 

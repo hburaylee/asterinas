@@ -47,6 +47,16 @@ const FXRSTOR_FUNCTIONS: &[&str] = &[
     "<aster_core::process::posix_thread::cpu_sync::CpuSync<ostd::arch::cpu::context::FpuContext>>::before_user_exec",
     "<aster_core::process::posix_thread::thread_local::SuppUserContext>::before_user_exec",
 ];
+// ThinLTO may inline the fixed inactive-GS write through the user-state hooks.
+// Each exception still requires an immediately preceding MOV of the one MSR
+// number; the name alone never authorizes WRMSR.
+const GS_BASE_FUNCTIONS: &[&str] = &[
+    "<ostd::arch::cpu::context::GsBase>::load",
+    "<ostd::arch::cpu::context::GsBase>::load_inactive",
+    "<aster_core::process::posix_thread::cpu_sync::CpuSync<ostd::arch::cpu::context::GsBase>>::before_user_exec",
+    "<aster_core::process::posix_thread::thread_local::SuppUserContext>::before_user_exec",
+    "<aster_core::context::Context as ostd::user::UserModeHooks>::pre_user_run",
+];
 const XSAVE_FUNCTION: &str = "core::core_arch::x86_64::xsave::_xsave64";
 const XRSTOR_FUNCTION: &str = "core::core_arch::x86_64::xsave::_xrstor64";
 
@@ -236,13 +246,18 @@ fn allowed_name(name: &str) -> bool {
     XGETBV_FUNCTIONS.contains(&name)
         || FXSAVE_FUNCTIONS.contains(&name)
         || FXRSTOR_FUNCTIONS.contains(&name)
+        || GS_BASE_FUNCTIONS.contains(&name)
         || [XSAVE_FUNCTION, XRSTOR_FUNCTION, "virq_entry", "yield_entry"].contains(&name)
 }
 
 fn changes_host_control(instruction: &Instruction<'_>) -> bool {
     matches!(
         instruction.mnemonic,
-        "cli"
+        "wrmsr"
+            | "wrmsrns"
+            | "wrmsrlist"
+            | "invpcid"
+            | "cli"
             | "sti"
             | "hlt"
             | "iret"
@@ -305,6 +320,14 @@ fn changes_host_control(instruction: &Instruction<'_>) -> bool {
         .next()
         .unwrap_or_default()
         .contains("%dr")
+        || instruction
+            .operands
+            .split('#')
+            .next()
+            .unwrap_or_default()
+            .rsplit(',')
+            .next()
+            .is_some_and(|destination| destination.trim().starts_with("%cr"))
 }
 
 // The only Image paths that change physical IF/return across a privilege
@@ -514,6 +537,7 @@ fn check_instructions(
 ) -> Result<(), String> {
     let registers = Regex::new(r"%(?:st\b|mm[0-7]\b|[xyz]mm[0-9]+\b|k[0-7]\b|tmm[0-7]\b)").unwrap();
     let mut offset = 0usize;
+    let mut previous: Option<(u64, Vec<u8>)> = None;
     for line in output.lines() {
         let Some(instruction) = instruction(line)? else {
             continue;
@@ -529,6 +553,7 @@ fn check_instructions(
                 instruction.address
             ));
         }
+        let preceding = previous.replace((instruction.address, instruction.bytes.clone()));
         offset = stop;
         if padding {
             if !instruction.bytes.iter().all(|byte| *byte == 0)
@@ -570,6 +595,18 @@ fn check_instructions(
         }
         let name = function.name.as_str();
         if host_control {
+            let fixed_user_gs_write = instruction.mnemonic == "wrmsr"
+                && instruction.bytes == [0x0f, 0x30]
+                && operands.is_empty()
+                && GS_BASE_FUNCTIONS.contains(&name)
+                && preceding.as_ref().is_some_and(|(address, bytes)| {
+                    *address >= function.start
+                        && bytes == &[0xb9, 0x02, 0x01, 0x00, 0xc0]
+                        && *address + bytes.len() as u64 == instruction.address
+                });
+            if fixed_user_gs_write {
+                continue;
+            }
             if !matches!(instruction.mnemonic, "cli" | "sti" | "iretq")
                 || !is_fixed_return_stub(function, start, bytes)
             {
@@ -626,6 +663,52 @@ mod tests {
                 let error = audit_function(name, code, code.len() as u64).unwrap_err();
                 assert!(error.contains("forbidden"), "{error}");
             }
+        }
+    }
+
+    #[test]
+    fn ordinary_code_cannot_write_control_registers_or_msrs() {
+        for code in [
+            &[0x0f, 0x22, 0xd8][..], // MOV RAX -> CR3
+            &[0x0f, 0x30][..],       // WRMSR
+            &[0xb9, 0x02, 0x01, 0x00, 0xc0, 0x0f, 0x30][..],
+        ] {
+            let error = audit_function("ordinary::code", code, code.len() as u64).unwrap_err();
+            assert!(error.contains("forbidden"), "{error}");
+        }
+    }
+
+    #[test]
+    fn user_gs_write_requires_the_fixed_msr_and_adjacent_sequence() {
+        let accepted = [0xb9, 0x02, 0x01, 0x00, 0xc0, 0x0f, 0x30];
+        for name in GS_BASE_FUNCTIONS {
+            assert_eq!(
+                audit_function(name, &accepted, accepted.len() as u64),
+                Ok(())
+            );
+            for code in [
+                &[0x0f, 0x30][..],
+                &[0xb9, 0x01, 0x01, 0x00, 0xc0, 0x0f, 0x30][..],
+                &[0xb9, 0x02, 0x01, 0x00, 0xc0, 0x31, 0xc9, 0x0f, 0x30][..],
+                &[0xb9, 0x02, 0x01, 0x00, 0xc0, 0x90, 0x0f, 0x30][..],
+                &[0x0f, 0x22, 0xd8][..],
+            ] {
+                assert!(audit_function(name, code, code.len() as u64).is_err());
+            }
+        }
+    }
+
+    #[test]
+    fn image_local_invlpg_and_fsbase_access_remain_allowed() {
+        for code in [
+            &[0x0f, 0x01, 0x3f][..],             // INVLPG (%rdi)
+            &[0xf3, 0x48, 0x0f, 0xae, 0xc0][..], // RDFSBASE %rax
+            &[0xf3, 0x48, 0x0f, 0xae, 0xd0][..], // WRFSBASE %rax
+        ] {
+            assert_eq!(
+                audit_function("ordinary::code", code, code.len() as u64),
+                Ok(())
+            );
         }
     }
 

@@ -98,3 +98,25 @@ Asterinas OSDK is developed as a sub-project of [Asterinas](https://github.com/a
 #### Note for Visual Studio Code users
 
 To enable advanced features of the editor on OSDK, please open the Asterinas repository as a workspace using the `File > Open Workspace from File...` menu entry, and select the file `.code-workspace` in the Asterinas repository root as the configuration.
+
+### Paired Kernelet build inputs
+
+With `--kernelet`, OSDK captures the workspace (including uncommitted source)
+plus its resolved dependency sources before building either Image or Host.
+The dependency snapshot also covers plain default-feature metadata queries
+issued by kernel proc macros during a build with default features disabled.
+Both compilers use this same private snapshot and an offline Cargo source cache.
+Relative dependencies between local workspaces retain their directory layout;
+absolute local dependency paths are redirected into the snapshot. The generated
+entry crates and final bundle remain in the requested output directory.
+
+Snapshots live in `<Cargo target directory>/osdk-inputs/<input digest>`. OSDK
+reuses a snapshot only after checking its source digest, and checks dependencies
+before each build to reject paths back into live source. Cargo index and lock
+bookkeeping remain writable; copied source files are read-only. The first build
+at a new snapshot path can recompile dependencies. This protects paired builds
+against concurrent checkout/cache edits; it does not sandbox build scripts or
+freeze the compiler, native tools, environment, or arbitrary files read by a
+build script. Source replacements that resolve outside the workspace and Cargo
+home are rejected. Use explicit local path dependencies for such sources so
+that OSDK can capture their workspaces.

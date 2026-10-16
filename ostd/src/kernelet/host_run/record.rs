@@ -45,12 +45,12 @@ pub(super) unsafe fn read<'a>(
     }
     let start = ptr.addr();
     let end = start.checked_add(bytes.len()).ok_or(-abi::INVALID)?;
-    let in_image = start >= state.image_start && end <= state.image_end;
-    let in_stack = state.execution.stacks.lock().contains_range(start, end);
-    let in_grant = start
-        .checked_sub(crate::mm::kspace::LINEAR_MAPPING_BASE_VADDR)
-        .is_some_and(|paddr| state.guest_memory.owns_range(paddr as u64, bytes.len()));
-    if !in_image && !in_stack && !in_grant {
+    let owned = (start >= state.image_start && end <= state.image_end)
+        || state.execution.contains_stack_range(start, end)
+        || start
+            .checked_sub(crate::mm::kspace::LINEAR_MAPPING_BASE_VADDR)
+            .is_some_and(|paddr| state.guest_memory.owns_range(paddr as u64, bytes.len()));
+    if !owned {
         return Err(-abi::INVALID);
     }
     // SAFETY: Ownership is pinned above; the caller supplies the shared-byte

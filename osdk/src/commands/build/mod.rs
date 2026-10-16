@@ -95,14 +95,28 @@ pub fn create_base_and_cached_build(
             );
             process::exit(Errno::BuildCrate as _);
         });
-    // One OSDK invocation builds the kernelet image first and the host image
-    // second, embedding the kernelet image's bytes into the host image.
+    // Freeze both source and Cargo dependencies before either compiler runs.
+    // The output paths remain the caller's original paths.
+    let snapshot = kernelet::capture_build_if_requested(
+        config,
+        action,
+        &target_crate,
+        cargo_target_directory.as_ref(),
+        osdk_output_directory.as_ref(),
+    );
+    let target_crate = snapshot
+        .as_ref()
+        .map_or(target_crate.clone(), |inputs| inputs.target().clone());
+    let _source_dir = snapshot
+        .as_ref()
+        .map(|inputs| DirGuard::change_dir(inputs.workspace()));
     let kernelet_image = kernelet::build_image_if_requested(
         config,
         action,
         &target_crate,
         osdk_output_directory.as_ref(),
         cargo_target_directory.as_ref(),
+        snapshot.as_ref().map(|inputs| inputs.cargo_home()),
     );
     let base_crate_path = new_base_crate(
         match action {
@@ -187,12 +201,21 @@ pub fn do_cached_build(
             process::exit(Errno::Cli as _);
         }
     };
+    let override_configs = kernelet::host_overrides(kernelet_image, &build.override_configs);
+    if let Some(image) = kernelet_image {
+        kernelet::validate_host_dependencies(
+            image,
+            &features,
+            build.no_default_features,
+            &override_configs,
+        );
+    }
     let aster_elf = build_kernel_elf(
         config.target_arch,
         &build.profile,
         &features,
         build.no_default_features,
-        &build.override_configs[..],
+        &override_configs,
         &cargo_target_directory,
         &rustflags,
         &extra_envs,

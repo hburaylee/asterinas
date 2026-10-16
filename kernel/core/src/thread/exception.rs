@@ -69,6 +69,8 @@ fn generate_fault_signal(exception: CpuException, ctx: &Context, user_ctx: &User
 }
 
 pub(super) fn page_fault_handler(info: &CpuException) -> Result<(), ()> {
+    #[cfg(all(ktest, not(feature = "kernelet")))]
+    fault_test::record();
     let task = Task::current().unwrap();
     let page_fault_info = info.try_into().unwrap();
 
@@ -97,11 +99,15 @@ pub(crate) mod fault_test {
 
     static PAGE_FAULTS: AtomicUsize = AtomicUsize::new(0);
 
+    pub(super) fn record() {
+        PAGE_FAULTS.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn count() -> usize {
-        ostd::mm::fault::inject_user_page_fault_handler(|_| {
-            PAGE_FAULTS.fetch_add(1, Ordering::Relaxed);
-            Err(())
-        });
+        // Registration is one-shot. Whichever test initializes it first must
+        // install the real resolver, so later associated-VMAR tests can fault
+        // in pages instead of inheriting a permanent reject-all test handler.
+        ostd::mm::fault::inject_user_page_fault_handler(super::page_fault_handler);
         PAGE_FAULTS.load(Ordering::Relaxed)
     }
 }

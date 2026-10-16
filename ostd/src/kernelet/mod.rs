@@ -15,10 +15,12 @@
 pub mod abi;
 #[cfg(feature = "kernelet-host")]
 pub(crate) mod account;
+#[cfg(feature = "kernelet-host")]
+mod deadline;
 #[cfg(any(feature = "kernelet", feature = "kernelet-host", ktest))]
 pub(crate) mod dma;
 
-#[cfg(feature = "kernelet-host")]
+#[cfg(any(feature = "kernelet", feature = "kernelet-host"))]
 pub(crate) mod clock;
 
 #[cfg(feature = "kernelet-host")]

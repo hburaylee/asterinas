@@ -3,6 +3,7 @@
 use alloc::sync::Arc;
 
 use aster_bigtcp::packet::{RxBuffer, TxBuffer};
+use aster_block::bio::BioBuffer;
 use aster_util::mem_obj_slice::Slice;
 use dma_pool::{DmaBuffer, DmaSegment};
 use ostd::mm::{
@@ -64,6 +65,12 @@ impl<D: DmaDirection> DmaBuf for DmaSegment<D> {
 }
 
 impl<D: DmaDirection> DmaBuf for Slice<DmaBuffer<D>> {
+    fn len(&self) -> usize {
+        self.size()
+    }
+}
+
+impl DmaBuf for Slice<BioBuffer> {
     fn len(&self) -> usize {
         self.size()
     }

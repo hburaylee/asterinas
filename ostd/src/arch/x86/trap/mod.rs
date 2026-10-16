@@ -229,17 +229,6 @@ unsafe extern "sysv64" fn trap_handler(f: &mut TrapFrame) {
             );
         }
     }
-    // Host carriers need a physical scheduling point after interrupt levels
-    // and callback guards have unwound. Host-off retains upstream boundaries.
-    #[cfg(feature = "kernelet-host")]
-    if f.trap_num >= 32
-        && was_irq_enabled
-        && crate::irq::InterruptLevel::current().is_task_context()
-    {
-        enable_local();
-        crate::task::scheduler::might_preempt();
-        disable_local();
-    }
     #[cfg(feature = "kernelet-host")]
     crate::kernelet::host_run::finish_image_trap(f);
 }

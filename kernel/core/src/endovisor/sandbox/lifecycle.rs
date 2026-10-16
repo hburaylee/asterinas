@@ -19,9 +19,9 @@ use super::{
 };
 use crate::{
     endovisor::{
-        placement::CpuReservation, policy::Admission, reaper, virtio_block::VirtioBlock,
-        virtio_console::VirtioConsole, virtio_net::VirtioNet, virtio_rng::VirtioRng,
-        virtio_vsock::VirtioVsock, vsock_switch,
+        placement::CpuReservation, policy::Admission, reaper, scheduling::ExecutionThreads,
+        virtio_block::VirtioBlock, virtio_console::VirtioConsole, virtio_net::VirtioNet,
+        virtio_rng::VirtioRng, virtio_vsock::VirtioVsock, vsock_switch,
     },
     events::IoEvents,
     prelude::*,
@@ -171,7 +171,7 @@ impl SandboxFile {
             .devices
             .get()
             .unwrap()
-            .for_each(|device| device.start_worker());
+            .for_each(|device| device.start_worker(&hooks.execution));
         let kill = {
             let mut state = self.state.lock();
             let kill = match &*state {
@@ -284,7 +284,10 @@ impl SandboxFile {
             _endpoint_reservations: pending.endpoint_reservations.clone(),
             admission: admission.clone(),
             _placement: placement,
-            carriers: SpinLock::new(Vec::new()),
+            execution: ExecutionThreads::new(pending.budget.nice, pending.num_vcpus, devices.len())
+                .map_err(|_| {
+                    Error::with_message(Errno::EINVAL, "invalid execution thread policy")
+                })?,
         });
         let kernelet = kind
             .create(&config, hooks.clone())
@@ -387,21 +390,16 @@ impl SandboxFile {
         let live = {
             let mut state = self.state.lock();
             match &mut *state {
-                SandboxState::Configuring(pending) => {
-                    let console = pending.console.clone();
-                    let net = pending.net.clone();
-                    let log = pending.log.clone();
-                    *state = SandboxState::Gone(killed_status(reason));
+                SandboxState::Configuring(_) => {
+                    let previous =
+                        core::mem::replace(&mut *state, SandboxState::Gone(killed_status(reason)));
+                    let SandboxState::Configuring(pending) = previous else {
+                        unreachable!();
+                    };
                     drop(state);
-                    if let Some(console) = console {
-                        console.revoke();
-                    }
-                    if let Some(net) = net {
-                        net.revoke();
-                    }
-                    if let Some(log) = log {
-                        log.revoke();
-                    }
+                    // Revoke storage before dropping its reservation guards.
+                    pending.revoke_endpoints();
+                    drop(pending);
                     vsock_switch::on_dying(self.cid);
                     self.pollee.notify(IoEvents::IN);
                     return Ok(());
@@ -569,6 +567,62 @@ mod tests {
                 SandboxState::Starting { kill: Some(_) }
             )
         });
+    }
+
+    #[ktest]
+    fn configuring_cleanup_revokes_log_before_releasing_reservation() {
+        use crate::{
+            endovisor::{
+                log_endpoint::LogEndpoint,
+                policy::{PrestartEndpointReservation, endpoint_bytes_for_test},
+            },
+            fs::file::FileLike,
+        };
+
+        for kill_first in [false, true] {
+            let mut sandbox = sandbox();
+            Arc::get_mut(&mut sandbox).unwrap().owner = crate::process::Uid::new(52_001);
+            let endpoint = LogEndpoint::new();
+            let file = endpoint.file();
+            let reservation = Arc::new(
+                PrestartEndpointReservation::reserve(
+                    sandbox.owner,
+                    endpoint.reservation_bytes(),
+                    #[cfg(kernelet_nat_failure_diag_host)]
+                    crate::endovisor::policy::QuotaTag::new(
+                        crate::endovisor::policy::QuotaClass::LogFixed,
+                        Some(sandbox.cid),
+                    ),
+                )
+                .unwrap(),
+            );
+            let reservation_ref = Arc::downgrade(&reservation);
+            assert_eq!(
+                endpoint_bytes_for_test(sandbox.owner),
+                endpoint.reservation_bytes()
+            );
+            {
+                let mut state = sandbox.state.lock();
+                let SandboxState::Configuring(pending) = &mut *state else {
+                    unreachable!();
+                };
+                pending.log = Some(endpoint.clone());
+                pending.endpoint_reservations.push(reservation);
+            }
+            assert!(endpoint.push(1, "test", "queued"));
+            if kill_first {
+                sandbox.kill(23).unwrap();
+            } else {
+                sandbox.destroy().unwrap();
+            }
+            assert!(reservation_ref.upgrade().is_none());
+            assert_eq!(endpoint_bytes_for_test(sandbox.owner), 0);
+            let mut buffer = [0; 256];
+            let mut writer = VmWriter::from(buffer.as_mut_slice()).to_fallible();
+            assert_eq!(file.read(&mut writer).unwrap(), 0);
+            assert!(!endpoint.push(1, "test", "closed"));
+            sandbox.destroy().unwrap();
+        }
     }
 
     #[ktest]

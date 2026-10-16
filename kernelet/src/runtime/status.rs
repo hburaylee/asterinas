@@ -40,7 +40,7 @@ pub(crate) struct InstanceStatus {
     reason: ExitReason,
     code: u32,
     uptime_ns: u64,
-    cpu_time_ns: u64,
+    cpu_time_ns: Option<u64>,
     #[serde(with = "address")]
     fault_addr: u64,
     #[serde(with = "address")]
@@ -86,7 +86,8 @@ impl InstanceStatus {
             reason,
             code: raw.code,
             uptime_ns: raw.uptime_ns,
-            cpu_time_ns: raw.cpu_time_ns,
+            cpu_time_ns: (raw.cpu_time_ns != kernelet_abi::STATS_UNAVAILABLE)
+                .then_some(raw.cpu_time_ns),
             fault_addr: raw.fault_addr,
             fault_ip: raw.fault_ip,
             message: std::str::from_utf8(&raw.message[..length])
@@ -162,6 +163,15 @@ mod address {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unavailable_cpu_time_serializes_as_null() {
+        let mut snapshot = raw(uapi::STATE_RUNNING, uapi::STATUS_REASON_NONE);
+        snapshot.cpu_time_ns = kernelet_abi::STATS_UNAVAILABLE;
+        let status = InstanceStatus::from_raw(snapshot).unwrap();
+        assert!(status.cpu_time_ns.is_none());
+        assert!(serde_json::to_value(status).unwrap()["cpu_time_ns"].is_null());
+    }
 
     fn raw(state: u32, reason: u32) -> uapi::StatusRaw {
         uapi::StatusRaw {

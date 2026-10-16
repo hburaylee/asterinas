@@ -458,16 +458,12 @@ impl UserContextApiInternal for UserContext {
 
             #[cfg(not(feature = "kernelet"))]
             {
-                self.user_context.run(guard);
-                #[cfg(feature = "kernelet-host")]
+                let fault_addr = self.user_context.run(guard);
                 let exception = CpuException::from_raw(
                     self.user_context.trap_num,
                     self.user_context.error_code,
-                    self.user_context.fault_addr,
+                    fault_addr,
                 );
-                #[cfg(not(feature = "kernelet-host"))]
-                let exception =
-                    CpuException::new(self.user_context.trap_num, self.user_context.error_code);
                 match exception {
                     #[cfg(feature = "cvm_guest")]
                     Some(CpuException::VirtualizationException) => {
@@ -708,6 +704,9 @@ impl FpuContext {
     }
 
     /// Saves CPU's current FPU context to this instance.
+    // Keep Image state instructions in the wrapper recognized by the artifact
+    // audit, independent of ThinLTO's caller-dependent inlining decisions.
+    #[cfg_attr(feature = "kernelet", inline(never))]
     pub fn save(&mut self) {
         let mem_addr = self.as_bytes_mut().as_mut_ptr();
 
@@ -729,6 +728,7 @@ impl FpuContext {
     }
 
     /// Loads CPU's FPU context from this instance.
+    #[cfg_attr(feature = "kernelet", inline(never))]
     pub fn load(&self) {
         let mem_addr = self.as_bytes().as_ptr();
 

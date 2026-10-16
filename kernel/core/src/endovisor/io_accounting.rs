@@ -9,7 +9,7 @@ use ostd::kernelet::control::Kernelet;
 #[cfg(kernelet_rq1_diagnostics)]
 use ostd::task::{CpuTimeMeasurement, Task};
 
-/// A breakdown of work already included in carrier or adopted-Task CPU time.
+/// Categories of optional device-work CPU observations.
 #[derive(Clone, Copy)]
 pub(super) enum WorkCategory {
     Completion,
@@ -19,10 +19,8 @@ pub(super) enum WorkCategory {
 /// Attributes one synchronous region to its device or receiving instance.
 ///
 /// Task execution measurements exclude descheduling, including preemption
-/// during large receive copies. These counters describe work; they do not
-/// add the same execution to the instance's aggregate quota a second time.
-/// Ordinary builds retain only a zero-sized guard; aggregate Task accounting
-/// and quota enforcement are independent of this diagnostic breakdown.
+/// during large receive copies. These counters describe work and do not
+/// control scheduling. Ordinary builds retain only a zero-sized guard.
 pub(super) struct ChargedSpan<'a> {
     #[cfg(kernelet_rq1_diagnostics)]
     kernelet: &'a Kernelet,

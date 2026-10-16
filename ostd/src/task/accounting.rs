@@ -1,243 +1,21 @@
 // SPDX-License-Identifier: MPL-2.0
 
-//! Optional runtime accounting attached to a native Task.
+//! Execution and deadline clocks, with optional explicit CPU measurements.
 
-use alloc::sync::Arc;
-#[cfg(any(feature = "kernelet-host", ktest))]
-use core::fmt::Debug;
-#[cfg(feature = "kernelet-host")]
-use core::sync::atomic::AtomicUsize;
-use core::{
-    sync::atomic::{AtomicBool, Ordering},
-    time::Duration,
-};
+#[cfg(feature = "kernelet")]
+use core::sync::atomic::Ordering;
 
-use crate::sync::{LocalIrqDisabled, SpinLock};
-
-/// An account receives only time that its Task actually executes on a CPU.
-/// The callback runs with IRQs disabled and must not sleep or schedule.
-#[cfg(any(feature = "kernelet-host", ktest))]
-pub(crate) trait CpuTimeAccount: Send + Sync + Debug {
-    fn charge(&self, nanoseconds: u64);
-    fn owner(&self) -> usize;
-}
-
-#[derive(Debug)]
-struct State {
-    #[cfg(any(feature = "kernelet-host", ktest))]
-    account: Option<Arc<dyn CpuTimeAccount>>,
-    started: Option<u64>,
-    elapsed_ns: u64,
-    measurements: u32,
-}
-
-impl State {
-    fn sample(&mut self, now: u64) {
-        if let Some(previous) = self.started.take() {
-            let elapsed = now.saturating_sub(previous);
-            self.elapsed_ns = self.elapsed_ns.saturating_add(elapsed);
-            #[cfg(any(feature = "kernelet-host", ktest))]
-            if let Some(account) = &self.account {
-                account.charge(elapsed);
-            }
-        }
-    }
-
-    fn enabled(&self) -> bool {
-        #[cfg(any(feature = "kernelet-host", ktest))]
-        if self.account.is_some() {
-            return true;
-        }
-        self.measurements != 0
-    }
-}
-
-/// A measurement of the current Task's CPU execution across preemption.
-///
-/// Sleeping and time spent running other Tasks are excluded. IRQ handling is
-/// included, consistently with the native Task's instance CPU account.
-#[must_use]
-pub struct CpuTimeMeasurement {
-    task: Arc<super::Task>,
-    started: u64,
-}
-
-impl !Send for CpuTimeMeasurement {}
-impl !Sync for CpuTimeMeasurement {}
-
-impl CpuTimeMeasurement {
-    pub(super) fn start(task: Arc<super::Task>) -> Self {
-        let started = task.accounting.begin_measurement();
-        Self { task, started }
-    }
-
-    /// Returns the CPU time elapsed so far, without ending the measurement.
-    pub fn elapsed(&self) -> Duration {
-        let mut state = self.task.accounting.state.lock();
-        let now = runtime_ns();
-        state.sample(now);
-        state.started = Some(now);
-        Duration::from_nanos(state.elapsed_ns.saturating_sub(self.started))
-    }
-}
-
-impl Drop for CpuTimeMeasurement {
-    fn drop(&mut self) {
-        self.task.accounting.end_measurement();
-    }
-}
-
-#[derive(Debug)]
-pub(super) struct TaskAccounting {
-    enabled: AtomicBool,
-    #[cfg(feature = "kernelet-host")]
-    carrier_context: AtomicUsize,
-    state: SpinLock<State, LocalIrqDisabled>,
-}
-
-impl TaskAccounting {
-    pub(super) fn new() -> Self {
-        Self {
-            enabled: AtomicBool::new(false),
-            #[cfg(feature = "kernelet-host")]
-            carrier_context: AtomicUsize::new(0),
-            state: SpinLock::new(State {
-                #[cfg(any(feature = "kernelet-host", ktest))]
-                account: None,
-                started: None,
-                elapsed_ns: 0,
-                measurements: 0,
-            }),
-        }
-    }
-
-    #[cfg(any(feature = "kernelet-host", ktest))]
-    pub(super) fn attach(&self, account: Arc<dyn CpuTimeAccount>) -> crate::Result<()> {
-        let mut state = self.state.lock();
-        if state.account.is_some() {
-            return Err(crate::Error::InvalidArgs);
-        }
-        let now = runtime_ns();
-        state.sample(now);
-        state.account = Some(account);
-        state.started = Some(now);
-        self.enabled.store(true, Ordering::Release);
-        Ok(())
-    }
-
-    #[cfg(any(feature = "kernelet-host", ktest))]
-    pub(super) fn detach(&self, owner: Option<usize>) -> crate::Result<()> {
-        let _ = self.sample(false);
-        let account = {
-            let mut state = self.state.lock();
-            if let Some(owner) = owner
-                && state
-                    .account
-                    .as_ref()
-                    .is_none_or(|account| account.owner() != owner)
-            {
-                if state.enabled() {
-                    state.started = Some(runtime_ns());
-                }
-                return Err(crate::Error::AccessDenied);
-            }
-            let account = state.account.take();
-            self.enabled.store(state.enabled(), Ordering::Release);
-            if state.enabled() {
-                state.started = Some(runtime_ns());
-            }
-            account
-        };
-        // Account destruction can wake the instance reaper; never do it under
-        // the per-Task accounting lock.
-        drop(account);
-        Ok(())
-    }
-
-    pub(super) fn sample(&self, running: bool) -> Option<u64> {
-        if !self.enabled.load(Ordering::Acquire) {
-            return None;
-        }
-        let mut state = self.state.lock();
-        let ticks = runtime_ticks();
-        let now = ticks_to_ns(ticks);
-        state.sample(now);
-        if running {
-            state.started = Some(now);
-        }
-        Some(ticks)
-    }
-
-    #[cfg(any(feature = "kernelet-host", ktest))]
-    pub(super) fn sample_owned(&self, owner: usize) -> crate::Result<()> {
-        let mut state = self.state.lock();
-        if state
-            .account
-            .as_ref()
-            .is_none_or(|account| account.owner() != owner)
-        {
-            return Err(crate::Error::AccessDenied);
-        }
-        let now = runtime_ns();
-        state.sample(now);
-        state.started = Some(now);
-        Ok(())
-    }
-
-    #[cfg(feature = "kernelet-host")]
-    pub(super) fn pause(&self) {
-        // SAFETY: The scheduler masks IRQs and retains the outgoing current
-        // Task's pinned context until the native switch has completed.
-        unsafe {
-            crate::kernelet::host_run::pause_carrier_context(
-                self.carrier_context.load(Ordering::Acquire),
-            )
-        };
-    }
-
-    fn begin_measurement(&self) -> u64 {
-        let mut state = self.state.lock();
-        let now = runtime_ns();
-        state.sample(now);
-        state.measurements = state.measurements.checked_add(1).unwrap();
-        state.started = Some(now);
-        self.enabled.store(true, Ordering::Release);
-        state.elapsed_ns
-    }
-
-    fn end_measurement(&self) {
-        let mut state = self.state.lock();
-        let now = runtime_ns();
-        state.sample(now);
-        state.measurements -= 1;
-        if state.enabled() {
-            state.started = Some(now);
-        }
-        self.enabled.store(state.enabled(), Ordering::Release);
-    }
-
-    #[cfg(feature = "kernelet-host")]
-    pub(super) unsafe fn set_carrier_context(&self, address: usize) {
-        self.carrier_context.store(address, Ordering::Release);
-        // SAFETY: The caller retains this Task's pinned context until it clears the slot.
-        unsafe { crate::kernelet::host_run::restore_carrier_context(address) };
-    }
-
-    pub(super) fn resume(&self) {
-        #[cfg(feature = "kernelet-host")]
-        // SAFETY: The incoming Task retains its context; the scheduler masks IRQs.
-        unsafe {
-            crate::kernelet::host_run::restore_carrier_context(
-                self.carrier_context.load(Ordering::Acquire),
-            )
-        };
-        if self.enabled.load(Ordering::Acquire) {
-            self.state.lock().started = Some(runtime_ns());
-        }
-    }
-}
+#[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
+mod measurement;
+#[cfg(ktest)]
+pub(crate) use measurement::CpuTimeAccount;
+#[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
+pub use measurement::CpuTimeMeasurement;
+#[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
+pub(in crate::task) use measurement::TaskAccounting;
 
 /// The execution clock shared by scheduler deltas and Task accounting.
+#[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
 pub(super) fn runtime_ticks() -> u64 {
     #[cfg(feature = "kernelet")]
     {
@@ -262,80 +40,13 @@ fn ticks_to_ns(ticks: u64) -> u64 {
     ((u128::from(ticks) * 1_000_000_000) / u128::from(crate::arch::tsc_freq())) as u64
 }
 
+#[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
 fn runtime_ns() -> u64 {
     ticks_to_ns(runtime_ticks())
 }
 
-/// Host monotonic wall time for quota periods and deadlines.
+/// Host monotonic wall time for logging limits and cancellable deadlines.
 #[cfg(feature = "kernelet-host")]
 pub(crate) fn now_ns() -> u64 {
     ticks_to_ns(crate::arch::read_tsc())
-}
-
-#[cfg(ktest)]
-mod tests {
-    use core::sync::atomic::AtomicU64;
-
-    use super::*;
-    use crate::prelude::*;
-
-    #[derive(Debug, Default)]
-    struct Account(AtomicU64);
-
-    impl CpuTimeAccount for Account {
-        fn charge(&self, nanoseconds: u64) {
-            self.0.fetch_add(nanoseconds, Ordering::Relaxed);
-        }
-
-        fn owner(&self) -> usize {
-            0
-        }
-    }
-
-    #[ktest]
-    fn scheduler_clock_and_measurements_share_cpu_accounting() {
-        let _irq_guard = crate::irq::disable_local();
-        let task = crate::task::Task::current().unwrap();
-        let account = Arc::new(Account::default());
-        task.attach_cpu_account(account.clone()).unwrap();
-        let measurement = task.measure_cpu_time();
-
-        let first = crate::task::scheduler::runtime_ticks();
-        let charged_before = account.0.load(Ordering::Relaxed);
-        for _ in 0..1_000 {
-            core::hint::spin_loop();
-        }
-        let _elapsed = measurement.elapsed();
-        let second = crate::task::scheduler::runtime_ticks();
-        let charged_after = account.0.load(Ordering::Relaxed);
-
-        drop(measurement);
-        task.detach_cpu_account(0).unwrap();
-        assert!(second > first);
-        assert_eq!(
-            charged_after - charged_before,
-            ticks_to_ns(second) - ticks_to_ns(first)
-        );
-    }
-
-    #[ktest]
-    fn cpu_measurement_excludes_descheduling_and_does_not_charge_twice() {
-        let account = Arc::new(Account::default());
-        let mut state = State {
-            account: Some(account.clone()),
-            started: Some(100),
-            elapsed_ns: 0,
-            measurements: 1,
-        };
-        state.sample(110); // Switch out after ten nanoseconds of execution.
-        state.sample(1_000); // Another Task runs; there is no active interval.
-        state.started = Some(1_000); // Resume this Task.
-        state.sample(1_005); // Read an outer measurement.
-        state.started = Some(1_005);
-        state.sample(1_005); // A nested read must not charge it again.
-        state.started = Some(1_005);
-        state.sample(1_010);
-        assert_eq!(state.elapsed_ns, 20);
-        assert_eq!(account.0.load(Ordering::Relaxed), 20);
-    }
 }

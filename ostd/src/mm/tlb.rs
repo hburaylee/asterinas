@@ -11,11 +11,13 @@ use super::{
     PAGE_SIZE, Vaddr,
     frame::{Frame, meta::AnyFrameMeta},
 };
+#[cfg(not(feature = "kernelet"))]
+use crate::smp::IpiSender;
 use crate::{
     const_assert,
     cpu::{AtomicCpuSet, PinCurrentCpu},
     cpu_local,
-    smp::{IpiSender, PendingIpis},
+    smp::PendingIpis,
     sync::{LocalIrqDisabled, RcuDrop, SpinLock},
 };
 
@@ -26,6 +28,7 @@ pub struct TlbFlusher<'a, G: PinCurrentCpu> {
     target_cpus: &'a AtomicCpuSet,
     pending_ipis: PendingIpis,
     ops_stack: OpsStack,
+    #[cfg(not(feature = "kernelet"))]
     ipi_sender: Option<&'static IpiSender>,
     #[cfg(feature = "kernelet")]
     user_root: Option<&'a super::VmSpace>,
@@ -45,6 +48,7 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
             target_cpus,
             pending_ipis: PendingIpis::new_empty(),
             ops_stack: OpsStack::new(),
+            #[cfg(not(feature = "kernelet"))]
             ipi_sender: crate::smp::IPI_SENDER.get(),
             #[cfg(feature = "kernelet")]
             user_root: None,
@@ -142,6 +146,7 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
             need_flush_on_self = true;
         }
 
+        #[cfg(not(feature = "kernelet"))]
         if let Some(ipi_sender) = self.ipi_sender {
             for cpu in target_cpus.iter() {
                 let mut flush_ops = FLUSH_OPS.get_on_cpu(cpu).lock();
@@ -149,6 +154,19 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
             }
 
             let pending_ipis = ipi_sender.inter_processor_call(&target_cpus, do_remote_flush);
+            self.pending_ipis.extend(&pending_ipis);
+        }
+
+        #[cfg(feature = "kernelet")]
+        {
+            // Image kernel mappings use virtual CPU queues and Host kick
+            // services. User roots took the synchronous Host shootdown path
+            // above; neither path can access a physical APIC.
+            for cpu in target_cpus.iter() {
+                let mut flush_ops = FLUSH_OPS.get_on_cpu(cpu).lock();
+                flush_ops.push_from(&self.ops_stack);
+            }
+            let pending_ipis = crate::smp::inter_processor_call(&target_cpus, do_remote_flush);
             self.pending_ipis.extend(&pending_ipis);
         }
 
@@ -176,6 +194,13 @@ impl<'a, G: PinCurrentCpu> TlbFlusher<'a, G> {
     /// processed in IRQs, two CPUs may deadlock if they are waiting for each
     /// other's TLB coherence.
     pub fn sync_tlb_flush(&mut self) {
+        #[cfg(feature = "kernelet")]
+        if self.pending_ipis.is_empty() {
+            // User-root shootdowns are synchronous Host operations, and a
+            // self-only kernel flush has no virtual IPI to wait for.
+            return;
+        }
+        #[cfg(not(feature = "kernelet"))]
         if self.ipi_sender.is_none() {
             // We performed some TLB flushes in the boot context. The AP's boot
             // process should take care of them.
@@ -499,6 +524,20 @@ impl Drop for OpsStack {
 mod test {
     use super::{FLUSH_ALL_PAGES_THRESHOLD, OpsStack, PAGE_SIZE, TlbFlushOp};
     use crate::prelude::ktest;
+
+    #[cfg(feature = "kernelet")]
+    #[ktest]
+    fn kernel_range_flush_waits_for_virtual_cpu_acknowledgements() {
+        let targets = crate::cpu::AtomicCpuSet::new(crate::cpu::CpuSet::new_full());
+        let guard = crate::task::disable_preempt();
+        let mut flusher = super::TlbFlusher::new(&targets, guard);
+        // An unmapped canonical address is safe to invalidate. This takes the
+        // ordinary Image range path, rather than a registered-user-root service.
+        flusher.issue_tlb_flush(TlbFlushOp::for_single(0));
+        flusher.dispatch_tlb_flush();
+        flusher.sync_tlb_flush();
+        assert!(flusher.pending_ipis.is_empty());
+    }
 
     #[ktest]
     fn shootdown_preserves_empty_and_single_range() {

@@ -4,17 +4,19 @@
 
 use std::{
     collections::BTreeMap,
+    ffi::{CString, OsString},
     fs::{self, File, OpenOptions},
     io::{Read, Seek},
     os::{
         fd::{AsRawFd, FromRawFd},
         unix::{
-            ffi::OsStrExt,
+            ffi::{OsStrExt, OsStringExt},
             fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt},
         },
     },
     path::{Path, PathBuf},
     process::Command,
+    sync::Arc,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -41,7 +43,9 @@ pub fn build(
             continue;
         }
         let source = bundle.join(&mount.source).canonicalize()?;
-        if source.is_dir() {
+        let node = SourceNode::open(&source)?;
+        let metadata = node.file.metadata()?;
+        if metadata.is_dir() {
             ensure!(
                 mount.options.iter().any(|option| option == "ro"),
                 "read-write directory bind is unsupported"
@@ -53,15 +57,26 @@ pub fn build(
             mount.options.retain(|option| option != "bind");
             images.push(image);
         } else {
-            ensure!(source.is_file(), "bind source must be a file or directory");
-            bind_bytes += source.metadata()?.len();
+            ensure!(
+                metadata.is_file(),
+                "bind source must be a file or directory"
+            );
+            bind_bytes += metadata.len();
             ensure!(
                 bind_bytes <= (crate::protocol::MAX_MESSAGE_BYTES / 8) as u64,
                 "bind files exceed agent message limit"
             );
-            let metadata = source.metadata()?;
             mount.content_metadata = Some((metadata.mode(), metadata.uid(), metadata.gid()));
-            mount.content = Some(fs::read(source)?);
+            let mut content = Vec::new();
+            let limit = crate::protocol::MAX_MESSAGE_BYTES / 8;
+            File::open(node.fd_path())?
+                .take((limit + 1) as u64)
+                .read_to_end(&mut content)?;
+            ensure!(
+                content.len() as u64 == metadata.len(),
+                "bind file changed while reading"
+            );
+            mount.content = Some(content);
         }
     }
     Ok(images)
@@ -71,7 +86,12 @@ fn build_image(root: &Path, cache: &Path, agent: Option<&Path>, mke2fs: &Path) -
     fs::create_dir_all(cache)?;
     let mut digest = Sha256::new();
     digest.update(b"kernelet-rootfs-v2\0");
-    let bytes = hash_tree(root, root, &mut digest)?;
+    let source = SourceNode::open(root)?;
+    ensure!(
+        source.file.metadata()?.is_dir(),
+        "rootfs must be a directory"
+    );
+    let bytes = hash_tree_inner(&source, Path::new(""), &mut digest, &mut BTreeMap::new())?;
     let root_digest = digest.clone().finalize();
     if let Some(agent) = agent {
         digest.update(b"agent\0");
@@ -86,7 +106,7 @@ fn build_image(root: &Path, cache: &Path, agent: Option<&Path>, mke2fs: &Path) -
     fs::DirBuilder::new().mode(0o700).create(&work)?;
     let result = (|| {
         let staging = work.join("root");
-        copy_tree(root, &staging)?;
+        copy_tree_inner(&source, &staging, &mut BTreeMap::new())?;
         let mut copied_digest = Sha256::new();
         copied_digest.update(b"kernelet-rootfs-v2\0");
         hash_tree(&staging, &staging, &mut copied_digest)?;
@@ -199,18 +219,139 @@ fn build_image(root: &Path, cache: &Path, agent: Option<&Path>, mke2fs: &Path) -
     result
 }
 
+// Bind every source component before inspecting it. O_PATH avoids opening a
+// device/FIFO while discovering its type. The only followed magic links below
+// name our own live descriptors, never a source-provided symlink.
+struct SourceNode {
+    file: Arc<File>,
+    attribute_path: PathBuf,
+    _parent: Option<Arc<File>>,
+}
+
+impl SourceNode {
+    fn open(path: &Path) -> Result<Self> {
+        use std::path::Component;
+        let mut node = Self {
+            file: Arc::new(
+                OpenOptions::new()
+                    .read(true)
+                    .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC)
+                    .open(if path.is_absolute() { "/" } else { "." })?,
+            ),
+            attribute_path: PathBuf::new(),
+            _parent: None,
+        };
+        for component in path.components() {
+            match component {
+                Component::RootDir | Component::CurDir => {}
+                Component::Normal(name) => node = node.child(name)?,
+                _ => anyhow::bail!("source path must not contain parent traversal"),
+            }
+        }
+        Ok(node)
+    }
+
+    fn fd_path(&self) -> PathBuf {
+        PathBuf::from(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+    }
+
+    fn child(&self, name: &std::ffi::OsStr) -> Result<Self> {
+        ensure!(
+            !name.as_bytes().contains(&b'/') && name != "." && name != ".." && !name.is_empty(),
+            "source child must be one normal path component"
+        );
+        let name_c = CString::new(name.as_bytes())?;
+        // Share the directory capability; do not dup/close a new FD per entry.
+        let parent = self.file.clone();
+        let attribute_path =
+            PathBuf::from(format!("/proc/self/fd/{}", parent.as_raw_fd())).join(name);
+        // SAFETY: parent and the single-component C name remain live. O_NOFOLLOW
+        // binds links themselves and never resolves a link supplied by the tree.
+        let raw = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name_c.as_ptr(),
+                libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        // SAFETY: raw is a newly owned descriptor.
+        Ok(Self {
+            file: Arc::new(unsafe { File::from_raw_fd(raw) }),
+            attribute_path,
+            _parent: Some(parent),
+        })
+    }
+
+    fn read_link(&self) -> Result<PathBuf> {
+        let mut bytes = vec![0; 256];
+        loop {
+            // SAFETY: an empty name reads the symlink bound by this O_PATH FD.
+            // Both Linux and the Host readlinkat support this empty-path form.
+            let len = unsafe {
+                libc::readlinkat(
+                    self.file.as_raw_fd(),
+                    c"".as_ptr(),
+                    bytes.as_mut_ptr().cast(),
+                    bytes.len(),
+                )
+            };
+            if len < 0 {
+                return Err(std::io::Error::last_os_error().into());
+            }
+            if (len as usize) < bytes.len() {
+                bytes.truncate(len as usize);
+                return Ok(PathBuf::from(OsString::from_vec(bytes)));
+            }
+            ensure!(bytes.len() < 1024 * 1024, "source symlink exceeds bound");
+            bytes.resize(bytes.len() * 2, 0);
+        }
+    }
+
+    fn attributes(&self, symlink: bool) -> Result<Vec<(OsString, Vec<u8>)>> {
+        let mut names: Vec<_> = if symlink {
+            // l*xattr never follows the final component, even if it is replaced.
+            xattr::list(&self.attribute_path)?.collect()
+        } else {
+            xattr::list_deref(self.fd_path())?.collect()
+        };
+        names.sort();
+        names
+            .into_iter()
+            .map(|name| {
+                let value = if symlink {
+                    xattr::get(&self.attribute_path, &name)?
+                } else {
+                    xattr::get_deref(self.fd_path(), &name)?
+                };
+                Ok((
+                    name,
+                    value.context("rootfs xattr changed during traversal")?,
+                ))
+            })
+            .collect()
+    }
+}
+
 fn hash_tree(root: &Path, path: &Path, digest: &mut Sha256) -> Result<u64> {
-    hash_tree_inner(root, path, digest, &mut BTreeMap::new())
+    hash_tree_inner(
+        &SourceNode::open(path)?,
+        path.strip_prefix(root)?,
+        digest,
+        &mut BTreeMap::new(),
+    )
 }
 
 fn hash_tree_inner(
-    root: &Path,
-    path: &Path,
+    node: &SourceNode,
+    relative_path: &Path,
     digest: &mut Sha256,
     links: &mut BTreeMap<(u64, u64), PathBuf>,
 ) -> Result<u64> {
-    let metadata = fs::symlink_metadata(path)?;
-    let relative = path.strip_prefix(root)?.as_os_str().as_bytes();
+    let metadata = node.file.metadata()?;
+    let relative = relative_path.as_os_str().as_bytes();
     digest.update((relative.len() as u64).to_le_bytes());
     digest.update(relative);
     for value in [metadata.mode(), metadata.uid(), metadata.gid()] {
@@ -218,10 +359,7 @@ fn hash_tree_inner(
     }
     digest.update(metadata.mtime().to_le_bytes());
     digest.update(metadata.mtime_nsec().to_le_bytes());
-    let mut attributes: Vec<_> = xattr::list(path)?.collect();
-    attributes.sort();
-    for name in attributes {
-        let value = xattr::get(path, &name)?.context("rootfs xattr changed during hashing")?;
+    for (name, value) in node.attributes(metadata.is_symlink())? {
         digest.update((name.as_bytes().len() as u64).to_le_bytes());
         digest.update(name.as_bytes());
         digest.update((value.len() as u64).to_le_bytes());
@@ -229,7 +367,7 @@ fn hash_tree_inner(
     }
     digest.update(0u64.to_le_bytes());
     if metadata.is_symlink() {
-        let target = fs::read_link(path)?;
+        let target = node.read_link()?;
         digest.update((target.as_os_str().as_bytes().len() as u64).to_le_bytes());
         digest.update(target.as_os_str().as_bytes());
         return Ok(0);
@@ -237,11 +375,11 @@ fn hash_tree_inner(
     if metadata.is_file() {
         let first = links
             .entry((metadata.dev(), metadata.ino()))
-            .or_insert_with(|| path.strip_prefix(root).unwrap().to_path_buf());
+            .or_insert_with(|| relative_path.to_path_buf());
         digest.update((first.as_os_str().as_bytes().len() as u64).to_le_bytes());
         digest.update(first.as_os_str().as_bytes());
         digest.update(metadata.len().to_le_bytes());
-        hash_file(path, digest)?;
+        hash_reader(&mut File::open(node.fd_path())?, digest)?;
         return Ok(metadata.len().max(4096));
     }
     if !metadata.is_dir() {
@@ -250,16 +388,21 @@ fn hash_tree_inner(
                 || metadata.file_type().is_block_device()
                 || metadata.file_type().is_fifo(),
             "unsupported rootfs node {}",
-            path.display()
+            relative_path.display()
         );
         digest.update(metadata.rdev().to_le_bytes());
         return Ok(0);
     }
-    let mut entries = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+    let mut entries = fs::read_dir(node.fd_path())?.collect::<std::io::Result<Vec<_>>>()?;
     entries.sort_by_key(|entry| entry.file_name());
     let mut size = 4096;
     for entry in entries {
-        size += hash_tree_inner(root, &entry.path(), digest, links)?;
+        size += hash_tree_inner(
+            &node.child(&entry.file_name())?,
+            &relative_path.join(entry.file_name()),
+            digest,
+            links,
+        )?;
     }
     Ok(size)
 }
@@ -280,30 +423,44 @@ fn hash_reader(file: &mut File, digest: &mut Sha256) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
 fn copy_tree(source: &Path, destination: &Path) -> Result<()> {
-    copy_tree_inner(source, destination, &mut BTreeMap::new())
+    copy_tree_inner(
+        &SourceNode::open(source)?,
+        destination,
+        &mut BTreeMap::new(),
+    )
 }
 
 fn copy_tree_inner(
-    source: &Path,
+    source: &SourceNode,
     destination: &Path,
     links: &mut BTreeMap<(u64, u64), PathBuf>,
 ) -> Result<()> {
-    let metadata = fs::symlink_metadata(source)?;
+    let metadata = source.file.metadata()?;
     if metadata.is_symlink() {
-        std::os::unix::fs::symlink(fs::read_link(source)?, destination)?;
+        std::os::unix::fs::symlink(source.read_link()?, destination)?;
     } else if metadata.is_dir() {
         fs::create_dir(destination)?;
-        for entry in fs::read_dir(source)? {
+        for entry in fs::read_dir(source.fd_path())? {
             let entry = entry?;
-            copy_tree_inner(&entry.path(), &destination.join(entry.file_name()), links)?;
+            copy_tree_inner(
+                &source.child(&entry.file_name())?,
+                &destination.join(entry.file_name()),
+                links,
+            )?;
         }
     } else if metadata.is_file() {
         let key = (metadata.dev(), metadata.ino());
         if let Some(first) = links.get(&key) {
             fs::hard_link(first, destination)?;
         } else {
-            fs::copy(source, destination)?;
+            let mut input = File::open(source.fd_path())?;
+            let mut output = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)?;
+            std::io::copy(&mut input, &mut output)?;
             links.insert(key, destination.to_path_buf());
         }
     } else {
@@ -322,8 +479,7 @@ fn copy_tree_inner(
     for name in xattr::list(destination)? {
         xattr::remove(destination, &name)?;
     }
-    for name in xattr::list(source)? {
-        let value = xattr::get(source, &name)?.context("rootfs xattr changed during copy")?;
+    for (name, value) in source.attributes(metadata.is_symlink())? {
         xattr::set(destination, &name, &value)?;
     }
     nix::sys::stat::utimensat(
@@ -393,6 +549,34 @@ mod tests {
         assert_eq!(fs::read(&outside).unwrap(), b"must survive");
         assert!(fs::metadata(image).unwrap().len() > 0);
         assert!(Path::new(&actual).is_file());
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn source_descriptor_survives_path_and_symlink_substitution() {
+        let directory =
+            std::env::temp_dir().join(format!("kernelet-source-fd-{}", std::process::id()));
+        fs::create_dir(&directory).unwrap();
+        let source = directory.join("source");
+        fs::create_dir(&source).unwrap();
+        fs::write(source.join("payload"), b"original").unwrap();
+        let root = SourceNode::open(&source).unwrap();
+        assert!(root.child(std::ffi::OsStr::new("../outside")).is_err());
+        let payload = root.child(std::ffi::OsStr::new("payload")).unwrap();
+        fs::rename(&source, directory.join("moved")).unwrap();
+        std::os::unix::fs::symlink("/etc", &source).unwrap();
+        fs::remove_file(directory.join("moved/payload")).unwrap();
+        std::os::unix::fs::symlink("/etc/passwd", directory.join("moved/payload")).unwrap();
+        let mut data = Vec::new();
+        File::open(payload.fd_path())
+            .unwrap()
+            .read_to_end(&mut data)
+            .unwrap();
+        assert_eq!(data, b"original");
+        let link = root.child(std::ffi::OsStr::new("payload")).unwrap();
+        assert!(link.file.metadata().unwrap().is_symlink());
+        assert_eq!(link.read_link().unwrap(), Path::new("/etc/passwd"));
+        assert!(SourceNode::open(&source.join("passwd")).is_err());
         fs::remove_dir_all(directory).unwrap();
     }
 

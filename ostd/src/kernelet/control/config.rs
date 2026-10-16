@@ -65,11 +65,13 @@ pub(super) fn boot_args(
     for (index, cpu) in config.cpus.iter().enumerate() {
         vcpu_host_cpu[index] = cpu.as_usize().try_into().map_err(|_| Error::InvalidArgs)?;
     }
+    let clock = super::super::clock::calibration()?;
     Ok(BootArgs {
         size: size_of::<BootArgs>() as u32,
         generation: identity.generation,
         source_hash: image.entry_table().source_hash,
-        tsc_freq_hz: crate::arch::tsc_freq(),
+        tsc_freq_hz: clock.tsc_freq_hz,
+        clock_origin_tsc: clock.origin_tsc,
         kernelet: identity.kernelet,
         num_vcpus: config.cpus.count() as u16,
         vcpu_host_cpu,
@@ -83,7 +85,6 @@ pub(super) fn boot_args(
         meta_block_sections: 0,
         meta_grain_bitmap: 0,
         max_meta_sections: config.max_meta_sections,
-        clock_page: 0,
         info_page: 0,
         vcpu_records: PAGE_SIZE as u32,
         max_tasks: config.max_tasks,

@@ -141,10 +141,10 @@ pub struct BudgetArgs {
 /// Value of an optional observation not collected by the running kernel.
 ///
 /// Consumers must display unavailable observations distinctly from zero.
-/// This applies to the diagnostic fields documented in [`StatsRaw`].
+/// This applies to diagnostic fields and to CPU time in Hosts without CPU accounting.
 pub const STATS_UNAVAILABLE: u64 = u64::MAX;
 
-/// An instance snapshot with always-available quota and resource accounting.
+/// An instance snapshot with always-available memory and lifecycle accounting.
 ///
 /// The diagnostic observations are unavailable in ordinary kernel builds.
 #[repr(C)]
@@ -160,6 +160,7 @@ pub struct StatsRaw {
     pub oopses: u32,
     pub host_bytes_charged: u64,
     pub host_overhead_bytes: u64,
+    /// Aggregate CPU time in ns, or [`STATS_UNAVAILABLE`] in Hosts without CPU accounting.
     pub cpu_time_ns: u64,
     pub throttled_ns: u64,
     /// Device completion CPU attribution in ns, or [`STATS_UNAVAILABLE`].
@@ -184,6 +185,7 @@ pub struct StatusRaw {
     pub code: u32,
     pub flags: u32,
     pub uptime_ns: u64,
+    /// Aggregate CPU time in ns, or [`STATS_UNAVAILABLE`] in Hosts without CPU accounting.
     pub cpu_time_ns: u64,
     pub fault_addr: u64,
     pub fault_ip: u64,

@@ -7,7 +7,7 @@ mod sched;
 
 pub(super) use init::{init, iter_all_ifaces};
 #[cfg(ktest)]
-pub(crate) use init::{init_loopback_for_ktest, loopback_iface};
+pub(crate) use init::{init_loopback_for_ktest, poll_loopback_for_ktest};
 pub(super) use poll::init_in_first_kthread;
 
 pub(super) type Iface = dyn aster_bigtcp::iface::Iface<ext::BigtcpExt>;

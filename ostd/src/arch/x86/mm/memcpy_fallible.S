@@ -28,6 +28,11 @@ __memcpy_fallible_end:
 
 .pushsection .ex_table, "a", @progbits
     .balign 8
-    .quad .move - .
-    .quad .memcpy_exit - .
+    .if {RELATIVE_EX_TABLE}
+        .quad .move - .
+        .quad .memcpy_exit - .
+    .else
+        .quad .move
+        .quad .memcpy_exit
+    .endif
 .popsection

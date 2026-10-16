@@ -100,6 +100,8 @@ pub struct BootArgs {
     pub source_hash: [u8; 32],
     /// Timestamp-counter frequency published by the Host.
     pub tsc_freq_hz: u64,
+    /// TSC origin of the Host-boot monotonic clock, shared by all instances.
+    pub clock_origin_tsc: u64,
     /// Host-assigned kernelet identifier.
     pub kernelet: u16,
     /// Number of virtual CPUs in this instance.
@@ -127,8 +129,6 @@ pub struct BootArgs {
     pub meta_grain_bitmap: u32,
     /// Maximum number of compact metadata blocks in this instance.
     pub max_meta_sections: u32,
-    /// Offset from this boot page to the shared clock page.
-    pub clock_page: u32,
     /// Offset from this boot page to the shared info page.
     pub info_page: u32,
     /// Offset from this boot page to the first writable virtual-CPU record.
@@ -205,16 +205,6 @@ pub struct InfoPage {
     pub reserved: u32,
 }
 
-/// Host-published monotonic time since Host boot.
-///
-/// The Host writes through its linear mapping. Every kernelet maps the same
-/// frame read-only, so the one atomic value needs no cross-field snapshot.
-#[repr(C)]
-pub struct ClockPage {
-    /// Monotonic nanoseconds, advanced at least once per physical timer tick.
-    pub monotonic_ns: AtomicU64,
-}
-
 /// Size of the Host's physical-memory grant unit.
 pub const GRAIN_SIZE: usize = 2 * 1024 * 1024;
 /// Physical-memory span represented by one compact metadata block.
@@ -225,62 +215,70 @@ pub const NO_META_BLOCK: u32 = u32::MAX;
 /// Mapped bytes in a Host-owned internal Task stack slot.
 pub(crate) const KSTACK_MAPPING_BYTES: usize = 64 * 4096;
 
-/// Physical samples retained with the stack on which execution was interrupted.
-///
-/// The Host locates this record from its own live stack pool and the hardware
-/// RSP, never a Guest Task pointer or a published current-Task cookie. The top
-/// cache line is excluded from the usable stack. The Guest drains the outgoing
-/// stack before releasing its Task's execution ownership or retiring the slot.
-#[repr(C, align(64))]
-#[derive(Default)]
-pub(crate) struct StackTickRecord {
-    user: AtomicU64,
-    kernel: AtomicU64,
-}
+/// Bytes usable by stack frames in a Host-owned slot.
+pub(crate) const KSTACK_USABLE_BYTES: usize = KSTACK_MAPPING_BYTES;
 
-impl StackTickRecord {
-    /// Adds one sample without wrapping. False requires terminating the image;
-    /// silently dropping or wrapping a sample would violate CPU accounting.
+/// Per-vCPU execution samples awaiting Image-side Task accounting.
+///
+/// Both privilege counts share one atomic word so taking a batch also defines
+/// a single logical Task handoff boundary. User ticks occupy the low 32 bits;
+/// kernel ticks occupy the high 32 bits. Overflow stops the Image rather than
+/// wrapping into the other privilege count. This record contains no Task
+/// identity and is independent of the virtual timer delivery counters.
+#[repr(transparent)]
+#[derive(Default)]
+pub(crate) struct PendingTaskTicks(AtomicU64);
+
+impl PendingTaskTicks {
     pub(crate) fn record(&self, user: bool) -> bool {
-        let counter = if user { &self.user } else { &self.kernel };
-        counter
+        let shift = if user { 0 } else { 32 };
+        self.0
             .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
-                value.checked_add(1)
+                ((value >> shift) as u32 != u32::MAX).then(|| value + (1 << shift))
             })
             .is_ok()
     }
 
-    pub(crate) fn take(&self) -> (u64, u64) {
-        (
-            self.user.swap(0, Ordering::AcqRel),
-            self.kernel.swap(0, Ordering::AcqRel),
-        )
+    /// Atomically transfers this batch to the current Image-side consumer.
+    pub(crate) fn take(&self) -> u64 {
+        self.0.swap(0, Ordering::AcqRel)
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
-        self.user.load(Ordering::Acquire) == 0 && self.kernel.load(Ordering::Acquire) == 0
+    pub(crate) fn split(batch: u64) -> (u64, u64) {
+        (batch as u32 as u64, batch >> 32)
     }
 }
 
-/// Bytes usable by stack frames, excluding the fixed sample record at the top.
-pub(crate) const KSTACK_USABLE_BYTES: usize = KSTACK_MAPPING_BYTES - size_of::<StackTickRecord>();
-
 #[cfg(ktest)]
-mod stack_tick_tests {
+mod pending_task_tick_tests {
     use super::*;
     use crate::prelude::*;
 
     #[ktest]
-    fn tick_counts_do_not_wrap_or_duplicate() {
-        let ticks = StackTickRecord::default();
+    fn handoff_separates_outgoing_and_incoming_execution_samples() {
+        let ticks = PendingTaskTicks::default();
         assert!(ticks.record(true));
         assert!(ticks.record(false));
-        assert_eq!(ticks.take(), (1, 1));
-        assert_eq!(ticks.take(), (0, 0));
-        ticks.user.store(u64::MAX, Ordering::Relaxed);
+        let outgoing = ticks.take();
+        // A physical producer after the logical handoff belongs to the new
+        // owner, even while Image is still cleaning up the previous Task.
+        assert!(ticks.record(false));
+        assert_eq!(PendingTaskTicks::split(outgoing), (1, 1));
+        assert_eq!(PendingTaskTicks::split(ticks.take()), (0, 1));
+        assert_eq!(PendingTaskTicks::split(ticks.take()), (0, 0));
+    }
+
+    #[ktest]
+    fn privilege_counts_do_not_wrap_into_each_other() {
+        let ticks = PendingTaskTicks::default();
+        ticks.0.store(u32::MAX as u64, Ordering::Relaxed);
         assert!(!ticks.record(true));
-        assert_eq!(ticks.take(), (u64::MAX, 0));
-        assert!(ticks.is_empty());
+        assert!(ticks.record(false));
+        assert_eq!(PendingTaskTicks::split(ticks.take()), (u32::MAX as u64, 1));
+        ticks.0.store((u32::MAX as u64) << 32, Ordering::Relaxed);
+        assert!(!ticks.record(false));
+        assert!(ticks.record(true));
+        assert_eq!(PendingTaskTicks::split(ticks.take()), (1, u32::MAX as u64));
     }
 }
 
@@ -318,6 +316,8 @@ pub(crate) struct VcpuRecord {
     pub cpu_local_base: u64,
     /// Host-published time spent asleep in `vcpu_idle`, in nanoseconds.
     pub parked_ns: AtomicU64,
+    /// Execution samples consumed at Image upcalls and logical Task handoffs.
+    pub task_ticks: PendingTaskTicks,
 }
 
 /// Recoverable user-copy fault state for one virtual CPU.
@@ -389,6 +389,9 @@ pub struct ServiceTable {
     /// Activates a registered page-table root.
     pub pt_activate: extern "C" fn(root_paddr: u64) -> i64,
     /// Invalidates translations belonging to a registered root.
+    /// With root zero, only (start=0, len=u64::MAX) is valid: this invalidates
+    /// all local carrier translations, including global entries, and retains
+    /// its selected root. It does not initiate a remote shootdown.
     pub tlb_shootdown: extern "C" fn(root_paddr: u64, start: u64, len: u64) -> i64,
     /// Allocates one guarded internal Task stack.
     pub kstack_alloc: extern "C" fn() -> u64,
@@ -487,10 +490,10 @@ const _: () = {
     assert!(size_of::<DeviceEntry>() == 24);
     assert!(size_of::<RunDesc>() == 16);
     assert!(size_of::<InfoPage>() == 24);
-    assert!(size_of::<ClockPage>() == 8);
-    assert!(size_of::<StackTickRecord>() == 64);
+    assert!(size_of::<PendingTaskTicks>() == 8);
     assert!(offset_of!(BootArgs, generation) == 4);
     assert!(offset_of!(BootArgs, source_hash) == 8);
+    assert!(offset_of!(BootArgs, clock_origin_tsc) == 48);
     assert!(offset_of!(BootArgs, realtime_base_ns) == 2320);
     assert!(offset_of!(BootArgs, monotonic_base_ns) == 2328);
     assert!(size_of::<VcpuRecord>() == 128);
@@ -498,6 +501,7 @@ const _: () = {
     assert!(offset_of!(VcpuRecord, guards) == 80);
     assert!(offset_of!(VcpuRecord, stack_limit) == 96);
     assert!(offset_of!(VcpuRecord, parked_ns) == 112);
+    assert!(offset_of!(VcpuRecord, task_ticks) == 120);
     assert!(size_of::<CopyFaultRecord>() == 64);
     assert!(offset_of!(CopyFaultRecord, pending) == 16);
     assert!(size_of::<KletUserContext>() == 168);

@@ -7,7 +7,7 @@
 //! crossing; the carrier keeps its pinned Task and current shared Task stack
 //! across that scheduling.
 
-use core::sync::atomic::Ordering;
+use core::{sync::atomic::Ordering, time::Duration};
 
 use super::{IDLE, RETURNING, SERVICE, USER, current_carrier_state};
 #[cfg(kernelet_getpid_profile)]
@@ -19,7 +19,8 @@ use crate::{
             BootArgs, INVALID, KSTACK_USABLE_BYTES, KletUserContext, STATE, USER_RETURN_PENDING,
             VIRQ_KICK, VIRQ_TICK, VcpuRecord,
         },
-        account, clock,
+        clock,
+        deadline::Deadline,
     },
     task::{Task, scheduler},
 };
@@ -100,9 +101,7 @@ extern "C" fn kernelet_host_vcpu_yield_impl() -> i64 {
     Task::yield_now();
     crate::arch::irq::disable_local();
     state.set_phase(RETURNING);
-    // Quota pauses the whole carrier, including a Guest critical section.
-    // Waiting here keeps non-sleeping services free of hidden budget waits.
-    state.wait_for_budget(RETURNING);
+    state.sample_stop();
     0
 }
 
@@ -123,9 +122,6 @@ extern "C" fn kernelet_host_vcpu_on_spin_impl() {
         crate::arch::irq::disable_local();
     }
     state.set_phase(RETURNING);
-    if state.control.account.is_throttled() {
-        state.wait_for_budget(RETURNING);
-    }
 }
 
 // SAFETY: The assembly stub authenticated this crossing and its shared Task
@@ -150,10 +146,8 @@ extern "C" fn kernelet_host_vcpu_idle_impl(deadline_ns: u64) -> i64 {
     }
     if record.pending.load(Ordering::Acquire) != 0 {
         // The caller already has work. Keep its active root and avoid creating
-        // a deadline for a wait that cannot sleep. Budget enforcement may still
-        // park the carrier through its normal Host-root path.
-        clock::publish();
-        state.wait_for_budget(SERVICE);
+        // a timer for a wait that cannot sleep.
+        state.sample_stop();
         state.set_phase(RETURNING);
         return 0;
     }
@@ -163,41 +157,36 @@ extern "C" fn kernelet_host_vcpu_idle_impl(deadline_ns: u64) -> i64 {
     state.parked.set(true);
     crate::arch::irq::enable_local();
     let guest_now_ns = clock::now_ns();
-    let host_now_ns = crate::task::accounting::now_ns();
     let tick_ns = 1_000_000_000 / crate::timer::TIMER_FREQ;
     let guest_deadline_ns = if deadline_ns == 0 {
         guest_now_ns.saturating_add(tick_ns)
     } else {
         deadline_ns
     };
-    // Guest deadlines are relative to the Host-boot clock page; the Host's
-    // deadline queue uses its own TSC-derived epoch. Convert only the remaining
-    // interval, and bound the minimum sleep against short-deadline storms.
-    let host_deadline_ns = if guest_deadline_ns == u64::MAX {
-        u64::MAX
-    } else {
-        host_now_ns.saturating_add(
-            guest_deadline_ns
-                .saturating_sub(guest_now_ns)
-                .max(MIN_IDLE_NS),
+    // Pass a relative duration to the Host's existing monotonic timers. The
+    // image and Host timer need not share an epoch. Keep the minimum sleep
+    // against short-deadline storms; indefinite waits allocate no timer.
+    let alarm = (guest_deadline_ns != u64::MAX).then(|| {
+        Deadline::after(
+            Duration::from_nanos(
+                guest_deadline_ns
+                    .saturating_sub(guest_now_ns)
+                    .max(MIN_IDLE_NS),
+            ),
+            &state.idle_wait,
         )
-    };
-    let alarm = (host_deadline_ns != u64::MAX)
-        .then(|| account::Deadline::new(host_deadline_ns, &state.idle_wait));
+    });
     state.idle_wait.wait_until(|| {
         (record.pending.load(Ordering::Acquire) != 0
             || state.sample_stop()
-            || crate::task::accounting::now_ns() >= host_deadline_ns)
-            .then_some(())
+            || alarm.as_ref().is_some_and(Deadline::is_expired))
+        .then_some(())
     });
     drop(alarm);
-    // A deadline may expire between physical ticks. Publish a fresh clock
-    // sample before vOSTD tests the absolute deadline on service return.
-    clock::publish();
     crate::arch::irq::disable_local();
     state.parked.set(false);
     state.set_phase(SERVICE);
-    state.wait_for_budget(SERVICE);
+    state.sample_stop();
     state.set_phase(RETURNING);
     0
 }
@@ -252,7 +241,7 @@ extern "C" fn kernelet_host_user_run_impl(ptr: *mut KletUserContext) -> i32 {
     #[cfg(kernelet_getpid_profile)]
     let validate_span = profile::span(profile::stage::HOST_VALIDATE);
     // The synchronous user gate uses the already registered tenant root.
-    // Native callbacks and quota waits leave it only when needed.
+    // Native callbacks leave it only when needed.
     let start = ptr as usize;
     let Some(end) = start.checked_add(size_of::<KletUserContext>()) else {
         state.set_phase(RETURNING);
@@ -333,13 +322,13 @@ extern "C" fn kernelet_host_user_run_impl(ptr: *mut KletUserContext) -> i32 {
         // The validated root contains the native kernel mappings. Keep it
         // active for the IRQ; an actual native switch saves the carrier and
         // leaves this active set through pause_carrier_context.
-        if crate::arch::is_timer_irq(frame.trap_num)
-            && state.sample_stack_tick(state.image_rsp, true)
-        {
-            // Ring 3's RSP is a user address. Its suspended, authenticated
-            // kernel crossing stack identifies the interrupted stack slot.
-            record.tick_user.fetch_add(1, Ordering::Relaxed);
-            record.pending.fetch_or(VIRQ_TICK, Ordering::Release);
+        if crate::arch::is_timer_irq(frame.trap_num) {
+            if record.task_ticks.record(true) {
+                record.tick_user.fetch_add(1, Ordering::Relaxed);
+                record.pending.fetch_or(VIRQ_TICK, Ordering::Release);
+            } else {
+                state.stop_tick_overflow();
+            }
         }
         // Sampling failure stops the image, but the physical IRQ still needs
         // its Host callbacks and acknowledgement before service termination.
@@ -359,7 +348,7 @@ extern "C" fn kernelet_host_user_run_impl(ptr: *mut KletUserContext) -> i32 {
         crate::arch::irq::disable_local();
         // All Native IRQ callbacks have returned to L0. Park the carrier at
         // this Host tick continuation even though user_run masks Guest IRQs.
-        state.wait_for_budget(SERVICE);
+        state.sample_stop();
     }
     state.set_phase(RETURNING);
     result

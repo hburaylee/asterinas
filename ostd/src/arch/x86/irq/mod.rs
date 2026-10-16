@@ -10,6 +10,7 @@ macro_rules! __log_prefix {
 }
 
 pub(super) mod chip;
+#[cfg(not(feature = "kernelet"))]
 pub(super) mod ipi;
 #[cfg_attr(feature = "kernelet", path = "kernelet_ops.rs")]
 mod ops;
@@ -19,6 +20,7 @@ mod remapping;
 pub use chip::{IRQ_CHIP, IrqChip, MappedIrqLine};
 #[cfg(feature = "kernelet-host")]
 pub(crate) use ipi::send_self_ipi;
+#[cfg(not(feature = "kernelet"))]
 pub(crate) use ipi::{HwCpuId, send_ipi};
 #[cfg(not(feature = "kernelet"))]
 pub(crate) use ops::enable_local_and_halt;

@@ -288,6 +288,7 @@ fn do_new_base_crate(
         dep_crate_path,
         link_unit_test_kernel,
         base_type,
+        &workspace_root,
     );
 
     // Copy the manifest configurations from the target crate to the base crate
@@ -331,6 +332,7 @@ fn add_manifest_dependency(
     crate_path: impl AsRef<Path>,
     link_unit_test_kernel: bool,
     base_type: BaseCrateType,
+    workspace_root: &Path,
 ) {
     let manifest_path = "Cargo.toml";
 
@@ -374,6 +376,7 @@ fn add_manifest_dependency(
             dependencies,
             "osdk-test-kernel",
             Path::new("deps").join("test-kernel"),
+            workspace_root,
         );
     }
 
@@ -381,24 +384,43 @@ fn add_manifest_dependency(
         dependencies,
         "osdk-frame-allocator",
         Path::new("deps").join("frame-allocator"),
+        workspace_root,
     );
 
     add_manifest_dependency_to(
         dependencies,
         "osdk-heap-allocator",
         Path::new("deps").join("heap-allocator"),
+        workspace_root,
     );
 
-    add_manifest_dependency_to(dependencies, "ostd", Path::new("..").join("ostd"));
+    add_manifest_dependency_to(
+        dependencies,
+        "ostd",
+        Path::new("..").join("ostd"),
+        workspace_root,
+    );
 
     let content = toml::to_string(&manifest).unwrap();
     fs::write(manifest_path, content).unwrap();
 }
 
-fn add_manifest_dependency_to(manifest: &mut toml::Value, dep_name: &str, path: PathBuf) {
+fn add_manifest_dependency_to(
+    manifest: &mut toml::Value,
+    dep_name: &str,
+    path: PathBuf,
+    workspace_root: &Path,
+) {
     let dep_str = match option_env!("OSDK_LOCAL_DEV") {
         Some("1") => {
-            let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+            // Paired builds must use the OSDK support crates in the same frozen
+            // workspace rather than paths embedded when cargo-osdk was compiled.
+            let local_osdk = workspace_root.join("osdk");
+            let crate_dir = if local_osdk.join("Cargo.toml").is_file() {
+                local_osdk
+            } else {
+                PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            };
             let dep_crate_dir = crate_dir.join(path);
             format!(
                 "{} = {{ path = \"{}\" }}",

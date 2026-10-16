@@ -2,7 +2,13 @@
 
 //! Tasks are the unit of code execution.
 
-#[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
+#[cfg(any(
+    feature = "kernelet-host",
+    feature = "kernelet",
+    kernelet_rq1,
+    kernelet_rq1_diagnostics,
+    ktest
+))]
 pub(crate) mod accounting;
 pub mod atomic_mode;
 #[cfg_attr(feature = "kernelet", path = "kernelet_stack.rs")]
@@ -13,13 +19,17 @@ mod processor;
 pub mod scheduler;
 mod utils;
 
+#[cfg(feature = "kernelet-host")]
+use core::sync::atomic::AtomicUsize;
+#[cfg(any(feature = "kernelet-host", feature = "kernelet"))]
+use core::sync::atomic::Ordering;
 use core::{
     any::Any,
     borrow::Borrow,
     cell::{Cell, SyncUnsafeCell},
     ops::Deref,
     ptr::NonNull,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::AtomicBool,
 };
 #[cfg(feature = "kernelet")]
 use core::{
@@ -28,18 +38,18 @@ use core::{
 };
 
 use kernel_stack::KernelStack;
-#[cfg(all(target_arch = "x86_64", feature = "kernelet-host"))]
-pub(crate) use preempt::check_preempt;
 use processor::current_task;
 use spin::Once;
 use utils::ForceSync;
 
-#[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
+#[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
 pub use self::accounting::CpuTimeMeasurement;
 pub use self::{
     preempt::{DisabledPreemptGuard, disable_preempt, halt_cpu},
     scheduler::info::{AtomicCpuId, TaskScheduleInfo},
 };
+#[cfg(feature = "kernelet-host")]
+use crate::kernelet::account::AdoptedTask;
 use crate::{
     arch::task::TaskContext,
     irq::{DisabledLocalIrqGuard, InterruptLevel},
@@ -73,10 +83,17 @@ pub(crate) fn exit_current_task() -> ! {
     #[cfg(feature = "kernelet")]
     crate::mm::VmSpace::deactivate();
 
-    #[cfg(any(feature = "kernelet-host", ktest))]
+    #[cfg(ktest)]
     {
         let current_task = Task::current().expect("task exit requires a current Task");
         let _ = current_task.accounting.detach(None);
+    }
+    #[cfg(feature = "kernelet-host")]
+    {
+        let current = Task::current().expect("task exit requires a current Task");
+        if let Some(adopted) = current.adopted_kernelet().take() {
+            drop(adopted);
+        }
     }
     scheduler::exit_current();
 }
@@ -163,6 +180,7 @@ pub struct Task {
     switched_to_cpu: AtomicBool,
 
     /// Defers preemption from a scheduler decision until its context switch.
+    #[cfg(feature = "kernelet")]
     scheduling_in_progress: AtomicBool,
 
     /// Defers virtual interrupt delivery while this Task finishes an upcall.
@@ -183,7 +201,12 @@ pub struct Task {
     active_vm_space: ForceSync<RefCell<Option<Arc<crate::mm::VmSpace>>>>,
 
     schedule_info: TaskScheduleInfo,
-    #[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
+    #[cfg(feature = "kernelet-host")]
+    carrier_context: AtomicUsize,
+    #[cfg(feature = "kernelet-host")]
+    // Only CurrentTask methods in task context access this worker's ownership.
+    adopted_kernelet: ForceSync<Cell<Option<AdoptedTask>>>,
+    #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
     accounting: accounting::TaskAccounting,
     #[cfg(kernelet_rq1_diagnostics)]
     rq1_fpu_counters:
@@ -200,13 +223,13 @@ impl Task {
         &self.rq1_fpu_counters
     }
 
-    /// Settles samples while this stack's execution ownership is exclusive.
+    /// Settles a batch captured while this Task owned its vCPU's execution.
     /// IRQs must be off, and an outgoing Task must still be switched_to_cpu.
     #[cfg(feature = "kernelet")]
-    fn drain_sampled_ticks(&self) {
+    fn account_sampled_ticks(&self, batch: u64) {
         debug_assert!(!crate::arch::irq::is_local_enabled());
         debug_assert!(self.switched_to_cpu.load(Ordering::Acquire));
-        let (user, kernel) = self.kstack.take_ticks();
+        let (user, kernel) = crate::kernelet::abi::PendingTaskTicks::split(batch);
         if user != 0 {
             crate::irq::call_sampled_task_tick_callback_functions(
                 self,
@@ -224,7 +247,7 @@ impl Task {
     }
 
     /// Attaches an account to this currently executing native Task.
-    #[cfg(any(feature = "kernelet-host", ktest))]
+    #[cfg(ktest)]
     pub(crate) fn attach_cpu_account(
         &self,
         account: Arc<dyn accounting::CpuTimeAccount>,
@@ -235,15 +258,7 @@ impl Task {
         self.accounting.attach(account)
     }
 
-    #[cfg(any(feature = "kernelet-host", ktest))]
-    pub(crate) fn sample_cpu_account(&self, owner: usize) -> Result<()> {
-        if !Task::current().is_some_and(|task| core::ptr::eq(&*task, self)) {
-            return Err(crate::Error::InvalidArgs);
-        }
-        self.accounting.sample_owned(owner)
-    }
-
-    #[cfg(any(feature = "kernelet-host", ktest))]
+    #[cfg(ktest)]
     pub(crate) fn detach_cpu_account(&self, owner: usize) -> Result<()> {
         debug_assert!(Task::current().is_some_and(|task| core::ptr::eq(&*task, self)));
         self.accounting.detach(Some(owner))
@@ -256,8 +271,15 @@ impl Task {
     /// clears it. The caller must hold physical IRQs disabled and own this Task.
     #[cfg(feature = "kernelet-host")]
     pub(crate) unsafe fn set_carrier_context(&self, address: usize) {
+        self.carrier_context.store(address, Ordering::Release);
         // SAFETY: The caller supplies the Task-owned lifetime and IRQ exclusion.
-        unsafe { self.accounting.set_carrier_context(address) };
+        unsafe {
+            if address == 0 {
+                crate::kernelet::host_run::clear_carrier_context();
+            } else {
+                crate::kernelet::host_run::restore_carrier_context(address);
+            }
+        };
     }
 
     /// Gets the current task.
@@ -327,10 +349,12 @@ impl Task {
     }
 }
 
+#[cfg(feature = "kernelet")]
 crate::cpu_local_cell! {
     static BOOT_SCHEDULING_IN_PROGRESS: bool = false;
 }
 
+#[cfg(feature = "kernelet")]
 pub(crate) fn scheduling_in_progress() -> bool {
     Task::current().map_or_else(
         || BOOT_SCHEDULING_IN_PROGRESS.load(),
@@ -342,10 +366,13 @@ pub(crate) fn scheduling_in_progress() -> bool {
 ///
 /// The mark follows the Task across a context switch. It does not mask IRQs or
 /// add a preemption guard, so the scheduler can still switch to another Task.
+#[cfg(feature = "kernelet")]
 pub(crate) struct SchedulingGuard;
 
+#[cfg(feature = "kernelet")]
 impl !Send for SchedulingGuard {}
 
+#[cfg(feature = "kernelet")]
 impl SchedulingGuard {
     pub(crate) fn new() -> Self {
         debug_assert!(!scheduling_in_progress());
@@ -358,6 +385,7 @@ impl SchedulingGuard {
     }
 }
 
+#[cfg(feature = "kernelet")]
 impl Drop for SchedulingGuard {
     fn drop(&mut self) {
         if let Some(task) = Task::current() {
@@ -536,7 +564,11 @@ impl TaskOptions {
         ctx.set_stack_pointer(kstack.end_vaddr() - 16);
 
         let new_task = Task {
-            #[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
+            #[cfg(feature = "kernelet-host")]
+            carrier_context: AtomicUsize::new(0),
+            #[cfg(feature = "kernelet-host")]
+            adopted_kernelet: ForceSync::new(Cell::new(None)),
+            #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
             accounting: accounting::TaskAccounting::new(),
             #[cfg(kernelet_rq1_diagnostics)]
             rq1_fpu_counters: crate::kernelet::fpu_profile::Counters::new(),
@@ -546,6 +578,7 @@ impl TaskOptions {
             ctx: SyncUnsafeCell::new(ctx),
             kstack,
             switched_to_cpu: AtomicBool::new(false),
+            #[cfg(feature = "kernelet")]
             scheduling_in_progress: AtomicBool::new(false),
             #[cfg(feature = "kernelet")]
             virq_deferral_depth: AtomicU32::new(0),
@@ -585,6 +618,45 @@ impl !Send for CurrentTask {}
 impl !Sync for CurrentTask {}
 
 impl CurrentTask {
+    #[cfg(feature = "kernelet-host")]
+    #[inline]
+    fn adopted_kernelet(&self) -> &Cell<Option<AdoptedTask>> {
+        assert!(InterruptLevel::current().is_task_context());
+
+        // SAFETY: CurrentTask cannot be sent to another Task, and the scheduler
+        // runs a Task on only one CPU at a time. Only these methods and this
+        // Task's exit cleanup access the cell; IRQ handlers are excluded above.
+        unsafe { self.adopted_kernelet.get() }
+    }
+
+    /// Retains an instance on this Host worker without CPU accounting.
+    #[cfg(feature = "kernelet-host")]
+    pub(crate) fn adopt_kernelet(&self, owner: AdoptedTask) -> Result<()> {
+        let adopted = self.adopted_kernelet();
+        if let Some(previous) = adopted.replace(Some(owner)) {
+            // Restore the live owner before refunding the rejected reservation.
+            drop(adopted.replace(Some(previous)));
+            return Err(crate::Error::InvalidArgs);
+        }
+        Ok(())
+    }
+
+    /// Releases this Host worker's matching instance reference.
+    #[cfg(feature = "kernelet-host")]
+    pub(crate) fn disown_kernelet(&self, owner: usize) -> Result<()> {
+        let adopted = self.adopted_kernelet();
+        let Some(previous) = adopted.take() else {
+            return Err(crate::Error::AccessDenied);
+        };
+        if previous.owner() != owner {
+            adopted.set(Some(previous));
+            return Err(crate::Error::AccessDenied);
+        }
+        // The cell is empty before Drop can wake the instance reaper.
+        drop(previous);
+        Ok(())
+    }
+
     /// Settles this Task's physical tick samples before publishing an exit.
     ///
     /// Only explicit-owner accounting callbacks run. No global timer callback
@@ -593,7 +665,9 @@ impl CurrentTask {
     pub fn flush_sampled_ticks(&self) {
         assert!(InterruptLevel::current().is_task_context());
         let _irq_guard = crate::irq::disable_local();
-        self.drain_sampled_ticks();
+        assert_eq!(current_task(), Some(self.0));
+        let batch = crate::kernelet::entry::vcpu_record().task_ticks.take();
+        self.account_sampled_ticks(batch);
     }
 
     /// Returns this Task's local virtual-interrupt progress epoch.
@@ -639,7 +713,7 @@ impl CurrentTask {
 
     /// Begins measuring execution accounted by this Task's scheduler,
     /// excluding time spent asleep or running other Tasks.
-    #[cfg(any(feature = "kernelet-host", feature = "kernelet", kernelet_rq1, ktest))]
+    #[cfg(any(feature = "kernelet", kernelet_rq1, kernelet_rq1_diagnostics, ktest))]
     pub fn measure_cpu_time(&self) -> CpuTimeMeasurement {
         CpuTimeMeasurement::start(self.cloned())
     }

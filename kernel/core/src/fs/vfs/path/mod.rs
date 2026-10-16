@@ -987,6 +987,7 @@ impl Path {
         mtime: Option<Duration>,
         ctime: Duration,
     ) -> Result<()> {
+        self.check_mount_writable()?;
         self.inode().set_times(&self.dentry, atime, mtime, ctime)
     }
 

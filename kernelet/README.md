@@ -28,16 +28,51 @@ Run these commands from `kernel/` inside the development container:
 The paired build enables `kernelet` only for its separate Image invocation.
 Host builds with support enabled use panic unwinding for protected service
 continuations.
+Host builds use existing Fair scheduling weights without separate cumulative
+instance CPU accounting or hard CPU quotas. No additional scheduling feature
+is required. Explicit CPU measurements are available only in Image,
+experiment, diagnostic, or kernel-test builds.
 An explicitly enabled Host without an embedded Image does not register
 `/dev/kernelet`.
 
-Without Host support, production builds exclude carrier accounting and switch
+Without Host support, production builds exclude carrier context switch
 hooks, Host timer services, NAT charge fields, carrier page-table ownership,
 and synchronous mapping-reclamation extensions.
 Explicit RQ1 fixture and diagnostic builds retain their measurement code;
 they are separate from production Native builds.
 Enabling Host support still changes shared paths even before creating an
 instance. This configuration needs its own performance measurements.
+
+The accepted scope of Host preemption checks and its relationship to the
+design book are recorded in
+[`Host preemption boundaries`](decisions/0001-host-preemption-boundaries.md).
+The selected scope of CPU register accessor protection and its prerequisites
+are recorded in [`CpuSync preemption`](decisions/0002-cpu-sync-preemption.md).
+The transitional Host scheduling design is described in
+[`Weight-only Host scheduling`](decisions/0003-weight-only-scheduling.md).
+Carrier identity cleanup is scoped to carrier transitions and fixed exit;
+see [`Carrier context boundaries`](decisions/0004-carrier-context-boundaries.md).
+Native address-space cache hits avoid hardware root checks by clearing the
+native cache at carrier entry; see
+[`Native VmSpace fast path`](decisions/0005-native-vmspace-fastpath.md).
+Carrier idle timeouts, exit waits, and reaper retries use the existing Host
+monotonic timers; see [`Host native timers`](decisions/0006-host-native-timers.md).
+Ordinary Host trap returns skip Image processing at the private carrier-pointer
+check; see [`Carrier trap fast path`](decisions/0008-carrier-trap-fastpath.md).
+Images read time locally from immutable TSC calibration, without a periodically
+published clock page; see [`Local TSC clock`](decisions/0007-local-tsc-clock.md).
+Carrier FPU preservation remains enabled; possible overlap with inner thread
+saves awaits measurement. See
+[`Carrier FPU preservation`](decisions/0009-carrier-fpu-preservation.md).
+Synchronous carrier root activation switches directly to the registered target,
+retaining the old reservation through CR3 commit; see
+[`Carrier direct root activation`](decisions/0010-carrier-direct-root-activation.md).
+Host queues per-vCPU execution samples; Image settles their Task ownership
+at upcalls and logical context handoffs. See
+[`Image pending CPU accounting`](decisions/0011-image-pending-cpu-accounting.md).
+Host stack authentication uses fixed layout and atomic live-bit reads;
+allocation and release retain the allocator lock. See
+[`Stack live validation`](decisions/0012-stack-live-validation.md).
 
 ## Userspace build
 
@@ -77,17 +112,16 @@ transferring the Host PTY master with `SCM_RIGHTS`.
 `stats <id>` reports JSON with
 CPU execution, throttling, completion and receive-copy CPU time,
 granted memory, memory limit, Host charges, and stacks.
-Total CPU time includes carrier execution and adopted Host completion and
-receive-copy work.
-The completion and receive-copy counters describe portions of that total.
-They are collected only in diagnostic kernel builds. Ordinary builds report
-these two JSON fields as `null`; total CPU time and resource accounting remain
-available. The raw `STATS` ioctl uses `STATS_UNAVAILABLE` (`UINT64_MAX`) for
-uncollected diagnostic fields, preserving the structure's layout.
-The CPU quota currently limits carrier execution time;
-adopted Host work contributes to statistics without consuming that quota.
-Throttle time is the sum of the wall-clock time each carrier spends waiting
-for its CPU budget.
+Cumulative CPU time is currently unavailable: stats and status JSON report
+`cpu_time_ns: null`, and containerd metrics omit CPU usage.
+The raw `STATS` and `STATUS` ioctls use `STATS_UNAVAILABLE` (`UINT64_MAX`) for
+uncollected CPU observations, preserving the structures' layouts.
+Completion and receive-copy CPU observations remain optional diagnostics;
+ordinary builds report them as `null`.
+Host creation and budget updates reject nonzero CPU quota with `EOPNOTSUPP`.
+Throttle time is zero. Memory, log limits and worker lifecycle ownership remain
+available. Carrier weights are divided by the fixed vCPU count; workers retain
+the Host's default Fair weight. This is not complete instance group scheduling.
 
 The runtime applies these OCI resource fields at creation:
 
@@ -96,7 +130,7 @@ The runtime applies these OCI resource fields at creation:
 | `linux.resources.memory.limit` | A nonnegative limit is rounded down to a whole 2 MiB grain, with creation failing below one grain; a negative or omitted limit uses `--max-grains`. |
 | `linux.resources.cpu.cpus` | The number of distinct CPU numbers selects the vCPU count; the Host's placement policy selects Host CPUs independently of those numbers. |
 | `linux.resources.cpu.shares` | A positive value maps to the rounded nice value `10 - log2(shares)`, clamped to `[-20, 19]`; its fair weight is divided among the configured carriers. |
-| `linux.resources.cpu.quota` and `period` | A positive quota sets carrier CPU time in microseconds per period, with an omitted period defaulting to `100000` microseconds; a nonpositive or omitted quota leaves this limit disabled. |
+| `linux.resources.cpu.quota` and `period` | A positive quota is unsupported and rejected with `EOPNOTSUPP`; a nonpositive or omitted quota requests no hard bandwidth limit. |
 | `linux.resources.pids.limit` | A nonnegative limit is rejected; a negative limit does not install a finite OCI PID limit. |
 
 For `N` configured vCPUs, each carrier receives `W/N` of the fair weight
@@ -177,9 +211,9 @@ that process exits;
 `kill(all=true)` signals these descendants as well.
 Sandbox destruction terminates the remaining Guest execution.
 
-Shim `Stats` exposes
-the Host's CPU time, throttle time, and granted/capped memory
-through containerd's cgroups metrics format.
+Shim `Stats` exposes granted/capped memory and zero throttle time through
+containerd's cgroups metrics format. CPU usage is omitted while cumulative
+instance CPU accounting is unavailable.
 Granted memory is an allocation, not Guest RSS.
 `Pids` queries the agent
 and returns PIDs in the Guest PID namespace;

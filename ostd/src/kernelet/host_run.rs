@@ -29,12 +29,7 @@ use super::{
     guest_memory::GuestMemory,
     host_grant::Grant,
 };
-use crate::{
-    arch::cpu::context::FpuContext,
-    irq,
-    sync::WaitQueue,
-    task::{Task, scheduler},
-};
+use crate::{arch::cpu::context::FpuContext, irq, sync::WaitQueue, task::Task};
 
 mod hook_stack;
 mod hooks;
@@ -66,7 +61,6 @@ pub(crate) const LEAVING: u32 = 5;
 pub(crate) const DETACHED: u32 = 11;
 const USER: u32 = 6;
 const IDLE: u32 = 9;
-const THROTTLED: u32 = 10;
 
 const _: () = {
     assert!(
@@ -79,8 +73,7 @@ const _: () = {
             | LEAVING
             | DETACHED
             | USER
-            | IDLE
-            | THROTTLED)
+            | IDLE)
             & STOP_REQUESTED
             == 0
     );
@@ -141,7 +134,6 @@ struct CarrierState<'a> {
     hook_active: Cell<bool>,
     paused_at: Cell<u64>,
     parked: Cell<bool>,
-    throttled: Cell<bool>,
     last_spin: Cell<u64>,
     // Preserve hardware FPU state across every carrier switch, including
     // image-side FPU restores that do not cross a Host service.
@@ -180,14 +172,12 @@ use super::getpid_profile as profile;
 /// The Task owns this address until it clears the slot at fixed exit.
 ///
 /// # Safety
-/// A nonzero address must name the current Task's pinned carrier. Physical
+/// The address must be nonzero and name the current Task's pinned carrier. Physical
 /// IRQs must be masked while the CPU-local pointer and counters are updated.
 pub(crate) unsafe fn restore_carrier_context(address: usize) {
+    debug_assert_ne!(address, 0);
+    debug_assert!(!crate::arch::irq::is_local_enabled());
     KERNELET_HOST_STATE_PTR.store(address);
-    if address == 0 {
-        super::vcpu_slot::restore(None);
-        return;
-    }
     // SAFETY: The native Task owns this pinned carrier context until fixed exit.
     let state = unsafe { &*(address as *const CarrierState) };
     #[cfg(kernelet_rq1_diagnostics)]
@@ -221,7 +211,7 @@ pub(crate) unsafe fn restore_carrier_context(address: usize) {
     let ns = (elapsed as u128 * 1_000_000_000 / crate::arch::tsc_freq() as u128) as u64;
     if state.parked.get() {
         record.parked_ns.fetch_add(ns, Ordering::Release);
-    } else if !state.throttled.get() {
+    } else {
         record.stolen_ns.fetch_add(ns, Ordering::Release);
     }
 }
@@ -229,10 +219,12 @@ pub(crate) unsafe fn restore_carrier_context(address: usize) {
 /// Starts the outgoing carrier's off-CPU interval.
 ///
 /// # Safety
-/// A nonzero address must name the outgoing Task's pinned carrier context;
+/// The address must be nonzero and name the outgoing Task's pinned carrier context;
 /// physical IRQs must remain masked through the context switch.
 pub(crate) unsafe fn pause_carrier_context(address: usize) {
-    if address != 0 {
+    debug_assert_ne!(address, 0);
+    debug_assert!(!crate::arch::irq::is_local_enabled());
+    {
         #[cfg(kernelet_getpid_profile)]
         let _pause_span = profile::span(profile::stage::HOST_CARRIER_PAUSE);
         // SAFETY: Called only for the outgoing Task while IRQs are masked.
@@ -258,7 +250,26 @@ pub(crate) unsafe fn pause_carrier_context(address: usize) {
         // A real native context switch restarts the cooperative grace period.
         state.deferred_ticks.set(0);
     }
+    // SAFETY: The outgoing carrier remains pinned and IRQs remain masked.
+    unsafe { clear_carrier_context() };
+}
+
+/// Clears CPU-local carrier state when leaving or retiring a carrier.
+///
+/// # Safety
+/// Physical IRQs must be masked, and the caller must finish saving any live
+/// carrier state before clearing it. The pinned context must remain live until
+/// this function returns. Ordinary Task switches rely on this cleanup.
+pub(crate) unsafe fn clear_carrier_context() {
+    debug_assert!(!crate::arch::irq::is_local_enabled());
     super::vcpu_slot::restore(None);
+    KERNELET_HOST_STATE_PTR.store(0);
+}
+
+#[cfg(ktest)]
+pub(super) fn test_carrier_context_is_clear() -> bool {
+    let _irq_guard = irq::disable_local();
+    KERNELET_HOST_STATE_PTR.load() == 0 && super::vcpu_slot::current() == super::abi::CpuSlot::NONE
 }
 
 unsafe extern "C" {
@@ -408,7 +419,9 @@ pub(crate) unsafe fn enter(
     execution: &ExecutionResources,
     vcpu: u16,
 ) -> crate::Result<u32> {
-    let boot_stack = execution.stacks.lock().slots[vcpu as usize].base() as u64;
+    let boot_stack = execution
+        .initial_stack_base(vcpu as usize)
+        .ok_or(crate::Error::InvalidArgs)? as u64;
     let (stack_pool_start, stack_pool_end, stack_pool_live) = execution.stack_pool_layout();
     // The Host-built boot page indexes two pinned arrays: all vCPU records
     // first, followed by all recoverable copy-fault records.
@@ -421,7 +434,6 @@ pub(crate) unsafe fn enter(
         + vcpu as usize * size_of::<CopyFaultRecord>();
     let copy_fault_record = (boot as *const u8).wrapping_add(copy_fault_offset);
     let fpu_stage = FpuContext::new();
-    control.account.attach_carrier()?;
     assert!(crate::arch::irq::is_local_enabled());
     let irq_guard = irq::disable_local();
     // SAFETY: The caller passes the live, writable record mapped by the
@@ -466,7 +478,6 @@ pub(crate) unsafe fn enter(
         hook_active: Cell::new(false),
         paused_at: Cell::new(0),
         parked: Cell::new(false),
-        throttled: Cell::new(false),
         last_spin: Cell::new(u64::MAX),
         vm_space: execution.carrier_vm_space(vcpu)?,
         tls: Cell::new(tls::TlsState::capture()),
@@ -476,14 +487,19 @@ pub(crate) unsafe fn enter(
         stack_pool_live,
     };
     assert_eq!(KERNELET_HOST_STATE_PTR.load(), 0);
+    // Release any native VmSpace before the fixed stubs can borrow CR3.
+    // Ordinary Host activation may then trust its software cache: a carrier
+    // never leaves a native address-space identity installed while using an
+    // image root. Pause and fixed exit use this same boundary.
+    state.install_host_root();
     // Guest XSAVE/XRSTOR use hardware directly, without an activation service.
-    // Install neutral state before publishing this carrier: even the initial
-    // budget wait can switch it out and save the now-live hardware state.
+    // Install neutral state before publishing this carrier, so a later
+    // context switch saves the now-live hardware state.
     // The borrow ends before a scheduler hook can borrow the staging context.
     state.fpu_stage.borrow().load();
     // SAFETY: The carrier is pinned on this current Task until fixed exit.
     unsafe { current.set_carrier_context(&mut state as *mut CarrierState as usize) };
-    state.wait_for_budget(STARTING);
+    state.sample_stop();
 
     // SAFETY: The caller supplies a live image entry, this function owns the
     // guarded image stack, and the carrier state is pinned. The assembly
@@ -511,23 +527,14 @@ pub(crate) unsafe fn enter(
     // SAFETY: Fixed exit owns this Task and has masked physical IRQs.
     unsafe { current.set_carrier_context(0) };
     crate::arch::irq::enable_local();
-    control.account.detach();
     Ok(code)
 }
 
 impl CarrierState<'_> {
-    /// Retains a physical sample with its interrupted stack, independently of
-    /// the Guest's current-Task publication during a context switch.
-    fn sample_stack_tick(&self, rsp: usize, user: bool) -> bool {
-        let result = self.execution.stacks.lock().record_tick(rsp, user);
-        let reason = match result {
-            Ok(()) => return true,
-            Err(resources::TickSampleError::InvalidStack) => KillReason::StackReserve,
-            // Opaque Host-policy code "TICK": stop rather than wrap or drop.
-            Err(resources::TickSampleError::Overflow) => KillReason::HostPolicy(0x5449_434b),
-        };
-        self.control.stop(ExitReason::Killed(reason));
-        false
+    fn stop_tick_overflow(&self) {
+        // Opaque Host-policy code "TICK": stop rather than wrap or drop.
+        self.control
+            .stop(ExitReason::Killed(KillReason::HostPolicy(0x5449_434b)));
     }
 
     fn copy_fault_record(&self) -> &CopyFaultRecord {
@@ -632,59 +639,12 @@ impl CarrierState<'_> {
     fn set_phase(&self, phase: u32) {
         debug_assert!(!crate::arch::irq::is_local_enabled());
         if phase == SERVICE && self.run_state.load(Ordering::Acquire) == ENTERING {
-            self.control
-                .account
+            self.control.carriers[self.vcpu as usize]
+                .counters
                 .service_calls
                 .fetch_add(1, Ordering::Relaxed);
         }
         self.run_state.store(phase, Ordering::Release);
-    }
-
-    /// Parks an authenticated carrier in Native Task context with no Host
-    /// guard held. Physical IRQs are masked on entry and return. A synchronous
-    /// service frame may remain live on the pinned shared Task stack; Guest
-    /// guards do not prevent the Host from parking the entire carrier.
-    /// `STARTING` has no image continuation yet; every other caller temporarily
-    /// publishes the depth-one `THROTTLED` phase.
-    fn wait_for_budget(&self, resume_phase: u32) {
-        if self.sample_stop() {
-            return;
-        }
-        #[cfg(kernelet_getpid_profile)]
-        profile::event(profile::event_id::BUDGET_CHECK);
-        #[cfg(kernelet_getpid_profile)]
-        let account_span = profile::span(profile::stage::HOST_ACCOUNT);
-        scheduler::runtime_ticks();
-        #[cfg(kernelet_getpid_profile)]
-        let _ = profile::end(account_span);
-        if !self.control.account.exhausted() {
-            return;
-        }
-        #[cfg(kernelet_getpid_profile)]
-        profile::event(profile::event_id::THROTTLE);
-        self.install_host_root();
-        if resume_phase != STARTING {
-            self.set_phase(THROTTLED);
-        }
-        self.throttled.set(true);
-        crate::arch::irq::enable_local();
-        self.control.account.wait_for_budget(|| self.sample_stop());
-        crate::arch::irq::disable_local();
-        self.throttled.set(false);
-        if resume_phase != STARTING {
-            self.set_phase(resume_phase);
-        }
-    }
-}
-
-/// Records the quota decision made by the physical Host tick.
-///
-/// The timer has already charged the current Task. Parking waits until a
-/// user IRQ continuation or the fixed yield continuation can sleep.
-pub(crate) fn on_host_tick() {
-    // SAFETY: The timer callback runs with physical IRQs masked on this CPU.
-    if let Some(state) = unsafe { current_carrier_state() } {
-        let _ = state.control.account.exhausted();
     }
 }
 
@@ -693,6 +653,19 @@ pub(crate) fn on_host_tick() {
 /// The caller must run on the current carrier's pinned physical CPU.
 unsafe fn current_carrier_state<'a>() -> Option<&'a CarrierState<'a>> {
     let state_ptr = KERNELET_HOST_STATE_PTR.load() as *const CarrierState;
+    // SAFETY: The caller pins this CPU; the slot retains the current carrier.
+    unsafe { carrier_state_from_ptr(state_ptr) }
+}
+
+/// Authenticates a snapshot of the Host-private CPU-local carrier pointer.
+///
+/// # Safety
+/// The pointer must be null or a live value loaded from this CPU's protected
+/// carrier slot. The caller must remain pinned and retain that carrier through
+/// the returned borrow; it must not use a snapshot across a context switch.
+unsafe fn carrier_state_from_ptr<'a>(
+    state_ptr: *const CarrierState<'a>,
+) -> Option<&'a CarrierState<'a>> {
     if state_ptr.is_null() {
         return None;
     }
@@ -843,12 +816,20 @@ fn redirect_fatal_image_exception(state: &CarrierState, frame: &mut crate::arch:
 /// Runs at native kernel trap return, after Host callback levels unwind.
 /// Ordinary traps retain the shared Task stack and the currently active root.
 pub(crate) fn finish_image_trap(frame: &mut crate::arch::trap::TrapFrame) {
+    // Ordinary Host Tasks have no carrier. Skip all Image return checks before
+    // reading the trap frame or querying the native interrupt level.
+    let state_ptr = KERNELET_HOST_STATE_PTR.load() as *const CarrierState;
+    if state_ptr.is_null() {
+        return;
+    }
     if frame.cs & 3 != 0 || !irq::InterruptLevel::current().is_task_context() {
         return;
     }
     // SAFETY: Physical IRQs are masked by the native trap path. The current
     // carrier and its immutable image entry table are pinned until fixed exit.
-    let Some(state) = (unsafe { current_carrier_state() }) else {
+    // No switch occurred since the pointer read. Authenticate that same snapshot
+    // only after rejecting nested IRQ contexts, without reading the slot again.
+    let Some(state) = (unsafe { carrier_state_from_ptr(state_ptr) }) else {
         return;
     };
     if state.run_state.load(Ordering::Acquire) != IMAGE
@@ -859,7 +840,7 @@ pub(crate) fn finish_image_trap(frame: &mut crate::arch::trap::TrapFrame) {
     }
     let cpu_access = state.cpu_access_range.contains(&frame.rip);
     // An ordinary CPU-local sequence must finish on this internal Task even
-    // after stop or quota exhaustion. Unlike fixed entry stubs, it still owes
+    // after stop or a Host scheduling request. Unlike fixed entry stubs, it still owes
     // the interrupted Task and virtual timer their physical tick samples.
     if !cpu_access && state.sample_stop() {
         frame.rip = state.exit_entry;
@@ -873,12 +854,11 @@ pub(crate) fn finish_image_trap(frame: &mut crate::arch::trap::TrapFrame) {
     let record = unsafe { &*(state.vcpu_record as *const VcpuRecord) };
     let is_timer = crate::arch::is_timer_irq(frame.trap_num);
     if is_timer {
-        match sample_tick_before_redirect(record, frame.rsp, cpu_access, |rsp| {
-            state.sample_stack_tick(rsp, false)
-        }) {
+        match sample_tick_before_redirect(record, cpu_access) {
             Ok(false) => return,
             Ok(true) => (),
             Err(()) => {
+                state.stop_tick_overflow();
                 redirect_fatal_image_exception(state, frame);
                 return;
             }
@@ -895,10 +875,15 @@ pub(crate) fn finish_image_trap(frame: &mut crate::arch::trap::TrapFrame) {
     } else {
         false
     };
-    if at_bound || state.control.account.is_throttled() {
+    // Only an authenticated carrier returning to Image text gains this
+    // scheduling point. Respect its virtual critical section until the bound;
+    // ordinary Host Tasks retain their existing interrupt-return behavior.
+    let host_preempt = !critical && Task::need_yield();
+    let forced_yield = at_bound;
+    if host_preempt || forced_yield {
         let redirected = redirect_image_return(state, record, frame, state.yield_entry);
         #[cfg(kernelet_rq1_diagnostics)]
-        if redirected {
+        if redirected && forced_yield {
             state
                 .control
                 .account
@@ -917,18 +902,13 @@ pub(crate) fn finish_image_trap(frame: &mut crate::arch::trap::TrapFrame) {
     }
 }
 
-/// Records a physical timer before deciding whether this instruction can be
-/// redirected. The stack sampler authenticates the interrupted Task's slot.
-fn sample_tick_before_redirect(
-    record: &VcpuRecord,
-    rsp: usize,
-    cpu_access: bool,
-    sample_stack: impl FnOnce(usize) -> bool,
-) -> Result<bool, ()> {
+/// Queues a physical timer before deciding whether redirection is allowed.
+/// Task ownership and CPU-clock callbacks remain entirely inside the Image.
+fn sample_tick_before_redirect(record: &VcpuRecord, cpu_access: bool) -> Result<bool, ()> {
     let counter = if record.irq_level.load(Ordering::Acquire) != 0 {
         &record.tick_l2
     } else {
-        if !sample_stack(rsp) {
+        if !record.task_ticks.record(false) {
             return Err(());
         }
         &record.tick_kernel
@@ -955,9 +935,7 @@ fn redirect_image_return(
     };
     if !state
         .execution
-        .stacks
-        .lock()
-        .contains_current_range(reserve_start, frame.rsp, frame.rsp)
+        .contains_current_stack_range(reserve_start, frame.rsp, frame.rsp)
     {
         state
             .control
@@ -1080,35 +1058,26 @@ fn machine_events_do_not_enter_tenant_fault_containment() {
 #[cfg(ktest)]
 #[crate::prelude::ktest]
 fn cpu_local_access_defers_redirect_without_losing_physical_ticks() {
-    use super::abi::StackTickRecord;
+    use super::abi::PendingTaskTicks;
 
     let record = VcpuRecord::default();
-    let stack_ticks = StackTickRecord::default();
-    let rsp = 0x1000;
-    let may_redirect = sample_tick_before_redirect(&record, rsp, true, |observed| {
-        assert_eq!(observed, rsp);
-        stack_ticks.record(false)
-    })
-    .unwrap();
-    assert!(!may_redirect);
+    assert!(!sample_tick_before_redirect(&record, true).unwrap());
     assert_eq!(record.tick_kernel.load(Ordering::Acquire), 1);
     assert_eq!(record.pending.load(Ordering::Acquire), VIRQ_TICK);
-    assert_eq!(stack_ticks.take(), (0, 1));
+    let outgoing = record.task_ticks.take();
+    assert_eq!(PendingTaskTicks::split(outgoing), (0, 1));
+    // Taking execution samples must not consume the queued virtual timer.
+    assert_eq!(record.tick_kernel.load(Ordering::Acquire), 1);
+    assert_eq!(record.pending.load(Ordering::Acquire), VIRQ_TICK);
 
-    // A nested virtual IRQ keeps its L2 classification without attributing
-    // its tick to the interrupted Task, including in a protected CPU access.
+    // A nested virtual IRQ runs timer callbacks but charges no Task CPU clock.
     record.irq_level.store(1, Ordering::Release);
-    assert!(
-        !sample_tick_before_redirect(&record, rsp, true, |_| {
-            panic!("L2 must not sample the Task stack")
-        })
-        .unwrap()
-    );
+    assert!(!sample_tick_before_redirect(&record, true).unwrap());
     assert_eq!(record.tick_l2.load(Ordering::Acquire), 1);
+    assert_eq!(record.task_ticks.take(), 0);
     record.irq_level.store(0, Ordering::Release);
-    assert!(
-        sample_tick_before_redirect(&record, rsp, false, |_| stack_ticks.record(false)).unwrap()
-    );
+    assert!(sample_tick_before_redirect(&record, false).unwrap());
     assert_eq!(record.tick_kernel.load(Ordering::Acquire), 2);
-    assert_eq!(stack_ticks.take(), (0, 1));
+    assert_eq!(PendingTaskTicks::split(record.task_ticks.take()), (0, 1));
+    assert_eq!(record.task_ticks.take(), 0);
 }

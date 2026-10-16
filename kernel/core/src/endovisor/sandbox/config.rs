@@ -10,7 +10,7 @@ use kernelet_abi::{
     VsockArgs, VsockPolicyArgs,
 };
 use ostd::{
-    kernelet::control::{CpuBudget, KerneletPolicy},
+    kernelet::control::{BudgetError, CpuBudget, KerneletPolicy},
     sync::WaitQueue,
     task::Task,
 };
@@ -113,9 +113,12 @@ impl SandboxFile {
         {
             return_errno_with_message!(Errno::EINVAL, "unsupported kernelet configuration");
         }
-        budget
-            .validate()
-            .map_err(|_| Error::with_message(Errno::EINVAL, "invalid kernelet budget"))?;
+        budget.validate().map_err(|error| match error {
+            BudgetError::UnsupportedQuota => {
+                Error::with_message(Errno::EOPNOTSUPP, "cpu quota is unsupported")
+            }
+            _ => Error::with_message(Errno::EINVAL, "invalid kernelet budget"),
+        })?;
         let mut bytes = vec![0u8; args.cmdline_len as usize];
         {
             let task = Task::current().unwrap();
