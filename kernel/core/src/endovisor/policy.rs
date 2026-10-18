@@ -19,6 +19,7 @@ use ostd::{
     kernelet::{abi::MAX_GRAINS_PER_REQUEST, control::HostByteCharge},
     sync::LocalIrqDisabled,
 };
+use spin::Once;
 
 use crate::{prelude::*, process::Uid};
 
@@ -612,16 +613,58 @@ impl PrestartEndpointReservation {
 
 /// The native NAT TCP buffers' user and Host charges, owned by native TCP.
 pub(crate) struct NativeTcpBufferCharge {
-    _host: HostByteCharge,
+    // A listener reserves UID quota before START. Its native observer can
+    // already be shared with backlog sockets when Host accounting is bound.
+    host: Once<HostByteCharge>,
     _user: PrestartEndpointReservation,
 }
 
 impl NativeTcpBufferCharge {
     pub(super) fn new(host: HostByteCharge, user: PrestartEndpointReservation) -> Self {
         Self {
-            _host: host,
+            host: Once::initialized(host),
             _user: user,
         }
+    }
+
+    pub(super) fn prestart(user: PrestartEndpointReservation) -> Self {
+        Self {
+            host: Once::new(),
+            _user: user,
+        }
+    }
+
+    pub(super) fn bytes(&self) -> usize {
+        self._user.bytes
+    }
+
+    pub(super) fn bind_host(
+        &self,
+        kernelet: &Arc<ostd::kernelet::control::Kernelet>,
+    ) -> ostd::Result<()> {
+        self.host
+            .try_call_once(|| kernelet.reserve_host_bytes(self.bytes()))?;
+        Ok(())
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn reserve_for_ktest(owner: Uid, bytes: usize) -> Result<Self> {
+        Ok(Self::prestart(PrestartEndpointReservation::reserve(
+            owner,
+            bytes,
+            #[cfg(kernelet_nat_failure_diag_host)]
+            QuotaTag::new(QuotaClass::TestOnly, None),
+        )?))
+    }
+
+    #[cfg(ktest)]
+    pub(crate) fn endpoint_bytes_for_ktest(owner: Uid) -> usize {
+        LEDGER
+            .lock()
+            .users
+            .iter()
+            .find(|user| user.owner == Some(owner))
+            .map_or(0, |user| user.endpoint_bytes)
     }
 }
 

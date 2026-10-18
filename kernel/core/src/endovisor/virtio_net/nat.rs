@@ -66,7 +66,10 @@ pub(super) struct NatBackend {
 }
 
 impl NatBackend {
-    pub(super) fn new(config: NetConfigArgs) -> Result<Self> {
+    pub(super) fn new(
+        config: NetConfigArgs,
+        reservation: &super::endpoint::BackendReservation,
+    ) -> Result<Self> {
         let count = usize::from(config.num_ports);
         if count > MAX_NET_PORTS || config.reserved0 != 0 {
             return_errno_with_message!(Errno::EINVAL, "invalid network configuration");
@@ -91,7 +94,10 @@ impl NatBackend {
             }
             let local = SocketAddrV4::new(Ipv4Addr::from(port.host_address), port.host_port);
             match port.protocol {
-                NET_PROTOCOL_TCP => listeners.push((TcpListener::bind(local)?, port.guest_port)),
+                NET_PROTOCOL_TCP => listeners.push((
+                    TcpListener::bind(local, reservation.clone())?,
+                    port.guest_port,
+                )),
                 NET_PROTOCOL_UDP => {
                     datagram_listeners.push((UdpSocket::bind(local)?, port.guest_port))
                 }
@@ -1640,7 +1646,7 @@ mod mapped_tcp_admission_tests {
         model: Arc<VirtioNet>,
         admission: Arc<Admission>,
         listener: Option<TcpListener>,
-        listener_reservation: Option<PrestartEndpointReservation>,
+        listener_reservation: Option<Arc<crate::endovisor::NativeTcpBufferCharge>>,
         port: u16,
         baseline_host_bytes: usize,
         cleanup_attempted: bool,
@@ -1695,13 +1701,16 @@ mod mapped_tcp_admission_tests {
                 baseline_host_bytes,
                 cleanup_attempted: false,
             };
-            fixture.listener_reservation = Some(
-                fixture
-                    .model
-                    .endpoint
-                    .reserve_backend_bytes(super::super::sockets::TCP_LISTENER_RESERVATION_BYTES)
-                    .unwrap(),
-            );
+            fixture.listener_reservation =
+                Some(Arc::new(crate::endovisor::NativeTcpBufferCharge::prestart(
+                    fixture
+                        .model
+                        .endpoint
+                        .reserve_backend_bytes(
+                            super::super::sockets::TCP_LISTENER_RESERVATION_BYTES,
+                        )
+                        .unwrap(),
+                )));
             let port = NEXT_LISTENER_PORT
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
                     (next < u16::MAX as u32).then_some(next + 1)
@@ -1709,7 +1718,11 @@ mod mapped_tcp_admission_tests {
                 .unwrap();
             fixture.port = u16::try_from(port).unwrap();
             fixture.listener = Some(
-                TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, fixture.port)).unwrap(),
+                TcpListener::bind(
+                    SocketAddrV4::new(Ipv4Addr::LOCALHOST, fixture.port),
+                    fixture.listener_reservation.as_ref().unwrap().clone(),
+                )
+                .unwrap(),
             );
             fixture
         }

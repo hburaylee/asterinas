@@ -57,6 +57,8 @@ mod connected;
 mod connecting;
 mod init;
 mod listen;
+#[cfg(all(ktest, feature = "kernelet-host"))]
+mod nat_charge_test;
 pub(super) mod observer;
 pub(crate) mod options;
 mod util;
@@ -129,7 +131,17 @@ impl StreamSocket {
         family: IpAddressFamily,
         charge: crate::endovisor::NativeTcpBufferCharge,
     ) -> Arc<Self> {
-        Self::new_inner(is_nonblocking, family, Some(Arc::new(charge)))
+        Self::new_nat_shared(is_nonblocking, family, Arc::new(charge))
+    }
+
+    /// Creates a NAT listener socket that shares its native buffer charge.
+    #[cfg(feature = "kernelet-host")]
+    pub(crate) fn new_nat_shared(
+        is_nonblocking: bool,
+        family: IpAddressFamily,
+        charge: Arc<crate::endovisor::NativeTcpBufferCharge>,
+    ) -> Arc<Self> {
+        Self::new_inner(is_nonblocking, family, Some(charge))
     }
 
     fn new_inner(

@@ -227,8 +227,13 @@ pub(super) struct TcpListener(
 );
 
 impl TcpListener {
-    pub(super) fn bind(local: SocketAddrV4) -> Result<Self> {
-        let socket = StreamSocket::new(true, IpAddressFamily::IPv4);
+    pub(super) fn bind(
+        local: SocketAddrV4,
+        reservation: super::endpoint::BackendReservation,
+    ) -> Result<Self> {
+        // Install before listen exposes a native backlog. Its observer is
+        // retained by unaccepted connections even after this file closes.
+        let socket = StreamSocket::new_nat_shared(true, IpAddressFamily::IPv4, reservation);
         socket.bind(address(local))?;
         // Retain a bounded connection burst until the backend can accept it.
         // The endpoint reserves buffers for this entire pending queue.

@@ -169,20 +169,9 @@ enum BackendState {
     Running,
 }
 
-/// Follows listener buffers from configuration through worker shutdown.
-pub(super) struct BackendReservation {
-    _user: PrestartEndpointReservation,
-    bytes: usize,
-    kernelet: Option<Arc<Kernelet>>,
-}
-
-impl Drop for BackendReservation {
-    fn drop(&mut self) {
-        if let Some(kernelet) = &self.kernelet {
-            kernelet.uncharge_host_bytes(self.bytes);
-        }
-    }
-}
+// Native listener observers retain this guard after worker exit or endpoint
+// revoke while unaccepted connections still hold their listener's buffers.
+pub(super) type BackendReservation = Arc<crate::endovisor::NativeTcpBufferCharge>;
 
 /// Owns the device queues and transfers its prepared backend to the worker.
 pub(in crate::endovisor) struct NetEndpoint {
@@ -265,12 +254,13 @@ impl NetEndpoint {
             })
             .sum::<usize>()
             .max(MAPPING_RESERVATION_BYTES);
-        let reservation = BackendReservation {
-            _user: self.reserve_backend_bytes(bytes)?,
-            bytes,
-            kernelet: None,
-        };
-        *backend = BackendState::Prepared(Box::new(NatBackend::new(config)?), reservation);
+        let reservation = Arc::new(crate::endovisor::NativeTcpBufferCharge::prestart(
+            self.reserve_backend_bytes(bytes)?,
+        ));
+        *backend = BackendState::Prepared(
+            Box::new(NatBackend::new(config, &reservation)?),
+            reservation,
+        );
         Ok(())
     }
 
@@ -288,11 +278,10 @@ impl NetEndpoint {
             return Err(ostd::Error::InvalidArgs);
         }
         kernelet.charge_host_bytes(bytes)?;
-        if let Err(error) = kernelet.charge_host_bytes(reservation.bytes) {
+        if let Err(error) = reservation.bind_host(&kernelet) {
             kernelet.uncharge_host_bytes(bytes);
             return Err(error);
         }
-        reservation.kernelet = Some(kernelet.clone());
         *account = Some((kernelet, bytes));
         Ok(())
     }

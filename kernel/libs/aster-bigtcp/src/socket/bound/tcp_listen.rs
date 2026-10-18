@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MPL-2.0
 
 use alloc::{boxed::Box, collections::btree_map::BTreeMap, sync::Arc, vec::Vec};
+use core::sync::atomic::{AtomicBool, Ordering};
 
 use aster_softirq::BottomHalfDisabled;
 use ostd::sync::SpinLock;
@@ -38,6 +39,7 @@ pub(super) struct TcpBacklog<E: Ext> {
 pub struct TcpListenerInner<E: Ext> {
     pub(super) backlog: SpinLock<TcpBacklog<E>, BottomHalfDisabled>,
     listener_key: ListenerKey,
+    closed: AtomicBool,
 }
 
 impl<E: Ext> TcpListenerInner<E> {
@@ -45,6 +47,7 @@ impl<E: Ext> TcpListenerInner<E> {
         Self {
             backlog: SpinLock::new(backlog),
             listener_key,
+            closed: AtomicBool::new(false),
         }
     }
 }
@@ -54,9 +57,10 @@ impl<E: Ext> Inner<E> for TcpListenerInner<E> {
     type Observer = E::TcpEventObserver;
 
     fn on_drop(this: &Arc<SocketBg<Self, E>>) {
-        debug_assert_eq!(
-            Arc::strong_count(this),
-            1,
+        // Backlog connections can retain the listener while their RST waits
+        // for a transmit token. Closure does not require a unique reference.
+        debug_assert!(
+            this.inner.closed.load(Ordering::Relaxed),
             "a listener must be closed before dropping"
         );
     }
@@ -156,6 +160,7 @@ impl<E: Ext> TcpListener<E> {
     pub fn close(&self) {
         // A TCP listener can be removed immediately.
         self.0.bound.iface().common().remove_tcp_listener(&self.0);
+        self.0.inner.closed.store(true, Ordering::Relaxed);
 
         let (connecting, connected) = {
             let mut socket = self.0.inner.backlog.lock();

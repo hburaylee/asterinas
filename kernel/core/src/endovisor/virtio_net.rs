@@ -487,7 +487,8 @@ impl VirtioNet {
             return;
         }
         if let Some((backend, reservation)) = self.endpoint.take_backend() {
-            // Backend resources are released before their UID reservation.
+            // Native listener observers retain the shared reservation until
+            // the last backlog reference releases its buffers.
             let result = backend.run(self);
             #[cfg(kernelet_nat_failure_diag_host)]
             self.record_diagnostic(
