@@ -135,36 +135,34 @@ fn parse_memory_region_type(typ: u32) -> MemoryRegionType {
 }
 
 impl HvmStartInfoV0 {
-    fn modules(&self) -> &[HvmModlistEntry] {
-        if self.nr_modules == 0 || self.modlist_paddr == 0 {
-            return &[];
+    /// Returns the `index`-th module-list entry, if present.
+    ///
+    /// The ABI only fixes the byte layout, so entries are read unaligned.
+    fn module(&self, index: usize) -> Option<HvmModlistEntry> {
+        if self.modlist_paddr == 0 || index >= self.nr_modules as usize {
+            return None;
         }
 
-        // SAFETY: `modlist_paddr` points to an array of at least `nr_modules`
-        // valid entries by the contract with the VMM.
-        unsafe {
-            core::slice::from_raw_parts(
-                paddr_to_vaddr(self.modlist_paddr as Paddr) as *const HvmModlistEntry,
-                self.nr_modules as usize,
-            )
-        }
+        let entry_ptr = paddr_to_vaddr(self.modlist_paddr as Paddr) as *const HvmModlistEntry;
+        // SAFETY: The VMM guarantees `nr_modules` entries at `modlist_paddr`, and
+        // the bounds check above keeps this read within them.
+        Some(unsafe { core::ptr::read_unaligned(entry_ptr.add(index)) })
     }
 }
 
 impl HvmStartInfoV1 {
-    fn memory_map(&self) -> Option<&[HvmMemmapTableEntry]> {
-        if self.memmap_entries == 0 {
+    /// Returns the `index`-th memory-map entry, if present.
+    ///
+    /// The ABI only fixes the byte layout, so entries are read unaligned.
+    fn memmap_entry(&self, index: usize) -> Option<HvmMemmapTableEntry> {
+        if self.memmap_paddr == 0 || index >= self.memmap_entries as usize {
             return None;
         }
 
-        // SAFETY: `memmap_paddr` points to an array of `memmap_entries` valid
-        // entries by the contract with the VMM.
-        Some(unsafe {
-            core::slice::from_raw_parts(
-                paddr_to_vaddr(self.memmap_paddr as Paddr) as *const HvmMemmapTableEntry,
-                self.memmap_entries as usize,
-            )
-        })
+        let entry_ptr = paddr_to_vaddr(self.memmap_paddr as Paddr) as *const HvmMemmapTableEntry;
+        // SAFETY: The VMM guarantees `memmap_entries` entries at `memmap_paddr`,
+        // and the bounds check above keeps this read within them.
+        Some(unsafe { core::ptr::read_unaligned(entry_ptr.add(index)) })
     }
 }
 
@@ -191,7 +189,7 @@ impl ToEarlyBootInfo for HvmStartInfoV0 {
     fn initramfs(&self) -> Option<&'static [u8]> {
         // The PVH protocol does not tag module kinds, so the first module is
         // treated as the initramfs by convention.
-        let module = self.modules().first()?;
+        let module = self.module(0)?;
 
         if module.paddr == 0 || module.size == 0 {
             return None;
@@ -245,23 +243,53 @@ impl ToEarlyBootInfo for HvmStartInfoV0 {
             // SAFETY: `version >= 1` guarantees the V1 fields are present in the
             // VMM-provided structure.
             let v1 = unsafe { &*(self as *const HvmStartInfoV0 as *const HvmStartInfoV1) };
-            if let Some(memmap) = v1.memory_map() {
-                for entry in memmap {
-                    let base = entry.addr.try_into().unwrap();
-                    let len = entry.size.try_into().unwrap();
-                    let typ = super::effective_region_type(
-                        parse_memory_region_type(entry.typ),
-                        base,
-                        len,
-                        acpi_root_table_address,
-                    );
+            for i in 0..v1.memmap_entries as usize {
+                let Some(entry) = v1.memmap_entry(i) else {
+                    // A zero `memmap_paddr` means the VMM supplied no table.
+                    break;
+                };
+                let base = entry.addr.try_into().unwrap();
+                let len = entry.size.try_into().unwrap();
+                let typ = super::effective_region_type(
+                    parse_memory_region_type(entry.typ),
+                    base,
+                    len,
+                    acpi_root_table_address,
+                );
 
-                    regions.push(MemoryRegion::new(base, len, typ)).unwrap();
-                }
+                regions.push(MemoryRegion::new(base, len, typ)).unwrap();
             }
         }
 
         super::finish_memory_regions(regions, framebuffer_arg, initramfs, kernel_cmdline)
+    }
+}
+
+/// Reads the VMM-provided start-info record into aligned local storage.
+///
+/// The ABI only fixes the record's byte layout, so it is read unaligned into
+/// this aligned buffer before any field is accessed.
+///
+/// # Safety
+///
+/// `start_info_ptr` must point to a mapped, initialized `hvm_start_info` record.
+unsafe fn read_start_info(start_info_ptr: *const u8) -> HvmStartInfoV1 {
+    // The V0 fields are always present, regardless of the version.
+    // SAFETY: The caller guarantees the record is initialized.
+    let v0 = unsafe { core::ptr::read_unaligned(start_info_ptr.cast::<HvmStartInfoV0>()) };
+
+    assert_eq!(v0.magic, HVM_START_MAGIC_VALUE);
+
+    if v0.version >= 1 {
+        // SAFETY: `version >= 1` guarantees the V1 fields are initialized.
+        unsafe { core::ptr::read_unaligned(start_info_ptr.cast::<HvmStartInfoV1>()) }
+    } else {
+        HvmStartInfoV1 {
+            v0,
+            memmap_paddr: 0,
+            memmap_entries: 0,
+            _reserved: 0,
+        }
     }
 }
 
@@ -274,15 +302,12 @@ impl ToEarlyBootInfo for HvmStartInfoV0 {
 /// - If this function is called, entry points of other boot protocols must never be called.
 // SAFETY: The name does not collide with other symbols.
 #[unsafe(no_mangle)]
-unsafe extern "sysv64" fn __pvh_entry(start_info_ptr: *const HvmStartInfoV0) -> ! {
+unsafe extern "sysv64" fn __pvh_entry(start_info_ptr: *const u8) -> ! {
     // SAFETY: We get the start-of-day structure from the VMM, so by contract the pointer is valid
-    // and the underlying memory is initialized. The V0 fields are always present regardless of
-    // the version number.
-    let start_info = unsafe { &*start_info_ptr };
+    // and the underlying memory is initialized.
+    let start_info = unsafe { read_start_info(start_info_ptr) };
 
-    assert_eq!(start_info.magic, HVM_START_MAGIC_VALUE);
-
-    EARLY_INFO.call_once(|| start_info.to_early_boot_info());
+    EARLY_INFO.call_once(|| start_info.v0.to_early_boot_info());
 
     // SAFETY: The safety is guaranteed by the safety preconditions and the fact that we call it
     // once after setting up necessary resources.
