@@ -97,7 +97,11 @@ pub(crate) fn request_grains(bytes: usize) -> bool {
 pub(crate) fn frame_to_meta(paddr: usize) -> usize {
     let boot = entry::boot_args();
     let ceiling = info().max_paddr.load(Ordering::Acquire) as usize;
-    assert!(paddr < ceiling);
+    assert!(
+        paddr < ceiling,
+        "paddr={paddr:#x} >= ceiling={ceiling:#x}, section={}",
+        paddr / META_SECTION_BYTES,
+    );
     let section = paddr / META_SECTION_BYTES;
     let index = shared_at::<AtomicU32>(boot.meta_section_index + (section * 4) as u32);
     let block = index.load(Ordering::Acquire);

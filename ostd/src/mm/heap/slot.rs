@@ -124,7 +124,15 @@ impl HeapSlot {
 
     /// Gets the physical address of the slot.
     pub fn paddr(&self) -> Paddr {
-        self.addr.as_ptr() as Vaddr - LINEAR_MAPPING_BASE_VADDR
+        #[cfg(feature = "kernelet")]
+        {
+            let base = crate::kernelet::entry::boot_args().linear_map_base as Vaddr;
+            self.addr.as_ptr() as Vaddr - base
+        }
+        #[cfg(not(feature = "kernelet"))]
+        {
+            self.addr.as_ptr() as Vaddr - LINEAR_MAPPING_BASE_VADDR
+        }
     }
 
     /// Gets the size of the slot.
