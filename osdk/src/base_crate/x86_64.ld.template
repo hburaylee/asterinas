@@ -95,6 +95,9 @@ SECTIONS
 # --------------------------------------------------------------------------- #
     . = LOADADDR(.ap_boot) + SIZEOF(.ap_boot) + KERNEL_VMA;
 
+    .stack_sizes            : AT(ADDR(.stack_sizes) - KERNEL_VMA) {
+        KEEP(*(.stack_sizes .stack_sizes.*))
+    }
     .text                   : AT(ADDR(.text) - KERNEL_VMA) {
         *(.text .text.*)
         PROVIDE(__etext = .);

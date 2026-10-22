@@ -8,6 +8,8 @@ use crate::task::TaskContextApi;
 core::arch::global_asm!(include_str!("switch.S"));
 #[cfg(feature = "kernelet")]
 core::arch::global_asm!(include_str!("kernelet_switch.S"));
+#[cfg(feature = "kernelet")]
+core::arch::global_asm!(include_str!("mcount.S"));
 
 #[repr(C)]
 #[derive(Clone, Debug)]
