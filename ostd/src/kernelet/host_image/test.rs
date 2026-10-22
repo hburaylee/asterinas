@@ -257,7 +257,7 @@ fn instance_relocation_and_sharing() {
     assert_ne!(first.base_vaddr(), second.base_vaddr());
     // The image uses this published GS offset, not the Host's source object.
     // Forgetting it in boot-page serialization would read an unrelated cell.
-    let mut cpu_slot_offset = [0u8; 4];
+    let mut cpu_slot_offset = [0u8; 8];
     first
         ._boot_frame
         .read_bytes(
@@ -266,7 +266,7 @@ fn instance_relocation_and_sharing() {
         )
         .unwrap();
     assert_eq!(
-        u32::from_le_bytes(cpu_slot_offset),
+        u64::from_le_bytes(cpu_slot_offset),
         first_boot.cpu_slot_gs_offset
     );
     // The virtual RTC needs both anchors from this instance's boot page.

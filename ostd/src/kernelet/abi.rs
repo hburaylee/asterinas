@@ -109,8 +109,11 @@ pub struct BootArgs {
     /// Physical CPU assigned to each virtual CPU.
     pub vcpu_host_cpu: [u16; MAX_VCPUS],
     /// GS offset of the Host-written 16-byte [`CpuSlot`].
-    /// The Host publishes [`CpuSlot::NONE`] outside a carrier.
-    pub cpu_slot_gs_offset: u32,
+    /// The Host publishes [`CpuSlot::NONE`] outside a carrier.  This is a
+    /// full 64-bit displacement: a Linux host places the cell in the vmlinux
+    /// per-CPU area and addresses it as `%gs:absolute_symbol`, where the
+    /// segment base is the per-CPU delta rather than the area base.
+    pub cpu_slot_gs_offset: u64,
     /// Size of one CPU-local replica in bytes.
     pub cpu_local_replica_bytes: u32,
     /// Base of the Host linear map shared by the kernelet.
@@ -486,7 +489,7 @@ const _: () = {
     assert!(offset_of!(EntryTable, stub_range_end_offset) == 112);
     assert!(offset_of!(EntryTable, cpu_access_start_offset) == 120);
     assert!(offset_of!(EntryTable, cpu_access_end_offset) == 128);
-    assert!(size_of::<BootArgs>() == 2336);
+    assert!(size_of::<BootArgs>() == 2344);
     assert!(size_of::<DeviceEntry>() == 24);
     assert!(size_of::<RunDesc>() == 16);
     assert!(size_of::<InfoPage>() == 24);
@@ -494,8 +497,8 @@ const _: () = {
     assert!(offset_of!(BootArgs, generation) == 4);
     assert!(offset_of!(BootArgs, source_hash) == 8);
     assert!(offset_of!(BootArgs, clock_origin_tsc) == 48);
-    assert!(offset_of!(BootArgs, realtime_base_ns) == 2320);
-    assert!(offset_of!(BootArgs, monotonic_base_ns) == 2328);
+    assert!(offset_of!(BootArgs, realtime_base_ns) == 2328);
+    assert!(offset_of!(BootArgs, monotonic_base_ns) == 2336);
     assert!(size_of::<VcpuRecord>() == 128);
     assert!(offset_of!(VcpuRecord, stolen_ns) == 64);
     assert!(offset_of!(VcpuRecord, guards) == 80);

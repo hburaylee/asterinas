@@ -27,7 +27,7 @@ macro_rules! record_asm {
             ".pushsection .text.kernelet_cpu_access, \"ax\", @progbits",
             "2:",
             "mov {record_base}, [rip + {boot_args}]",
-            "mov {slot:e}, dword ptr [{record_base} + {slot_offset}]",
+            "mov {slot}, qword ptr [{record_base} + {slot_offset}]",
             "mov {slot}, gs:[{slot}]",
             "shr {slot}, 16",
             "movzx {slot:e}, {slot:x}",
