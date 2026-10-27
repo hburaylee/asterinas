@@ -11,10 +11,10 @@ use super::{
     block::{BlockReader, DataBlock},
     compressor::DecompressContext,
     dir::{DirEntry, DirIter},
-    fragment::{FragmentEntry, RawFragmentEntry},
+    fragment::{FragmentCache, FragmentEntry, RawFragmentEntry},
     impl_for_vfs::inode::SquashFsInode,
     inode::{self, BlockInfo, InodeMeta, ParsedInode},
-    meta::{self, MetaCursor, MetaReader},
+    meta::{self, MetaCache, MetaCursor, MetaReader},
     super_block::SuperBlock,
 };
 use crate::{
@@ -49,6 +49,8 @@ pub(crate) struct SquashFs {
     /// Block-pointer array of the fragment table; empty if the image has no fragments.
     frag_locations: Vec<MetaBlockLocation>,
     decompress: DecompressContext,
+    meta_cache: Mutex<MetaCache>,
+    frag_cache: Mutex<FragmentCache>,
     anon_device_id: AnonDeviceId,
     /// Live inodes, held weakly so unreferenced ones can be dropped and
     /// re-read from disk.
@@ -80,6 +82,8 @@ impl SquashFs {
             id_locations,
             frag_locations,
             decompress,
+            meta_cache: Mutex::new(MetaCache::new()),
+            frag_cache: Mutex::new(FragmentCache::new()),
             anon_device_id,
             inode_cache: RwMutex::new(BTreeMap::new()),
             fs_event_subscriber_stats: FsEventSubscriberStats::new(),
@@ -110,7 +114,12 @@ impl SquashFs {
         if sb.frag_count == 0 || sb.frag_table == INVALID_BLK {
             return Ok(Vec::new());
         }
-        Self::read_index_table::<RawFragmentEntry>(device, sb.frag_table, sb.frag_count as u64, sb.bytes_used)
+        Self::read_index_table::<RawFragmentEntry>(
+            device,
+            sb.frag_table,
+            sb.frag_count as u64,
+            sb.bytes_used,
+        )
     }
 
     /// Reads the top-level pointer array of a two-level lookup table.
@@ -127,9 +136,12 @@ impl SquashFs {
         entry_count: u64,
         bytes_used: u64,
     ) -> Result<Vec<MetaBlockLocation>, SquashFsError> {
-        let total_size = size_of::<T>().checked_mul(entry_count as usize)
+        let total_size = size_of::<T>()
+            .checked_mul(entry_count as usize)
             .filter(|&s| s as u64 <= bytes_used)
-            .ok_or(SquashFsError::CorruptedImage("entry count exceeds image size"))?;
+            .ok_or(SquashFsError::CorruptedImage(
+                "entry count exceeds image size",
+            ))?;
         let block_count = total_size.div_ceil(meta::META_MAX);
 
         // The pointers are stored contiguously on disk. Read the whole array in
@@ -160,16 +172,18 @@ impl SquashFs {
     }
 
     /// Reads and parses the inode addressed by the 64-bit `inode_ref` on demand,
-    /// decompressing metadata blocks from the device.
+    /// decompressing metadata blocks through the shared cache.
     pub(super) fn read_inode(&self, inode_ref: u64) -> Result<ParsedInode> {
         let raw = {
             // The inode table's metadata ends where the directory table begins.
             // Clamp to `bytes_used` so a corrupt `dir_table` past the used
             // bytes cannot widen the read bound.
             let inode_table_end = self.super_block.dir_table.min(self.super_block.bytes_used);
+            let mut cache = self.meta_cache.lock();
             let mut reader = MetaReader::with_end(
                 &self.device,
                 &self.decompress,
+                &mut cache,
                 self.super_block.inode_table,
                 inode_table_end,
                 MetaCursor::from_ref(inode_ref),
@@ -208,9 +222,11 @@ impl SquashFs {
             .get(meta_index)
             .ok_or_else(|| Error::with_message(Errno::EIO, "id index out of bounds"))?;
 
+        let mut cache = self.meta_cache.lock();
         let mut reader = MetaReader::new(
             &self.device,
             &self.decompress,
+            &mut cache,
             0,
             MetaCursor {
                 block: block_ptr,
@@ -231,9 +247,11 @@ impl SquashFs {
             .get(meta_index)
             .ok_or_else(|| Error::with_message(Errno::EIO, "fragment index out of bounds"))?;
 
+        let mut cache = self.meta_cache.lock();
         let mut reader = MetaReader::new(
             &self.device,
             &self.decompress,
+            &mut cache,
             0,
             MetaCursor {
                 block: block_ptr,
@@ -286,9 +304,11 @@ impl SquashFs {
         file_size: u32,
         name: &[u8],
     ) -> Result<Option<(SquashFsIno, u64)>> {
+        let mut cache = self.meta_cache.lock();
         let mut reader = MetaReader::new(
             &self.device,
             &self.decompress,
+            &mut cache,
             self.super_block.dir_table,
             MetaCursor {
                 block: block_start as u64,
@@ -315,9 +335,11 @@ impl SquashFs {
         skip: usize,
         mut f: impl FnMut(usize, &DirEntry) -> Result<bool>,
     ) -> Result<()> {
+        let mut cache = self.meta_cache.lock();
         let mut reader = MetaReader::new(
             &self.device,
             &self.decompress,
+            &mut cache,
             self.super_block.dir_table,
             MetaCursor {
                 block: block_start as u64,
@@ -364,16 +386,18 @@ impl SquashFs {
     }
 
     /// Returns the decompressed fragment block at `frag_index`, reading and
-    /// decompressing it.
+    /// decompressing it on a cache miss.
+    ///
+    /// Fragment blocks may be shared by many files, so they are served from
+    /// the fragment cache to avoid repeated re-decompression.
     pub(super) fn fragment_block(&self, frag_index: u32) -> Result<DataBlock> {
         let frag = self.frag_lookup(frag_index)?;
         let reader = BlockReader::new(&self.device, &self.decompress);
-        Ok(reader.read_fragment(
-            frag.start,
-            frag.size as usize,
-            frag.compressed,
-            self.super_block.block_size as usize,
-        )?)
+        let block = self
+            .frag_cache
+            .lock()
+            .get(&reader, &frag, self.super_block.block_size)?;
+        Ok(block)
     }
 }
 

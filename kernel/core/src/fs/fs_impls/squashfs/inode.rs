@@ -71,8 +71,9 @@ pub(super) struct ParsedInode {
 /// An inode as read straight from the metadata stream, before its UID/GID
 /// indexes are resolved against the ID table.
 ///
-/// Resolving UID/GID requires another metadata read, so it is deferred to
-/// [`super::fs::SquashFs::read_inode`].
+/// Resolving UID/GID requires another metadata read through the same locked
+/// cache, so it is deferred to [`super::fs::SquashFs::read_inode`] until the
+/// metadata reader's lock has been released.
 pub(super) struct RawInode {
     pub(super) mode: u16,
     /// Index into the UID/GID table, resolved later into a real UID.

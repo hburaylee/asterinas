@@ -8,10 +8,12 @@
 //! # Design notes
 //!
 //! Following the Linux kernel, inodes and directory entries are read and
-//! decompressed on demand rather than materialised at mount time. The UID/GID
-//! and fragment tables are likewise resolved one entry at a time; only their
-//! top-level block-pointer arrays are held resident. File data blocks are read
-//! on-demand through the page cache.
+//! decompressed on demand through a small cache of decompressed metadata
+//! blocks rather than materialised at mount time. The UID/GID and fragment
+//! tables are likewise resolved one entry at a time; only their top-level
+//! block-pointer arrays are held resident. File data blocks are read on-demand
+//! through the page cache; decompressed fragment blocks, which may be shared
+//! by many files, are served from a small round-robin fragment cache.
 
 use core::fmt;
 
