@@ -42,10 +42,21 @@ if [ ! -e ${ASTER_IMAGE_PATH} ]; then
     echo "Image created successfully!"
 fi
 
-DISK=$(losetup -fP --show ${ASTER_IMAGE_PATH})
-cleanup() {
-    losetup -d ${DISK} 2>/dev/null || true
-}
-trap cleanup EXIT INT TERM ERR
+# /dev/loop-control may exist even when loop devices cannot be created
+# (for example, in an unprivileged container where losetup fails with
+# EPERM). Try the loop-based path first and fall back to the loop-free
+# installation directly into the image file when losetup fails.
+DISK=""
+if DISK=$(losetup -fP --show ${ASTER_IMAGE_PATH}); then
+    cleanup() {
+        if [[ -n "${DISK}" ]]; then
+            losetup -d ${DISK} 2>/dev/null || true
+        fi
+    }
+    trap cleanup EXIT INT TERM ERR
 
-${DISTRO_DIR}/result/bin/aster-nixos-install --config ${CONFIG_PATH} --disk ${DISK}
+    ${DISTRO_DIR}/result/bin/aster-nixos-install --config ${CONFIG_PATH} --disk ${DISK}
+else
+    echo "losetup failed; falling back to loop-free image installation." >&2
+    ${DISTRO_DIR}/result/bin/aster-nixos-install --config ${CONFIG_PATH} --image ${ASTER_IMAGE_PATH}
+fi
