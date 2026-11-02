@@ -7,6 +7,7 @@ set -e
 # Default values
 CONFIG_PATH=""
 DISK=""
+IMAGE=""
 FORCE_FORMAT_DISK=false
 
 # Function to display help
@@ -14,16 +15,19 @@ show_help() {
     cat << EOF
 Usage:
 $0 --config <CONFIG_PATH> --disk <DISK> [--force-format-disk]
+$0 --config <CONFIG_PATH> --image <IMAGE_PATH>
 $0 [-h | --help]
 
 Options:
   --config <CONFIG_PATH>      Path to the configuration file.
-  --disk <DISK>               Target disk for installation (e.g., /dev/sda).
+  --disk <DISK>               Target block device for installation (e.g., /dev/sda).
+  --image <IMAGE_PATH>        Target disk image file; installs without loop devices.
   --force-format-disk         Forcefully format the specified disk (DANGEROUS!).
   -h, --help                  Show this help message.
 
-Example:
+Examples:
   $0 --config ./distro/configuration.nix --disk /dev/vda --force-format-disk
+  $0 --config ./distro/configuration.nix --image ./asterinas.img
 EOF
 }
 
@@ -44,6 +48,14 @@ while [[ $# -gt 0 ]]; do
                 exit 1
             fi
             DISK="$2"
+            shift 2
+            ;;
+        --image)
+            if [[ -z "$2" ]] || [[ "$2" == -* ]]; then
+                echo "Error: --image requires a non-empty argument." >&2
+                exit 1
+            fi
+            IMAGE="$2"
             shift 2
             ;;
         --force-format-disk)
@@ -68,9 +80,195 @@ if [[ -z "$CONFIG_PATH" ]]; then
     exit 1
 fi
 
-if [[ -z "$DISK" ]]; then
-    echo "Error: --disk is required." >&2
+if [[ -n "$DISK" && -n "$IMAGE" ]]; then
+    echo "Error: --disk and --image are mutually exclusive." >&2
     exit 1
+fi
+
+if [[ -z "$DISK" && -z "$IMAGE" ]]; then
+    echo "Error: either --disk or --image is required." >&2
+    exit 1
+fi
+
+# Install NixOS directly into a disk image file without using loop devices.
+# The image is partitioned and populated with parted/mkfs/mcopy/dd.
+install_to_image() {
+    local IMAGE=$1
+    local CONFIG_PATH=$2
+
+    echo "Installing Asterinas NixOS into ${IMAGE} without loop devices."
+
+    local BUILD_DIR ESP_IMG ESP_CONTENT_DIR ROOT_IMG
+    BUILD_DIR=$(mktemp -d /tmp/aster-nixos-install.XXXXXX)
+    # Nix needs to read the configuration files under BUILD_DIR while building
+    # the system closure, so the directory must be traversable.
+    chmod 755 "${BUILD_DIR}"
+    ESP_IMG=$(mktemp /tmp/aster-nixos-esp.XXXXXX.img)
+    ESP_CONTENT_DIR=$(mktemp -d /tmp/aster-nixos-esp-content.XXXXXX)
+    ROOT_IMG=$(mktemp /tmp/aster-nixos-root.XXXXXX.img)
+
+    cleanup_image() {
+        rm -f "${ESP_IMG}" "${ROOT_IMG}"
+        rm -rf "${BUILD_DIR}" "${ESP_CONTENT_DIR}"
+    }
+    trap cleanup_image EXIT INT TERM ERR
+
+    # Create a GPT partition table directly inside the image file.
+    parted -s "${IMAGE}" -- mklabel gpt
+    parted -s "${IMAGE}" -- mkpart ESP fat32 1MB 512MB
+    parted -s "${IMAGE}" -- mkpart root ext2 512MB 100%
+    parted -s "${IMAGE}" -- set 1 esp on
+
+    # Read the byte offsets and sizes that parted actually assigned.
+    local PART_INFO ESP_START ESP_SIZE ROOT_START ROOT_SIZE
+    PART_INFO=$(parted -s -m "${IMAGE}" unit B print | awk -F: '
+        /^1:/ { gsub(/B$/, "", $2); gsub(/B$/, "", $4); esp_start=$2; esp_size=$4 }
+        /^2:/ { gsub(/B$/, "", $2); gsub(/B$/, "", $4); root_start=$2; root_size=$4 }
+        END { print esp_start, esp_size, root_start, root_size }')
+
+    read -r ESP_START ESP_SIZE ROOT_START ROOT_SIZE <<< "${PART_INFO}"
+    if [[ -z "${ESP_START}" || -z "${ESP_SIZE}" || -z "${ROOT_START}" || -z "${ROOT_SIZE}" ]]; then
+        echo "Error: failed to parse partitions from ${IMAGE}." >&2
+        exit 1
+    fi
+
+    # Populate a staging directory exactly like the block-device path.
+    mkdir -p "${BUILD_DIR}/boot" "${BUILD_DIR}/tmp" "${BUILD_DIR}/etc/nixos"
+    chmod 1777 "${BUILD_DIR}/tmp"
+
+    cp "${CONFIG_PATH}" "${BUILD_DIR}/etc/nixos/configuration.nix"
+    cp @aster-configuration@ "${BUILD_DIR}/etc/nixos/aster_configuration.nix"
+    cp -r @aster-etc-nixos@/modules "${BUILD_DIR}/etc/nixos"
+    cp -r @aster-etc-nixos@/overlays "${BUILD_DIR}/etc/nixos"
+
+    COMMON_NIX_ARGS=(
+        --option extra-substituters "@aster-substituters@"
+        --option extra-trusted-public-keys "@aster-trusted-public-keys@"
+    )
+
+    NIX_SYSTEM="@aster-target-platform@"
+    NIXPKGS_PATH="@aster-nixpkgs@"
+
+    SYSTEM_CLOSURE=$(nix-build "${NIXPKGS_PATH}/nixos" -A system \
+        --option extra-platforms "${NIX_SYSTEM}" \
+        --argstr system "${NIX_SYSTEM}" \
+        -I "nixos-config=${BUILD_DIR}/etc/nixos/configuration.nix" \
+        "${COMMON_NIX_ARGS[@]}" \
+        --no-out-link)
+
+    export PATH=${PATH}:/run/current-system/sw/bin
+
+    # Install the system manually rather than through `nixos-install`:
+    # `nixos-install` invokes `nixos-enter`, whose `unshare --mount-proc`
+    # is not available in unprivileged containers.
+    nix-env --store "${BUILD_DIR}" \
+        "${COMMON_NIX_ARGS[@]}" \
+        --extra-substituters "auto?trusted=1" \
+        -p "${BUILD_DIR}/nix/var/nix/profiles/system" \
+        --set "${SYSTEM_CLOSURE}"
+
+    # The activation script normally mounts /sys, /proc, and /run through its
+    # `specialfs` snippet. Mounting sysfs/procfs is not permitted in this
+    # unprivileged container, so patch that snippet out of the copy in the
+    # target store before running activation.
+    local ACTIVATE_PATH
+    ACTIVATE_PATH="${BUILD_DIR}/nix/store/$(basename "${SYSTEM_CLOSURE}")/activate"
+    chmod u+w "${ACTIVATE_PATH}"
+    sed -i 's|^source /nix/store/.*-mounts.sh$|# &|' "${ACTIVATE_PATH}"
+
+    # At boot, systemd mounts a fresh tmpfs on /run, which would hide the
+    # /run/current-system symlink created by activation. Mount /run before
+    # activation in the stage-2 init script so the symlink survives into
+    # the running system.
+    local INIT_PATH
+    INIT_PATH="${BUILD_DIR}/nix/store/$(basename "${SYSTEM_CLOSURE}")/init"
+    chmod u+w "${INIT_PATH}"
+    awk '{
+        print
+        if ($0 == "echo \"running activation script...\"") {
+            print "mkdir -p /run"
+            print "mount -n -t tmpfs -o mode=755 tmpfs /run"
+        }
+    }' "${INIT_PATH}" > "${INIT_PATH}.tmp"
+    chmod --reference="${INIT_PATH}" "${INIT_PATH}.tmp"
+    mv "${INIT_PATH}.tmp" "${INIT_PATH}"
+
+    mkdir -m 0755 -p "${BUILD_DIR}/etc"
+    touch "${BUILD_DIR}/etc/NIXOS"
+    ln -sfn /proc/mounts "${BUILD_DIR}/etc/mtab"
+    mkdir -p "${BUILD_DIR}/run"
+
+    mkdir -p "${BUILD_DIR}/dev" "${BUILD_DIR}/sys" "${BUILD_DIR}/proc"
+    # The activation script only needs /dev/null during installation. A real
+    # devtmpfs is mounted over /dev when the image boots.
+    : > "${BUILD_DIR}/dev/null"
+    chmod 666 "${BUILD_DIR}/dev/null"
+
+    chroot "${BUILD_DIR}" /nix/var/nix/profiles/system/activate
+
+    # Install GRUB manually. The NixOS `switch-to-configuration boot` helper
+    # probes /dev/vda* block devices, which do not exist in a loop-free image
+    # build, so create a standalone EFI image and a minimal grub.cfg directly.
+    local KERNEL_PATH INITRD_PATH KERNEL_PARAMS
+    KERNEL_PATH=$(chroot "${BUILD_DIR}" readlink -f /nix/var/nix/profiles/system/kernel)
+    INITRD_PATH=$(chroot "${BUILD_DIR}" readlink -f /nix/var/nix/profiles/system/initrd)
+    KERNEL_PARAMS=$(cat "${BUILD_DIR}/nix/var/nix/profiles/system/kernel-params")
+
+    mkdir -p "${BUILD_DIR}/boot/grub" "${BUILD_DIR}/boot/EFI/BOOT"
+    cat > "${BUILD_DIR}/boot/grub/grub.cfg" <<EOF
+set default=0
+set timeout=0
+menuentry "Asterinas NixOS" {
+    insmod part_gpt
+    insmod ext2
+    insmod fat
+    insmod search
+    insmod search_label
+    search --no-floppy --set=root --label nixos
+    linux ${KERNEL_PATH} ${KERNEL_PARAMS}
+    initrd ${INITRD_PATH}
+}
+EOF
+
+    grub-mkstandalone \
+        --format=x86_64-efi \
+        --output="${BUILD_DIR}/boot/EFI/BOOT/BOOTX64.EFI" \
+        --modules="part_gpt ext2 fat normal linux nativedisk search search_label" \
+        "boot/grub/grub.cfg=${BUILD_DIR}/boot/grub/grub.cfg"
+
+    # Keep only the current system generation.
+    nix-env --store "${BUILD_DIR}" \
+        -p "${BUILD_DIR}/nix/var/nix/profiles/system" \
+        --delete-generations old
+    nix-store --store "${BUILD_DIR}" --gc
+
+    # Put /boot on the ESP. The root filesystem keeps /boot only as a mount point.
+    cp -a "${BUILD_DIR}/boot/." "${ESP_CONTENT_DIR}/"
+    rm -rf "${BUILD_DIR}"/boot/*
+
+    truncate -s "${ESP_SIZE}" "${ESP_IMG}"
+    mkfs.fat -F 32 -n boot "${ESP_IMG}"
+    (cd "${ESP_CONTENT_DIR}" && for entry in *; do
+        [[ -e "${entry}" ]] || continue
+        if [[ -d "${entry}" ]]; then
+            mcopy -s -i "${ESP_IMG}" "${entry}" "::/${entry}"
+        else
+            mcopy -i "${ESP_IMG}" "${entry}" "::/${entry}"
+        fi
+    done)
+
+    truncate -s "${ROOT_SIZE}" "${ROOT_IMG}"
+    mkfs.ext2 -L nixos -d "${BUILD_DIR}" "${ROOT_IMG}"
+
+    dd if="${ESP_IMG}" of="${IMAGE}" bs=512 seek=$((ESP_START / 512)) conv=notrunc status=none
+    dd if="${ROOT_IMG}" of="${IMAGE}" bs=512 seek=$((ROOT_START / 512)) conv=notrunc status=none
+
+    echo "Congratulations! Asterinas NixOS has been installed successfully!"
+}
+
+if [[ -n "$IMAGE" ]]; then
+    install_to_image "$IMAGE" "$CONFIG_PATH"
+    exit 0
 fi
 
 # When a tool below closes the disk after writing it, udevd asks the kernel
