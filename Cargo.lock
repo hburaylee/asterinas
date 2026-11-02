@@ -127,6 +127,7 @@ dependencies = [
 name = "aster-console"
 version = "0.1.0"
 dependencies = [
+ "aster-device",
  "component",
  "ostd",
  "spin",

@@ -4,6 +4,7 @@ use alloc::{boxed::Box, fmt::Debug, string::ToString, sync::Arc, vec::Vec};
 use core::hint::spin_loop;
 
 use aster_console::{AnyConsoleDevice, ConsoleCallback};
+use aster_device::common::AnyDevice;
 use aster_util::mem_obj_slice::Slice;
 use ostd::{
     arch::trap::TrapFrame,
@@ -64,6 +65,10 @@ impl AnyConsoleDevice for ConsoleDevice {
             // Contention on pushing, retry.
             spin_loop();
         }
+    }
+
+    fn backing_device(&self) -> Option<Arc<dyn AnyDevice>> {
+        Some(self.virtio_device.clone() as Arc<dyn AnyDevice>)
     }
 }
 
