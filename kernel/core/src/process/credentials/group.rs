@@ -10,6 +10,13 @@ use crate::prelude::*;
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Pod)]
 pub(crate) struct Gid(u32);
 
+const DEFAULT_OVERFLOW_GID: u32 = 65534;
+
+/// The kernel-wide overflow GID, configurable via `/proc/sys/kernel/overflowgid`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v6.15/source/kernel/sys.c#L167>
+static OVERFLOW_GID: AtomicU32 = AtomicU32::new(DEFAULT_OVERFLOW_GID);
+
 impl Gid {
     /// The invalid GID, typically used to indicate that no valid GID is found when returning to user space.
     ///
@@ -18,11 +25,15 @@ impl Gid {
 
     /// The overflow GID, typically used to indicate that group mappings between namespaces fail.
     ///
-    /// This is currently a constant (65534 is usually the "nobody" group), but it should be
-    /// configured via `/proc/sys/kernel/overflowgid`.
-    ///
-    /// Reference: <https://elixir.bootlin.com/linux/v6.15/source/kernel/sys.c#L167>.
-    pub(crate) const OVERFLOW: Gid = Self::new(65534);
+    /// 65534 is usually the "nobody" group. The value can be configured via
+    /// `/proc/sys/kernel/overflowgid`.
+    pub(crate) fn overflow() -> Self {
+        Self::new(OVERFLOW_GID.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_overflow(gid: Self) {
+        OVERFLOW_GID.store(gid.0, Ordering::Relaxed);
+    }
 
     pub(crate) const fn new(gid: u32) -> Self {
         Self(gid)

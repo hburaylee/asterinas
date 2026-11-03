@@ -102,7 +102,7 @@ impl CUserCred {
         Self {
             pid: 0,
             uid: Uid::overflow(),
-            gid: Gid::OVERFLOW,
+            gid: Gid::overflow(),
         }
     }
 }
