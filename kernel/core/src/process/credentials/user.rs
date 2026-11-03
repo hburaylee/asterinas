@@ -11,6 +11,12 @@ use crate::prelude::*;
 pub(crate) struct Uid(u32);
 
 const ROOT_UID: u32 = 0;
+const DEFAULT_OVERFLOW_UID: u32 = 65534;
+
+/// The kernel-wide overflow UID, configurable via `/proc/sys/kernel/overflowuid`.
+///
+/// Reference: <https://elixir.bootlin.com/linux/v6.15/source/kernel/sys.c#L166>
+static OVERFLOW_UID: AtomicU32 = AtomicU32::new(DEFAULT_OVERFLOW_UID);
 
 impl Uid {
     /// The invalid UID, typically used to indicate that no valid UID is found when returning to user space.
@@ -20,11 +26,15 @@ impl Uid {
 
     /// The overflow UID, typically used to indicate that user mappings between namespaces fail.
     ///
-    /// This is currently a constant (65534 is usually the "nobody" user), but it should be
-    /// configured via `/proc/sys/kernel/overflowuid`.
-    ///
-    /// Reference: <https://elixir.bootlin.com/linux/v6.15/source/kernel/sys.c#L166>.
-    pub(crate) const OVERFLOW: Uid = Self::new(65534);
+    /// 65534 is usually the "nobody" user. The value can be configured via
+    /// `/proc/sys/kernel/overflowuid`.
+    pub(crate) fn overflow() -> Self {
+        Self::new(OVERFLOW_UID.load(Ordering::Relaxed))
+    }
+
+    pub(crate) fn set_overflow(uid: Self) {
+        OVERFLOW_UID.store(uid.0, Ordering::Relaxed);
+    }
 
     pub(crate) const fn new_root() -> Self {
         Self(ROOT_UID)
