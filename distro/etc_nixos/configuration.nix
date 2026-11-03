@@ -36,6 +36,7 @@
   environment.systemPackages = with pkgs; [
     hello-asterinas
     gitMinimal
+    codex
   ];
 
   system.nixos.distroName = "Asterinas NixOS";
