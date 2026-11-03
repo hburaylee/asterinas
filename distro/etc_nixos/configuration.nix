@@ -37,7 +37,15 @@
     hello-asterinas
     gitMinimal
     codex
+    vim
+    curl
+    cacert
+    uv
+    python312
+    binutils
   ];
+
+  documentation.doc.enable = false;
 
   system.nixos.distroName = "Asterinas NixOS";
 
