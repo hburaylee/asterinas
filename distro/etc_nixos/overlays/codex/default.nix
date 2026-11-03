@@ -1,8 +1,14 @@
 final: prev:
 let
-  inherit (final) lib stdenv fetchurl makeBinaryWrapper;
+  inherit (final)
+    lib
+    stdenv
+    fetchurl
+    makeBinaryWrapper
+    ;
   version = "0.166.0";
-  isSupported = stdenv.hostPlatform.system == "x86_64-linux" || stdenv.hostPlatform.system == "aarch64-linux";
+  isSupported =
+    stdenv.hostPlatform.system == "x86_64-linux" || stdenv.hostPlatform.system == "aarch64-linux";
   arch = if stdenv.hostPlatform.system == "aarch64-linux" then "aarch64" else "x86_64";
 
   codex-src = fetchurl {
@@ -26,9 +32,7 @@ let
       runHook preInstall
       tar -xzf $src
       install -Dm755 codex-${arch}-unknown-linux-musl $out/bin/codex
-      wrapProgram $out/bin/codex --prefix PATH : ${
-        lib.makeBinPath [ final.ripgrep ]
-      }
+      wrapProgram $out/bin/codex --prefix PATH : ${lib.makeBinPath [ final.ripgrep ]}
       runHook postInstall
     '';
 
