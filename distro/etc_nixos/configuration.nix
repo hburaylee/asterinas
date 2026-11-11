@@ -11,6 +11,31 @@
   pkgs,
   ...
 }:
+let
+  # Native libraries needed to compile codex-rs: the *-sys crates in
+  # codex-rs/Cargo.lock and codex-rs/bwrap/build.rs's pkg-config probe of
+  # libcap. NixOS 26.05 does not link /lib/pkgconfig or /include into the
+  # system profile by default (see nixos/modules/config/system-path.nix),
+  # so their real /nix/store paths are exported in environment.shellInit.
+  # `X.dev or X` keeps the expression valid if a package has no dev output.
+  nativeDevInputs = with pkgs; [
+    libcap
+    (libcap.dev or libcap)
+    openssl
+    (openssl.dev or openssl)
+    alsa-lib
+    (alsa-lib.dev or alsa-lib)
+    curl
+    (curl.dev or curl)
+    sqlite
+    (sqlite.dev or sqlite)
+    zlib
+    (zlib.dev or zlib)
+    zstd
+    (zstd.dev or zstd)
+    bzip2
+  ];
+in
 {
   # Do not change these imports, which describe system-wide settings for AsterNixOS.
   imports = [ ./aster_configuration.nix ];
@@ -43,7 +68,44 @@
     uv
     python312
     binutils
-  ];
+    nodejs_24
+    pnpm_10
+
+    # Rust toolchain for building and testing codex-rs inside the guest.
+    # NOTE: codex-rs/rust-toolchain.toml pins Rust 1.95.0, while `rustc` here
+    # comes from the pinned nixpkgs (nixos-26.05) and may be a different
+    # version. Nix's cargo is not a rustup proxy, so it ignores that file;
+    # check `rustc --version` in the guest before starting a full build.
+    rustc
+    cargo
+    cargo-nextest
+    just
+
+    # Native build tools.
+    gcc
+    gnumake
+    pkg-config
+    cmake
+
+    # Test and runtime helpers (sandbox tests, codex's ripgrep, coreutils).
+    bubblewrap
+    ripgrep
+    coreutils
+    findutils
+    gnused
+    gnutar
+    gzip
+  ] ++ nativeDevInputs;
+
+  # codex-rs/bwrap/build.rs calls pkg-config, and the *-sys crates need the
+  # headers and libraries behind nativeDevInputs. Point directly at the
+  # /nix/store outputs because /run/current-system/sw does not contain them.
+  # This appends to (rather than replaces) any existing value.
+  environment.shellInit = ''
+    export PKG_CONFIG_PATH="${lib.makeSearchPath "lib/pkgconfig" nativeDevInputs}:''${PKG_CONFIG_PATH:-}"
+    export C_INCLUDE_PATH="${lib.makeSearchPath "include" nativeDevInputs}:''${C_INCLUDE_PATH:-}"
+    export LIBRARY_PATH="${lib.makeSearchPath "lib" nativeDevInputs}:''${LIBRARY_PATH:-}"
+  '';
 
   documentation.doc.enable = false;
 
