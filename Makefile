@@ -103,7 +103,7 @@ VIRTIOFS_CACHE ?= auto
 # End of Virtio-fs settings.
 
 # NixOS settings
-NIXOS_DISK_SIZE_IN_MB ?= 16384
+NIXOS_DISK_SIZE_IN_MB ?= 51200
 NIXOS_DISABLE_SYSTEMD ?= false
 # The following option is only effective when NIXOS_DISABLE_SYSTEMD is set to 'true'.
 # Use a login shell to ensure that environment variables are initialized correctly.

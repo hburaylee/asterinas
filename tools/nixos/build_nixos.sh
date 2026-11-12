@@ -11,7 +11,7 @@ CONFIG_FILE_NAME=${1:-"configuration.nix"}
 SCRIPT_DIR=$(cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd)
 ASTERINAS_DIR=$(realpath ${SCRIPT_DIR}/../..)
 ASTER_IMAGE_PATH=${ASTERINAS_DIR}/target/nixos/asterinas.img
-NIXOS_DISK_SIZE_IN_MB=${NIXOS_DISK_SIZE_IN_MB:-16384}
+NIXOS_DISK_SIZE_IN_MB=${NIXOS_DISK_SIZE_IN_MB:-51200}
 DISTRO_DIR=$(realpath ${ASTERINAS_DIR}/distro)
 CONFIG_PATH=${DISTRO_DIR}/etc_nixos/${CONFIG_FILE_NAME}
 

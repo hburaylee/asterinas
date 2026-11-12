@@ -220,8 +220,8 @@ initramfs_pkgs:
 
 $(EXT2_IMAGE):
 	@mkdir -p $(BUILD_DIR)
-	@dd if=/dev/zero of=$(EXT2_IMAGE) bs=2G count=1
-	@mke2fs $(EXT2_IMAGE)
+	@truncate -s 50G $(EXT2_IMAGE)
+	@mke2fs -F $(EXT2_IMAGE)
 
 $(EXFAT_IMAGE):
 	@mkdir -p $(BUILD_DIR)
