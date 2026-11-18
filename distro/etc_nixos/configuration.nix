@@ -34,6 +34,12 @@ let
     zstd
     (zstd.dev or zstd)
     bzip2
+    # glib-2.0 is probed via pkg-config by glib-sys (pulled in through
+    # gstreamer-sys). Keep in the closure so image rebuilds do not lose it;
+    # the dev output is deterministic for the pinned nixpkgs
+    # (…-glib-2.88.1-dev must match the paths in run-codex-nextest.sh).
+    glib
+    (glib.dev or glib)
   ];
 in
 {
