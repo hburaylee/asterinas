@@ -2,31 +2,31 @@
 
 //! SiFive UART console support.
 
-use alloc::string::ToString;
+use alloc::{string::ToString, sync::Arc};
 
+use aster_platform::{
+    Attr, BusDevice, Driver, PlatformBus, PlatformDevice, PlatformResource, Result,
+};
 use aster_util::{field_ptr, safe_ptr::SafePtr};
 use fdt::node::FdtNode;
 use fdt_util::{AcquireIoMems, AcquireIrqLines};
 use ostd::{
-    arch::irq::MappedIrqLine,
     io::IoMem,
+    mm::{VmIoOnce, VmReader},
     sync::{LocalIrqDisabled, SpinLock},
 };
-use spin::Once;
 
 use crate::console::{Uart, UartConsole, UartMut};
 
 pub(super) const FDT_COMPATIBLES: [&str; 2] = ["sifive,uart0", "sifive,fu540-c000-uart"];
 
-/// IRQ line for UART serial.
-static IRQ_LINE: Once<MappedIrqLine> = Once::new();
-
-pub(super) fn init(fdt_node: FdtNode) {
+/// Parses the device resources from the FDT node.
+pub(super) fn parse_resource(fdt_node: &FdtNode) -> Option<PlatformResource> {
     let Some([io_mem]) = fdt_node.acquire_io_mems([size_of::<Registers>()]) else {
-        return;
+        return None;
     };
-    let Some([mut irq_line]) = fdt_node.acquire_irq_lines() else {
-        return;
+    let Some([irq_line]) = fdt_node.acquire_irq_lines() else {
+        return None;
     };
 
     let clock_hz = fdt_node
@@ -37,22 +37,60 @@ pub(super) fn init(fdt_node: FdtNode) {
         // a PRCI clock provider instead of a direct `clock-frequency` property.
         .unwrap_or(SifiveUart::DEFAULT_CLOCK_HZ);
 
-    let mut uart: SpinLock<SifiveUart, LocalIrqDisabled> = SpinLock::new(SifiveUart::new(io_mem));
-    uart.get_mut().init(clock_hz);
+    Some(
+        PlatformResource::new(FDT_COMPATIBLES[0], Some(io_mem))
+            .with_irq(irq_line)
+            .with_clock_hz(clock_hz),
+    )
+}
 
-    let uart_console = UartConsole::new(uart);
+/// The driver for SiFive UART serial devices discovered in the FDT.
+pub(super) struct SiFiveSerialDriver;
 
-    aster_console::register_device(
-        aster_console::UART_CONSOLE_NAME.to_string(),
-        uart_console.clone(),
-    );
+impl Driver<PlatformBus> for SiFiveSerialDriver {
+    fn name(&self) -> &str {
+        "sifive-uart"
+    }
 
-    let cloned_uart_console = uart_console.clone();
-    irq_line.on_active(move |_| cloned_uart_console.trigger_input_callbacks());
-    IRQ_LINE.call_once(move || irq_line);
-    uart_console.uart().flush();
+    fn match_data(&self) -> &'static [&'static str] {
+        &FDT_COMPATIBLES
+    }
 
-    ostd::info!("Registered SiFive UART as a console");
+    fn on_probe(&self, dev: &Arc<PlatformDevice>) -> Result<()> {
+        let resource = dev.payload();
+        let (Some(io_mem), Some(irq_line)) = (resource.io_mem(), resource.irq()) else {
+            return Ok(());
+        };
+
+        let mut uart = SifiveUart::new(io_mem);
+        uart.init(resource.clock_hz().unwrap_or(SifiveUart::DEFAULT_CLOCK_HZ));
+
+        let console = UartConsole::new(SpinLock::<_, LocalIrqDisabled>::new(uart), dev.clone());
+        aster_console::register_device(
+            aster_console::UART_CONSOLE_NAME.to_string(),
+            console.clone(),
+        );
+
+        // The IRQ line is kept alive by the platform device.
+        let cloned_console = console.clone();
+        irq_line
+            .lock()
+            .on_active(move |_| cloned_console.trigger_input_callbacks());
+        console.uart().flush();
+
+        ostd::info!("registered SiFive UART as a console");
+        Ok(())
+    }
+
+    fn on_release(&self, _dev: &Arc<PlatformDevice>) {}
+
+    fn dev_attrs(&self) -> &'static [Attr<BusDevice<PlatformBus>>] {
+        &[]
+    }
+
+    fn suppress_bind_attrs(&self) -> bool {
+        false
+    }
 }
 
 struct SifiveUart {

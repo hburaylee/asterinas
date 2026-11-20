@@ -80,7 +80,7 @@ pub(super) fn init_in_first_process() -> Result<()> {
         let serial0 = Tty::new(SerialDriver::MINOR_ID_BASE, driver);
 
         SERIAL0.call_once(|| serial0.clone());
-        class::add_tty_device(serial0.clone(), None)?;
+        class::add_tty_device(serial0.clone(), serial_console.backing_device())?;
 
         serial_console.register_callback(Box::leak(Box::new(
             move |mut reader: VmReader<Infallible>| {

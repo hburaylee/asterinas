@@ -1,43 +1,91 @@
 // SPDX-License-Identifier: MPL-2.0
 
+//! The PL011 UART: an ARM prime cell UART discovered in the FDT by the
+//! early boot code and statically declared as a platform device.
+
+use alloc::{boxed::Box, string::ToString, sync::Arc};
+
+use aster_platform::{
+    Attr, BusDevice, Driver, PlatformBus, PlatformDevice, PlatformResource, Result,
+};
 use fdt_util::AcquireIrqLines;
-use ostd::arch::{
-    irq::MappedIrqLine,
-    serial::{Pl011Uart, SERIAL_PORT},
-};
-use spin::Once;
+use ostd::arch::serial::{Pl011Uart, SERIAL_PORT};
 
-use crate::{
-    alloc::string::ToString,
-    console::{Uart, UartConsole, UartMut},
-};
+use crate::console::{Uart, UartConsole, UartMut};
 
-/// IRQ line for UART serial.
-static IRQ_LINE: Once<MappedIrqLine> = Once::new();
+/// The compatible string of the PL011 serial device.
+const PL011_COMPATIBLE: &str = "arm,pl011";
 
 pub(super) fn init() {
     let Some(uart) = SERIAL_PORT.get() else {
         return;
     };
 
+    // The early-probed UART keeps its FDT node. The IRQ line acquired from
+    // it is held by the platform device.
     let node = uart.lock().fdt_node();
-    let Some([mut irq_line]) = node.acquire_irq_lines() else {
+    let Some([irq_line]) = node.acquire_irq_lines() else {
         return;
     };
 
-    let uart_console = UartConsole::new(uart);
+    let resource = PlatformResource::new(PL011_COMPATIBLE, None).with_irq(irq_line);
+    if let Err(error) = aster_platform::add_device(node.name, resource) {
+        ostd::warn!("failed to register the pl011 device: {:?}", error);
+        return;
+    }
 
-    aster_console::register_device(
-        aster_console::UART_CONSOLE_NAME.to_string(),
-        uart_console.clone(),
-    );
+    if let Err(error) = aster_platform::register_driver(Box::new(Pl011SerialDriver)) {
+        ostd::warn!("failed to register the pl011 driver: {:?}", error);
+    }
+}
 
-    irq_line.on_active(move |_| uart_console.trigger_input_callbacks());
-    IRQ_LINE.call_once(move || irq_line);
-    uart.lock().enable_recv_interrupt();
-    uart.flush();
+/// The driver for the PL011 serial device.
+pub(super) struct Pl011SerialDriver;
 
-    ostd::info!("Registered PL011 as a console");
+impl Driver<PlatformBus> for Pl011SerialDriver {
+    fn name(&self) -> &str {
+        "pl011"
+    }
+
+    fn match_data(&self) -> &'static [&'static str] {
+        &[PL011_COMPATIBLE]
+    }
+
+    fn on_probe(&self, dev: &Arc<PlatformDevice>) -> Result<()> {
+        let Some(uart) = SERIAL_PORT.get() else {
+            return Ok(());
+        };
+        let Some(irq_line) = dev.payload().irq() else {
+            return Ok(());
+        };
+
+        let console = UartConsole::new(uart, dev.clone());
+        aster_console::register_device(
+            aster_console::UART_CONSOLE_NAME.to_string(),
+            console.clone(),
+        );
+
+        // The IRQ line is kept alive by the platform device.
+        let cloned_console = console.clone();
+        irq_line
+            .lock()
+            .on_active(move |_| cloned_console.trigger_input_callbacks());
+        uart.lock().enable_recv_interrupt();
+        console.uart().flush();
+
+        ostd::info!("registered PL011 as a console");
+        Ok(())
+    }
+
+    fn on_release(&self, _dev: &Arc<PlatformDevice>) {}
+
+    fn dev_attrs(&self) -> &'static [Attr<BusDevice<PlatformBus>>] {
+        &[]
+    }
+
+    fn suppress_bind_attrs(&self) -> bool {
+        false
+    }
 }
 
 impl UartMut for Pl011Uart {

@@ -4,6 +4,7 @@ use alloc::{sync::Arc, vec::Vec};
 use core::fmt::Debug;
 
 use aster_console::{AnyConsoleDevice, ConsoleCallback};
+use aster_platform::AnyDevice;
 use inherit_methods_macro::inherit_methods;
 use ostd::{
     console::uart_ns16650a::{Ns16550aAccess, Ns16550aUart},
@@ -15,6 +16,8 @@ use ostd::{
 pub(super) struct UartConsole<U: Uart> {
     uart: U,
     callbacks: SpinLock<Vec<&'static ConsoleCallback>, LocalIrqDisabled>,
+    /// The device model node this console is reached through.
+    backing: Option<Arc<dyn AnyDevice>>,
 }
 
 impl<U: Uart> Debug for UartConsole<U> {
@@ -24,16 +27,16 @@ impl<U: Uart> Debug for UartConsole<U> {
 }
 
 impl<U: Uart> UartConsole<U> {
-    /// Creates a new UART console.
-    pub(super) fn new(uart: U) -> Arc<Self> {
+    /// Creates a new UART console over `uart`, reached through `backing`.
+    pub(super) fn new(uart: U, backing: Arc<dyn AnyDevice>) -> Arc<Self> {
         Arc::new(Self {
             uart,
             callbacks: SpinLock::new(Vec::new()),
+            backing: Some(backing),
         })
     }
 
     /// Returns a reference to the UART instance.
-    #[cfg_attr(not(target_arch = "riscv64"), expect(dead_code))]
     pub(super) fn uart(&self) -> &U {
         &self.uart
     }
@@ -67,6 +70,10 @@ impl<U: Uart + Send + Sync + 'static> AnyConsoleDevice for UartConsole<U> {
 
     fn register_callback(&self, callback: &'static ConsoleCallback) {
         self.callbacks.lock().push(callback);
+    }
+
+    fn backing_device(&self) -> Option<Arc<dyn AnyDevice>> {
+        self.backing.clone()
     }
 }
 
