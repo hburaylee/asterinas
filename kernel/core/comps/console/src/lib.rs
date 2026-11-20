@@ -10,6 +10,7 @@ extern crate alloc;
 use alloc::{collections::BTreeMap, fmt::Debug, string::String, sync::Arc, vec::Vec};
 use core::any::Any;
 
+use aster_device::common::AnyDevice;
 use component::{ComponentInitError, init_component};
 use ostd::{
     mm::{Infallible, VmReader},
@@ -27,6 +28,11 @@ pub trait AnyConsoleDevice: Send + Sync + Any + Debug {
     ///
     /// The callback may be called in the interrupt context. Therefore, it should _never_ sleep.
     fn register_callback(&self, callback: &'static ConsoleCallback);
+
+    /// Returns the device model node this console is reached through, if any.
+    fn backing_device(&self) -> Option<Arc<dyn AnyDevice>> {
+        None
+    }
 }
 
 pub const UART_CONSOLE_NAME: &str = "Uart-Console";

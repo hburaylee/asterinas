@@ -9,6 +9,7 @@ mod pty;
 pub mod registry;
 pub(crate) mod tty;
 
+use aster_device::class::{Class, ClassDevice};
 use device_id::DeviceId;
 pub(crate) use mem::{getrandom, geturandom};
 pub(crate) use pty::{PtyMaster, PtySlave, new_pty_pair};
@@ -52,6 +53,22 @@ pub enum DeviceType {
     Block,
 }
 
+/// Adds a class device to the device model and the char registry.
+///
+/// If the char registry refuses the device,
+/// the device model registration is undone rather than left dangling.
+pub(crate) fn add_class_char_device<C: Class>(device: &Arc<ClassDevice<C>>) -> Result<()>
+where
+    ClassDevice<C>: Device,
+{
+    aster_device::add_device(device)?;
+    if let Err(error) = registry::char::register(device.clone()) {
+        let _ = aster_device::remove_device(device);
+        return Err(error);
+    }
+    Ok(())
+}
+
 pub(crate) fn init_in_first_kthread() {
     model::init_in_first_kthread();
     registry::init_in_first_kthread();
@@ -66,7 +83,6 @@ pub(crate) fn init_in_first_kthread() {
 /// Initializes device state after mounting rootfs.
 pub(crate) fn init_in_first_process() -> Result<()> {
     tty::init_in_first_process()?;
-    registry::init_in_first_process()?;
 
     Ok(())
 }

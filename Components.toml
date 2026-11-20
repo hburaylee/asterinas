@@ -14,6 +14,7 @@ mlsdisk = { name = "aster-mlsdisk" }
 network = { name = "aster-network" }
 nvme = { name = "aster-nvme" }
 pci = { name = "aster-pci" }
+platform = { name = "aster-platform" }
 simpledrm = { name = "aster-simpledrm" }
 softirq = { name = "aster-softirq" }
 systree = { name = "aster-systree" }

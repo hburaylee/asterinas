@@ -99,6 +99,7 @@ name = "aster-block"
 version = "0.1.0"
 dependencies = [
  "align_ext",
+ "aster-device",
  "aster-util",
  "component",
  "device-id",
@@ -126,6 +127,7 @@ dependencies = [
 name = "aster-console"
 version = "0.1.0"
 dependencies = [
+ "aster-device",
  "component",
  "ostd",
  "spin",
@@ -296,6 +298,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "aster-block",
+ "aster-device",
  "bittle",
  "component",
  "ctr",
@@ -350,6 +353,16 @@ dependencies = [
  "fdt",
  "fdt-util",
  "int-to-c-enum",
+ "ostd",
+ "spin",
+]
+
+[[package]]
+name = "aster-platform"
+version = "0.1.0"
+dependencies = [
+ "aster-device",
+ "component",
  "ostd",
  "spin",
 ]
@@ -425,6 +438,7 @@ name = "aster-uart"
 version = "0.1.0"
 dependencies = [
  "aster-console",
+ "aster-platform",
  "aster-util",
  "component",
  "fdt",
@@ -471,6 +485,7 @@ dependencies = [
  "dma-pool",
  "fdt-util",
  "id-alloc",
+ "inherit-methods-macro",
  "int-to-c-enum",
  "io-util",
  "ostd",
