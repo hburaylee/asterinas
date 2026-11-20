@@ -358,6 +358,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-platform"
+version = "0.1.0"
+dependencies = [
+ "aster-device",
+ "component",
+ "ostd",
+ "spin",
+]
+
+[[package]]
 name = "aster-rights"
 version = "0.1.0"
 dependencies = [
@@ -428,6 +438,7 @@ name = "aster-uart"
 version = "0.1.0"
 dependencies = [
  "aster-console",
+ "aster-platform",
  "aster-util",
  "component",
  "fdt",
