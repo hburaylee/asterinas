@@ -36,7 +36,7 @@ pub(crate) use file::{getrandom, geturandom};
 use spin::Once;
 
 use super::{
-    Device, DeviceType,
+    Device, DeviceType, add_class_char_device,
     registry::char::{self, MajorIdOwner},
 };
 use crate::{
@@ -126,12 +126,5 @@ fn add_device(file: MemFile) -> Result<()> {
     let device = MemDevice::builder(class, file.name(), file)
         .devnum(DevNum::char(id))
         .build();
-    aster_device::add_device(&device)?;
-    // The number-to-open map is the second registry; if it refuses the
-    // device, the first registration is undone rather than left dangling.
-    if let Err(error) = char::register(device.clone()) {
-        let _ = aster_device::remove_device(&device);
-        return Err(error);
-    }
-    Ok(())
+    add_class_char_device(&device)
 }
