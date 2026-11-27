@@ -1,8 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use aster_device::common::SysStr;
+
 use crate::{
     device::tty::{Tty, termio::CTermios},
-    fs::{devtmpfs::DevtmpfsNodeMeta, file::PerOpenFileOps},
+    fs::file::PerOpenFileOps,
     prelude::*,
     util::ioctl::RawIoctl,
 };
@@ -19,8 +21,11 @@ pub(crate) trait TtyDriver: Send + Sync + 'static {
     /// The device major ID.
     const DEVICE_MAJOR_ID: u32;
 
-    /// Returns the metadata that specifies a TTY device inode to be created in devtmpfs, if any.
-    fn devtmpfs_meta(&self, _index: u32) -> Option<DevtmpfsNodeMeta>;
+    /// Returns the name of the device node the TTY with `index` owns in devtmpfs.
+    ///
+    /// `None` means the TTY has no node of its own, like a PTY slave whose node belongs
+    /// to devpts.
+    fn devnode_name(&self, _index: u32) -> Option<SysStr>;
 
     /// Opens the TTY.
     ///

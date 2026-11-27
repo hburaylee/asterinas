@@ -6,19 +6,18 @@
 //!
 //! Reference: <https://www.kernel.org/doc/html/latest/admin-guide/devices.html>
 
+use aster_device::common::SysStr;
 use device_id::{DeviceId, MajorId, MinorId};
 use spin::Once;
 
+use super::{
+    class::{AnyTtyDevice, add_tty_device},
+    hvc::hvc0_device,
+    serial::serial0_device,
+    vt::active_vt,
+};
 use crate::{
-    device::{
-        Device, DeviceType,
-        registry::char,
-        tty::{hvc::hvc0_device, serial::serial0_device, vt::active_vt},
-    },
-    fs::{
-        devtmpfs::DevtmpfsNodeMeta,
-        file::{PerOpenFileOps, mkmod},
-    },
+    fs::file::{InodeMode, PerOpenFileOps, mkmod},
     prelude::*,
 };
 
@@ -26,21 +25,17 @@ use crate::{
 /// terminal.
 pub(crate) struct Tty0Device;
 
-impl Device for Tty0Device {
-    fn type_(&self) -> DeviceType {
-        DeviceType::Char
+impl AnyTtyDevice for Tty0Device {
+    fn devnode_name(&self) -> Option<SysStr> {
+        Some("tty0".into())
     }
 
-    fn id(&self) -> DeviceId {
+    fn device_id(&self) -> DeviceId {
         DeviceId::new(MajorId::new(4), MinorId::new(0))
     }
 
-    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
-        Some(DevtmpfsNodeMeta::new("tty0").unwrap())
-    }
-
-    fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
-        active_vt().open()
+    fn open_file(&self) -> Result<Box<dyn PerOpenFileOps>> {
+        active_vt().open_file()
     }
 }
 
@@ -48,21 +43,21 @@ impl Device for Tty0Device {
 /// of the session of the current process.
 pub(crate) struct TtyDevice;
 
-impl Device for TtyDevice {
-    fn type_(&self) -> DeviceType {
-        DeviceType::Char
+impl AnyTtyDevice for TtyDevice {
+    fn devnode_name(&self) -> Option<SysStr> {
+        Some("tty".into())
     }
 
-    fn id(&self) -> DeviceId {
+    fn device_id(&self) -> DeviceId {
         DeviceId::new(MajorId::new(5), MinorId::new(0))
     }
 
-    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
+    fn devnode_mode(&self) -> InodeMode {
         // Reference: <https://elixir.bootlin.com/linux/v6.18/source/drivers/tty/tty_io.c#L3511>.
-        Some(DevtmpfsNodeMeta::with_mode("tty", mkmod!(a+rw)).unwrap())
+        mkmod!(a+rw)
     }
 
-    fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
+    fn open_file(&self) -> Result<Box<dyn PerOpenFileOps>> {
         let Some(terminal) = current!().terminal() else {
             return Err(errno!(
                 ENOTTY,
@@ -77,65 +72,56 @@ impl Device for TtyDevice {
 /// Corresponds to `/dev/console` in the file system. This device represents a console to which
 /// system messages will be sent.
 pub(crate) struct SystemConsole {
-    inner: Arc<dyn Device>,
+    inner: Arc<dyn AnyTtyDevice>,
 }
 
 /// The device ID of `/dev/console`.
 pub(crate) const CONSOLE_DEVICE_ID: DeviceId = DeviceId::new(MajorId::new(5), MinorId::new(1));
 
 impl SystemConsole {
-    /// Returns the singleton instance of the console device.
-    pub(crate) fn singleton() -> &'static Arc<SystemConsole> {
-        static INSTANCE: Once<Arc<SystemConsole>> = Once::new();
+    /// Creates the console device that forwards I/O to the TTY selected by `console=`.
+    pub(super) fn from_console_param() -> Self {
+        // TODO: Support specifying multiple TTY devices, e.g., "console=hvc0 console=tty0".
+        let console_name = CONSOLES
+            .get()
+            .and_then(|consoles| consoles.first().map(|s| s.as_str()))
+            .unwrap_or("tty0");
 
-        INSTANCE.call_once(|| {
-            // TODO: Support specifying multiple TTY devices, e.g., "console=hvc0 console=tty0".
-            let console_name = CONSOLES
-                .get()
-                .and_then(|consoles| consoles.first().map(|s| s.as_str()))
-                .unwrap_or("tty0");
+        let console: Option<Arc<dyn AnyTtyDevice>> = match console_name {
+            "tty0" => Some(Arc::new(Tty0Device)),
+            "ttyS0" => serial0_device().cloned().map(|device| device as _),
+            "hvc0" => hvc0_device().cloned().map(|device| device as _),
+            _ => None,
+        };
+        let inner = console.unwrap_or_else(|| {
+            warn!(
+                "'{}' console not found, falling back to 'tty0'",
+                console_name
+            );
+            Arc::new(Tty0Device)
+        });
 
-            let device = match console_name {
-                "tty0" => Some(Arc::new(Tty0Device) as _),
-                "ttyS0" => serial0_device().cloned().map(|device| device as _),
-                "hvc0" => hvc0_device().cloned().map(|device| device as _),
-                _ => None,
-            };
-            let inner = device.unwrap_or_else(|| {
-                warn!(
-                    "'{}' console not found, falling back to 'tty0'",
-                    console_name
-                );
-                Arc::new(Tty0Device) as _
-            });
-
-            Arc::new(Self { inner })
-        })
+        Self { inner }
     }
 }
 
-impl Device for SystemConsole {
-    fn type_(&self) -> DeviceType {
-        DeviceType::Char
+impl AnyTtyDevice for SystemConsole {
+    fn devnode_name(&self) -> Option<SysStr> {
+        Some("console".into())
     }
 
-    fn id(&self) -> DeviceId {
+    fn device_id(&self) -> DeviceId {
         CONSOLE_DEVICE_ID
     }
 
-    fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
-        Some(DevtmpfsNodeMeta::new("console").unwrap())
-    }
-
-    fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
-        self.inner.open()
+    fn open_file(&self) -> Result<Box<dyn PerOpenFileOps>> {
+        self.inner.open_file()
     }
 }
 
 pub(super) fn init_in_first_process() -> Result<()> {
-    char::register(Arc::new(Tty0Device))?;
-    char::register(Arc::new(TtyDevice))?;
-    char::register(SystemConsole::singleton().clone())?;
+    add_tty_device(Arc::new(Tty0Device), None)?;
+    add_tty_device(Arc::new(TtyDevice), None)?;
 
     Ok(())
 }

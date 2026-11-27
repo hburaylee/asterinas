@@ -1,9 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
+use aster_device::common::SysStr;
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::sync::LocalIrqDisabled;
 
-use self::{line_discipline::LineDiscipline, termio::CFontOp};
+use self::{class::AnyTtyDevice, line_discipline::LineDiscipline, termio::CFontOp};
 use crate::{
     device::{Device, DeviceType},
     dispatch_ioctl,
@@ -20,6 +21,7 @@ use crate::{
     util::ioctl::RawIoctl,
 };
 
+mod class;
 mod device;
 mod driver;
 mod file;
@@ -36,10 +38,14 @@ pub(super) use driver::TtyDriver;
 pub(super) use flags::TtyFlags;
 
 pub(super) fn init_in_first_process() -> Result<()> {
+    class::register()?;
+
     hvc::init_in_first_process()?;
     serial::init_in_first_process()?;
     device::init_in_first_process()?;
     vt::init_in_first_process()?;
+
+    class::add_console_device()?;
 
     Ok(())
 }
@@ -347,6 +353,20 @@ impl<D: TtyDriver> Terminal for Tty<D> {
     }
 }
 
+impl<D: TtyDriver> AnyTtyDevice for Tty<D> {
+    fn devnode_name(&self) -> Option<SysStr> {
+        self.driver.devnode_name(self.index)
+    }
+
+    fn device_id(&self) -> DeviceId {
+        Device::id(self)
+    }
+
+    fn open_file(&self) -> Result<Box<dyn PerOpenFileOps>> {
+        Device::open(self)
+    }
+}
+
 impl<D: TtyDriver> Device for Tty<D> {
     fn type_(&self) -> DeviceType {
         DeviceType::Char
@@ -360,7 +380,8 @@ impl<D: TtyDriver> Device for Tty<D> {
     }
 
     fn devtmpfs_meta(&self) -> Option<DevtmpfsNodeMeta> {
-        self.driver.devtmpfs_meta(self.index)
+        // The `tty` class creates the node when the device is added.
+        None
     }
 
     fn open(&self) -> Result<Box<dyn PerOpenFileOps>> {
