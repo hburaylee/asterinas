@@ -6,12 +6,12 @@
 //!
 //! Reference: <https://www.kernel.org/doc/html/latest/admin-guide/devices.html>
 
-use aster_device::common::SysStr;
+use aster_device::common::{Attr, Error as DeviceError, SysStr};
 use device_id::{DeviceId, MajorId, MinorId};
 use spin::Once;
 
 use super::{
-    class::{AnyTtyDevice, add_tty_device},
+    class::{AnyTtyDevice, TtyClassDevice, add_tty_device},
     hvc::hvc0_device,
     serial::serial0_device,
     vt::active_vt,
@@ -73,6 +73,7 @@ impl AnyTtyDevice for TtyDevice {
 /// system messages will be sent.
 pub(crate) struct SystemConsole {
     inner: Arc<dyn AnyTtyDevice>,
+    active_name: &'static str,
 }
 
 /// The device ID of `/dev/console`.
@@ -93,15 +94,23 @@ impl SystemConsole {
             "hvc0" => hvc0_device().cloned().map(|device| device as _),
             _ => None,
         };
-        let inner = console.unwrap_or_else(|| {
-            warn!(
-                "'{}' console not found, falling back to 'tty0'",
-                console_name
-            );
-            Arc::new(Tty0Device)
-        });
+        let (inner, active_name) = match console {
+            Some(inner) => (inner, console_name),
+            None => {
+                warn!(
+                    "'{}' console not found, falling back to 'tty0'",
+                    console_name
+                );
+                (Arc::new(Tty0Device) as Arc<dyn AnyTtyDevice>, "tty0")
+            }
+        };
 
-        Self { inner }
+        Self { inner, active_name }
+    }
+
+    /// Returns the name of the TTY this console forwards to.
+    fn active_name(&self) -> &'static str {
+        self.active_name
     }
 }
 
@@ -112,6 +121,18 @@ impl AnyTtyDevice for SystemConsole {
 
     fn device_id(&self) -> DeviceId {
         CONSOLE_DEVICE_ID
+    }
+
+    fn attrs(&self) -> &'static [Attr<TtyClassDevice>] {
+        const ATTRS: &[Attr<TtyClassDevice>] = &[Attr::ro("active", |dev, w| {
+            let payload: &dyn Any = dev.payload().as_ref();
+            let console = payload
+                .downcast_ref::<SystemConsole>()
+                .ok_or(DeviceError::Attribute)?;
+            writeln!(w, "{}", console.active_name())?;
+            Ok(())
+        })];
+        ATTRS
     }
 
     fn open_file(&self) -> Result<Box<dyn PerOpenFileOps>> {
