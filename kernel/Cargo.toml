@@ -13,6 +13,7 @@ ostd.workspace = true
 aster-drm.workspace = true
 aster-simpledrm.workspace = true
 aster-uart.workspace = true
+aster-virtio-console.workspace = true
 
 [target.x86_64-unknown-none.dependencies]
 aster-i8042.workspace = true

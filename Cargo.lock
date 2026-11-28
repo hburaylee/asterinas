@@ -425,6 +425,7 @@ name = "aster-uart"
 version = "0.1.0"
 dependencies = [
  "aster-console",
+ "aster-core",
  "aster-util",
  "component",
  "fdt",
@@ -485,6 +486,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "aster-virtio-console"
+version = "0.1.0"
+dependencies = [
+ "aster-console",
+ "aster-core",
+ "aster-virtio",
+ "component",
+ "ostd",
+]
+
+[[package]]
 name = "asterinas"
 version = "0.1.0"
 dependencies = [
@@ -493,6 +505,7 @@ dependencies = [
  "aster-i8042",
  "aster-simpledrm",
  "aster-uart",
+ "aster-virtio-console",
  "ostd",
 ]
 

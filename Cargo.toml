@@ -31,6 +31,7 @@ members = [
     "kernel/comps/i8042",
     "kernel/comps/simpledrm",
     "kernel/comps/uart",
+    "kernel/comps/virtio-console",
     "kernel/core",
     "kernel/core/comps/block",
     "kernel/core/comps/cmdline",
@@ -86,6 +87,7 @@ default-members = [
     "kernel/comps/i8042",
     "kernel/comps/simpledrm",
     "kernel/comps/uart",
+    "kernel/comps/virtio-console",
     "kernel/core",
     "kernel/core/comps/block",
     "kernel/core/comps/cmdline",
@@ -172,6 +174,7 @@ aster-drm = { path = "kernel/comps/drm" }
 aster-i8042 = { path = "kernel/comps/i8042" }
 aster-simpledrm = { path = "kernel/comps/simpledrm" }
 aster-uart = { path = "kernel/comps/uart" }
+aster-virtio-console = { path = "kernel/comps/virtio-console" }
 
 # Crates under kernel/core/comps
 aster-block = { path = "kernel/core/comps/block" }

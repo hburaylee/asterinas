@@ -2,6 +2,5 @@
 
 mod config;
 pub mod device;
-pub(crate) mod driver;
 
 pub const DEVICE_NAME: &str = "Virtio-Console";

@@ -25,10 +25,10 @@ use crate::{device::VirtioDeviceType, transport::VirtioTransport};
 ///
 /// Drivers provide a [`VirtioDeviceType`] as their [`Bus::MatchData`].
 /// A driver matches a device when this value equals [`VirtioTransport::device_type()`].
-pub(crate) struct VirtioBus;
+pub struct VirtioBus;
 
 /// A device on the VirtIO bus.
-pub(crate) type VirtioDevice = BusDevice<VirtioBus>;
+pub type VirtioDevice = BusDevice<VirtioBus>;
 
 impl Bus for VirtioBus {
     const NAME: &'static str = "virtio";

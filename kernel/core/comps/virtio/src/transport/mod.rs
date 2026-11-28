@@ -28,7 +28,7 @@ pub(crate) mod pci;
 /// 3. Access device config memory.
 /// 4. Config virtqueue.
 /// 5. Get the interrupt resources allocated to the device.
-pub(crate) trait VirtioTransport: Sync + Send + Debug {
+pub trait VirtioTransport: Sync + Send + Debug {
     // ====================Device related APIs=======================
 
     /// Get device type.
@@ -122,7 +122,7 @@ pub(crate) trait VirtioTransport: Sync + Send + Debug {
 
 /// Manage PCI device/notify configuration space (legacy/modern).
 #[derive(Debug)]
-pub(crate) struct ConfigManager<T: Pod> {
+pub struct ConfigManager<T: Pod> {
     modern_space: Option<SafePtr<T, IoMem>>,
     legacy_space: Option<(BarAccess, usize)>,
 }
@@ -238,7 +238,7 @@ pub enum VirtioTransportError {
 bitflags::bitflags! {
     /// The device status field.
     #[derive(Clone, Copy, Debug, PartialEq)]
-    pub(crate) struct DeviceStatus: u8 {
+    pub struct DeviceStatus: u8 {
         /// Indicates that the guest OS has found the device and recognized it
         /// as a valid virtio device.
         const ACKNOWLEDGE        = 1;

@@ -18,7 +18,7 @@ use crate::{
 };
 
 /// A functional driver for one VirtIO device type.
-pub(crate) trait VirtioDriver: Send + Sync + 'static {
+pub trait VirtioDriver: Send + Sync + 'static {
     /// Returns the driver directory name under `/sys/bus/virtio/drivers`.
     fn name(&self) -> &str;
 
@@ -52,9 +52,7 @@ pub(crate) trait VirtioDriver: Send + Sync + 'static {
 /// Registers a functional driver and probes matching devices already on the bus.
 ///
 /// The low-level VirtIO component must have initialized the bus first.
-pub(crate) fn register_driver<D: VirtioDriver>(
-    driver: D,
-) -> common::Result<Arc<DriverHandle<VirtioBus>>> {
+pub fn register_driver<D: VirtioDriver>(driver: D) -> common::Result<Arc<DriverHandle<VirtioBus>>> {
     bus::VIRTIO_BUS
         .get()
         .unwrap()

@@ -14,7 +14,7 @@ pub mod socket;
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, TryFromInt)]
-pub(crate) enum VirtioDeviceType {
+pub enum VirtioDeviceType {
     Invalid = 0,
     Network = 1,
     Block = 2,

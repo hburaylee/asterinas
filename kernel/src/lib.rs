@@ -17,6 +17,7 @@ extern crate aster_drm as _;
 extern crate aster_i8042 as _;
 extern crate aster_simpledrm as _;
 extern crate aster_uart as _;
+extern crate aster_virtio_console as _;
 
 #[ostd::main]
 fn main() {

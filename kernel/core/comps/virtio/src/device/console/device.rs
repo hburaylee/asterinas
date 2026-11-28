@@ -79,17 +79,20 @@ impl Debug for ConsoleDevice {
 }
 
 impl ConsoleDevice {
-    pub(crate) fn negotiate_features(features: u64) -> u64 {
+    pub fn negotiate_features(features: u64) -> u64 {
         let mut features = ConsoleFeatures::from_bits_truncate(features);
         // A virtio console device may have multiple ports, but we only use one port to communicate now.
         features.remove(ConsoleFeatures::VIRTIO_CONSOLE_F_MULTIPORT);
         features.bits()
     }
 
-    pub(crate) fn init(
+    /// Initializes the device and publishes it to the kernel logger.
+    ///
+    /// Returns the device so that the driver can register its TTY.
+    pub fn init(
         virtio_device: Arc<VirtioDevice>,
         _negotiated_features: u64,
-    ) -> Result<(), VirtioDeviceError> {
+    ) -> Result<Arc<Self>, VirtioDeviceError> {
         let config_manager = VirtioConsoleConfig::new_manager(virtio_device.payload().as_ref());
         debug!("virtio_console_config = {:?}", config_manager.read_config());
 
@@ -139,9 +142,9 @@ impl ConsoleDevice {
 
         Self::notify_receive_queue(&mut device.receive_queue.disable_irq().lock());
 
-        aster_console::register_device(DEVICE_NAME.to_string(), device);
+        aster_console::register_device(DEVICE_NAME.to_string(), device.clone());
 
-        Ok(())
+        Ok(device)
     }
 
     fn handle_recv_irq(&self) {

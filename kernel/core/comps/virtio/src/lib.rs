@@ -27,13 +27,13 @@ macro_rules! __log_prefix {
     };
 }
 
-mod bus;
+pub mod bus;
 pub mod device;
 mod dma_buf;
-mod driver;
+pub mod driver;
 mod id_alloc;
-mod queue;
-mod transport;
+pub mod queue;
+pub mod transport;
 
 static VIRTIO_BLOCK_MAJOR_ID: Once<MajorIdOwner> = Once::new();
 
@@ -46,7 +46,6 @@ fn virtio_component_init() -> Result<(), ComponentInitError> {
 
     driver::register_driver(device::block::driver::VirtioBlockDriver).unwrap();
     driver::register_driver(device::network::driver::VirtioNetDriver::new()).unwrap();
-    driver::register_driver(device::console::driver::VirtioConsoleDriver).unwrap();
     driver::register_driver(device::entropy::driver::VirtioRngDriver::new()).unwrap();
     driver::register_driver(device::input::driver::VirtioInputDriver).unwrap();
     driver::register_driver(device::socket::driver::VirtioVsockDriver::new()).unwrap();

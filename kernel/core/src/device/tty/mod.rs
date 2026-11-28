@@ -26,7 +26,6 @@ mod device;
 mod driver;
 mod file;
 mod flags;
-mod hvc;
 pub(super) mod ioctl_defs;
 mod line_discipline;
 pub mod termio;
@@ -42,7 +41,6 @@ pub use self::{
 };
 
 pub(super) fn init_in_first_process() -> Result<()> {
-    hvc::init_in_first_process()?;
     device::init_in_first_process()?;
     vt::init_in_first_process()?;
 

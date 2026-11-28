@@ -544,7 +544,7 @@ impl VirtQueue {
 
 #[repr(C, align(16))]
 #[derive(Clone, Copy, Debug, Default, Pod)]
-pub(crate) struct Descriptor {
+pub struct Descriptor {
     addr: u64,
     len: u32,
     flags: DescFlags,
@@ -595,7 +595,7 @@ impl PodOnce for DescFlags {}
 /// It is only written by the driver and read by the device.
 #[repr(C, align(2))]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(crate) struct AvailRing {
+pub struct AvailRing {
     flags: AvailFlags,
     /// A driver MUST NOT decrement the idx.
     idx: u16,
@@ -608,7 +608,7 @@ pub(crate) struct AvailRing {
 #[padding_struct]
 #[repr(C, align(4))]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(crate) struct UsedRing {
+pub struct UsedRing {
     flags: u16,
     /// The next index of the used element in the ring array.
     idx: u16,
