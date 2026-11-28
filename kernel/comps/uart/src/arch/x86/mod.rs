@@ -1,7 +1,5 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use alloc::string::ToString;
-
 use ostd::{
     arch::{
         irq::{IRQ_CHIP, MappedIrqLine},
@@ -37,10 +35,7 @@ pub(super) fn init() {
 
     let uart_console = UartConsole::new(uart);
 
-    aster_console::register_device(
-        aster_console::UART_CONSOLE_NAME.to_string(),
-        uart_console.clone(),
-    );
+    crate::register_console(uart_console.clone());
 
     irq_line.on_active(move |_| uart_console.trigger_input_callbacks());
     IRQ_LINE.call_once(move || irq_line);

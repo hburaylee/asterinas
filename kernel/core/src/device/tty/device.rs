@@ -11,13 +11,11 @@ use device_id::{DeviceId, MajorId, MinorId};
 use spin::Once;
 
 use super::{
-    class::{AnyTtyDevice, TtyClassDevice, add_tty_device},
-    hvc::hvc0_device,
-    serial::serial0_device,
+    class::{AnyTtyDevice, TtyClassDevice, add_tty_device, find_device},
     vt::active_vt,
 };
 use crate::{
-    fs::file::{InodeMode, PerOpenFileOps, mkmod},
+    fs::file::{PerOpenFileOps, mkmod},
     prelude::*,
 };
 
@@ -52,9 +50,9 @@ impl AnyTtyDevice for TtyDevice {
         DeviceId::new(MajorId::new(5), MinorId::new(0))
     }
 
-    fn devnode_mode(&self) -> InodeMode {
+    fn devnode_mode(&self) -> u16 {
         // Reference: <https://elixir.bootlin.com/linux/v6.18/source/drivers/tty/tty_io.c#L3511>.
-        mkmod!(a+rw)
+        mkmod!(a+rw).bits()
     }
 
     fn open_file(&self) -> Result<Box<dyn PerOpenFileOps>> {
@@ -90,8 +88,8 @@ impl SystemConsole {
 
         let console: Option<Arc<dyn AnyTtyDevice>> = match console_name {
             "tty0" => Some(Arc::new(Tty0Device)),
-            "ttyS0" => serial0_device().cloned().map(|device| device as _),
-            "hvc0" => hvc0_device().cloned().map(|device| device as _),
+            "ttyS0" => find_device("ttyS0"),
+            "hvc0" => find_device("hvc0"),
             _ => None,
         };
         let (inner, active_name) = match console {

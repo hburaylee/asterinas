@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MPL-2.0
 
-use aster_device::common::SysStr;
+pub use aster_device::common::SysStr;
 use device_id::{DeviceId, MajorId, MinorId};
 use ostd::sync::LocalIrqDisabled;
 
-use self::{class::AnyTtyDevice, line_discipline::LineDiscipline, termio::CFontOp};
+use self::{line_discipline::LineDiscipline, termio::CFontOp};
 use crate::{
     device::{Device, DeviceType},
     dispatch_ioctl,
@@ -29,19 +29,20 @@ mod flags;
 mod hvc;
 pub(super) mod ioctl_defs;
 mod line_discipline;
-mod serial;
-pub(super) mod termio;
+pub mod termio;
 mod vt;
 
 pub(crate) use device::CONSOLE_DEVICE_ID;
-pub(super) use driver::TtyDriver;
+pub use driver::TtyDriver;
 pub(super) use flags::TtyFlags;
 
-pub(super) fn init_in_first_process() -> Result<()> {
-    class::register()?;
+pub use self::{
+    class::{AnyTtyDevice, TtyClassDevice, add_tty_device},
+    file::TtyFile,
+};
 
+pub(super) fn init_in_first_process() -> Result<()> {
     hvc::init_in_first_process()?;
-    serial::init_in_first_process()?;
     device::init_in_first_process()?;
     vt::init_in_first_process()?;
 
@@ -72,7 +73,7 @@ const IO_CAPACITY: usize = 4096;
 ///             +-------+
 /// Tty::push_input   D::push_output
 /// ```
-pub(crate) struct Tty<D> {
+pub struct Tty<D> {
     index: u32,
     driver: D,
     ldisc: SpinLock<LineDiscipline, LocalIrqDisabled>,
@@ -83,7 +84,7 @@ pub(crate) struct Tty<D> {
 }
 
 impl<D> Tty<D> {
-    pub(super) fn new(index: u32, driver: D) -> Arc<Self> {
+    pub fn new(index: u32, driver: D) -> Arc<Self> {
         Arc::new_cyclic(move |weak_ref| Tty {
             index,
             driver,
@@ -134,7 +135,7 @@ impl<D: TtyDriver> Tty<D> {
     ///
     /// This method returns the number of bytes pushed or fails with an error if no bytes can be
     /// pushed because the buffer is full.
-    pub(crate) fn push_input(&self, chs: &[u8]) -> Result<usize> {
+    pub fn push_input(&self, chs: &[u8]) -> Result<usize> {
         let mut ldisc = self.ldisc.lock();
         let mut echo = self.driver.echo_callback();
 

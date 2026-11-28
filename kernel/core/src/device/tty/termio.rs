@@ -17,7 +17,7 @@ type CSpeed = u32;
 /// The input flags; `c_iflags` bits in Linux.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(crate) struct CInputFlags(u32);
+pub struct CInputFlags(u32);
 
 bitflags! {
     impl CInputFlags: u32 {
@@ -54,7 +54,7 @@ impl Default for CInputFlags {
 /// The output flags; `c_oflags` bits in Linux.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct COutputFlags(u32);
+pub struct COutputFlags(u32);
 
 bitflags! {
     impl COutputFlags: u32 {
@@ -83,7 +83,7 @@ impl Default for COutputFlags {
 /// The control flags; `c_cflags` bits in Linux.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(super) struct CCtrlFlags(u32);
+pub struct CCtrlFlags(u32);
 
 impl Default for CCtrlFlags {
     fn default() -> Self {
@@ -150,7 +150,7 @@ pub(super) enum CCtrlSize {
 /// The baud part of the control flags ([`CCtrlFlags`]).
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq, TryFromInt)]
-pub(super) enum CCtrlBaud {
+pub enum CCtrlBaud {
     // https://elixir.bootlin.com/linux/v6.0.9/source/include/uapi/asm-generic/termbits-common.h#L30
     B0 = 0x00000000, /* hang up */
     B50 = 0x00000001,
@@ -229,7 +229,7 @@ impl CCtrlBaud {
 /// The local flags; `c_lflags` bits in Linux.
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(crate) struct CLocalFlags(u32);
+pub struct CLocalFlags(u32);
 
 bitflags! {
     impl CLocalFlags: u32 {
@@ -271,10 +271,9 @@ impl Default for CLocalFlags {
 }
 
 /// An index for a control character ([`CCtrlChar`]).
-#[expect(clippy::upper_case_acronyms)]
 #[repr(u32)]
 #[derive(Clone, Copy, Debug, TryFromInt)]
-pub(crate) enum CCtrlCharId {
+pub enum CCtrlCharId {
     // https://elixir.bootlin.com/linux/v6.0.9/source/include/uapi/asm-generic/termbits.h#L42
     VINTR = 0,
     VQUIT = 1,
@@ -330,7 +329,7 @@ impl CCtrlCharId {
 /// Reference: <https://elixir.bootlin.com/linux/v6.0.9/source/include/uapi/asm-generic/termbits.h#L30>.
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Pod)]
-pub(crate) struct CTermios {
+pub struct CTermios {
     c_iflags: CInputFlags,
     c_oflags: COutputFlags,
     c_cflags: CCtrlFlags,
@@ -376,11 +375,11 @@ impl CTermios {
     /// Reference: <https://elixir.bootlin.com/linux/v6.0.9/source/include/uapi/asm-generic/termbits.h#L9>.
     const NUM_CTRL_CHARS: usize = 19;
 
-    pub(crate) fn special_char(&self, id: CCtrlCharId) -> CCtrlChar {
+    pub fn special_char(&self, id: CCtrlCharId) -> CCtrlChar {
         self.c_cc[id as usize]
     }
 
-    pub(super) fn special_char_mut(&mut self, id: CCtrlCharId) -> &mut CCtrlChar {
+    pub fn special_char_mut(&mut self, id: CCtrlCharId) -> &mut CCtrlChar {
         &mut self.c_cc[id as usize]
     }
 
@@ -393,12 +392,12 @@ impl CTermios {
     }
 
     /// Returns the input flags.
-    pub(crate) fn input_flags(&self) -> &CInputFlags {
+    pub fn input_flags(&self) -> &CInputFlags {
         &self.c_iflags
     }
 
     /// Returns the local flags.
-    pub(crate) fn local_flags(&self) -> &CLocalFlags {
+    pub fn local_flags(&self) -> &CLocalFlags {
         &self.c_lflags
     }
 }

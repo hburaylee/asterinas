@@ -7,7 +7,7 @@ pub(crate) mod misc;
 mod model;
 mod pty;
 pub mod registry;
-pub(crate) mod tty;
+pub mod tty;
 
 use aster_device::class::{Class, ClassDevice};
 use device_id::DeviceId;

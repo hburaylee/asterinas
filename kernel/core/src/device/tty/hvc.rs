@@ -5,7 +5,6 @@ use alloc::format;
 use aster_console::AnyConsoleDevice;
 use aster_device::common::SysStr;
 use ostd::mm::Infallible;
-use spin::Once;
 
 use super::{Tty, TtyDriver, class};
 use crate::{
@@ -50,15 +49,6 @@ impl TtyDriver for HvcDriver {
     fn on_termios_change(&self, _old_termios: &CTermios, _new_termios: &CTermios) {}
 }
 
-static HVC0: Once<Arc<Tty<HvcDriver>>> = Once::new();
-
-/// Returns the `hvc0` device.
-///
-/// Returns `None` if the device is not found nor initialized.
-pub(super) fn hvc0_device() -> Option<&'static Arc<Tty<HvcDriver>>> {
-    HVC0.get()
-}
-
 pub(super) fn init_in_first_process() -> Result<()> {
     let devices = aster_console::all_devices();
 
@@ -75,7 +65,6 @@ pub(super) fn init_in_first_process() -> Result<()> {
         };
         let hvc0 = Tty::new(0, driver);
 
-        HVC0.call_once(|| hvc0.clone());
         class::add_tty_device(hvc0.clone(), None)?;
 
         virtio_console.register_callback(Box::leak(Box::new(

@@ -17,16 +17,16 @@ use crate::{
     device::{Device, DeviceType, add_class_char_device},
     fs::{
         devtmpfs::DevtmpfsNodeMeta,
-        file::{InodeMode, PerOpenFileOps, mkmod},
+        file::{PerOpenFileOps, mkmod},
     },
     prelude::*,
 };
 
 /// The `tty` class, which groups terminal devices such as `/dev/ttyS0` and `/dev/console`.
-pub(super) struct TtyClass;
+pub struct TtyClass;
 
 /// A device in the `tty` class.
-pub(super) type TtyClassDevice = ClassDevice<TtyClass>;
+pub type TtyClassDevice = ClassDevice<TtyClass>;
 
 impl Class for TtyClass {
     const NAME: &'static str = "tty";
@@ -35,7 +35,7 @@ impl Class for TtyClass {
     fn devnode(&self, dev: &ClassDevice<Self>) -> Option<DevNode> {
         Some(DevNode {
             path: None,
-            mode: Some(dev.payload().devnode_mode().bits()),
+            mode: Some(dev.payload().devnode_mode()),
         })
     }
 
@@ -53,7 +53,7 @@ impl Class for TtyClass {
 }
 
 /// What a TTY device provides to the `tty` class.
-pub(super) trait AnyTtyDevice: Send + Sync + Any {
+pub trait AnyTtyDevice: Send + Sync + Any {
     /// The name of the device's node under `/dev`.
     ///
     /// `None` for a device without a node of its own (a PTY slave, whose node
@@ -64,8 +64,8 @@ pub(super) trait AnyTtyDevice: Send + Sync + Any {
     fn device_id(&self) -> DeviceId;
 
     /// The permission bits of the `/dev` node.
-    fn devnode_mode(&self) -> InodeMode {
-        mkmod!(u+rw)
+    fn devnode_mode(&self) -> u16 {
+        mkmod!(u+rw).bits()
     }
 
     /// The attributes shown in the device's sysfs directory.
@@ -98,27 +98,33 @@ impl Device for TtyClassDevice {
 
 static TTY_CLASS: Once<Arc<ClassHandle<TtyClass>>> = Once::new();
 
-/// Registers the `tty` class, creating `/sys/class/tty`.
+/// Returns the `tty` class, registering it on first use.
 ///
-/// Must run before any device joins the class.
-pub(super) fn register() -> Result<()> {
-    let class = class::register(TtyClass)?;
-    TTY_CLASS.call_once(|| class);
-    Ok(())
+/// Registration is lazy: drivers add TTY devices from their component initialization,
+/// which has no explicit ordering with aster-core's own initialization.
+fn class() -> Result<&'static Arc<ClassHandle<TtyClass>>> {
+    if let Some(class) = TTY_CLASS.get() {
+        return Ok(class);
+    }
+    // A concurrent first caller may have registered the class in the meantime.
+    match class::register(TtyClass) {
+        Ok(class) => Ok(TTY_CLASS.call_once(|| class)),
+        Err(error) => TTY_CLASS.get().ok_or_else(|| error.into()),
+    }
 }
 
 /// Adds `payload` to the `tty` class and the char registry.
 ///
 /// `parent` is the sysfs parent. `None` puts the device directly under
 /// `/sys/devices/virtual/tty/`. Fails with `EINVAL` if the payload has no node.
-pub(super) fn add_tty_device(
+pub fn add_tty_device(
     payload: Arc<dyn AnyTtyDevice>,
     parent: Option<Arc<dyn AnyDevice>>,
 ) -> Result<()> {
     let name = payload
         .devnode_name()
         .ok_or(errno!(EINVAL, "the TTY has no device node"))?;
-    let mut builder = TtyClassDevice::builder(TTY_CLASS.get().unwrap(), name, payload.clone())
+    let mut builder = TtyClassDevice::builder(class()?, name, payload.clone())
         .devnum(DevNum::char(payload.device_id()))
         .attrs(payload.attrs());
     if let Some(parent) = parent {
@@ -132,4 +138,10 @@ pub(super) fn add_tty_device(
 /// Must run after the other TTY devices have been added, so that the selected TTY exists.
 pub(super) fn add_console_device() -> Result<()> {
     add_tty_device(Arc::new(SystemConsole::from_console_param()), None)
+}
+
+/// Returns the TTY registered under `name`, e.g. `"hvc0"`.
+pub(crate) fn find_device(name: &str) -> Option<Arc<dyn AnyTtyDevice>> {
+    let device = class().ok()?.find_device(name)?;
+    Some(device.payload().clone())
 }

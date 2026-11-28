@@ -14,10 +14,10 @@ use crate::{
     util::ioctl::RawIoctl,
 };
 
-pub(super) struct TtyFile<D>(Arc<Tty<D>>);
+pub struct TtyFile<D>(Arc<Tty<D>>);
 
 impl<D: TtyDriver> TtyFile<D> {
-    pub(super) fn new(tty: Arc<Tty<D>>) -> Self {
+    pub fn new(tty: Arc<Tty<D>>) -> Self {
         Self(tty)
     }
 }
